@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/promptfilter"
 )
 
 // AccountStatus 账号状态
@@ -42,6 +44,7 @@ type Account struct {
 	mu             sync.RWMutex
 	DBID           int64 // 数据库 ID
 	RefreshToken   string
+	SessionToken   string
 	AccessToken    string
 	ExpiresAt      time.Time
 	AccountID      string
@@ -94,11 +97,26 @@ type Account struct {
 	Disabled       int32 // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
 	AddedAt        int64 // 加入号池的时间（UnixNano），用于过期清理
 	Locked         int32 // 原子标志，1 = 锁定，自动清理跳过此账号
+	DispatchPaused int32 // 原子标志，1 = 禁用调度选择，不影响刷新/探针/清理
 
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
 	BaseConcurrencyOverride *int64
+	AllowedAPIKeyIDs        []int64
+	allowedAPIKeySet        map[int64]struct{}
+	ModelCooldowns          map[string]ModelCooldown
 }
+
+type ModelCooldown struct {
+	Model        string
+	Reason       string
+	ResetAt      time.Time
+	UpdatedAt    time.Time
+	BackoffLevel int
+}
+
+// AccountFilter 用于请求级调度约束，例如按模型限制账号套餐。
+type AccountFilter func(*Account) bool
 
 const (
 	defaultBackgroundRefreshInterval = 2 * time.Minute
@@ -163,6 +181,40 @@ func cloneInt64Ptr(v *int64) *int64 {
 	}
 	cloned := *v
 	return &cloned
+}
+
+func cloneInt64Slice(values []int64) []int64 {
+	if len(values) == 0 {
+		return []int64{}
+	}
+	cloned := make([]int64, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func normalizeAllowedAPIKeyIDs(values []int64) []int64 {
+	if len(values) == 0 {
+		return []int64{}
+	}
+	unique := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, exists := unique[value]; exists {
+			continue
+		}
+		unique[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i] < result[j]
+	})
+	if len(result) == 0 {
+		return []int64{}
+	}
+	return result
 }
 
 func reflectOptionalInt64Field(src any, fieldName string) *int64 {
@@ -256,7 +308,7 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 }
 
 func defaultScoreBiasForPlan(planType string) int64 {
-	switch strings.ToLower(strings.TrimSpace(planType)) {
+	switch NormalizePlanType(planType) {
 	case "pro", "plus", "team":
 		return 50
 	default:
@@ -339,6 +391,7 @@ func linearDecay(base float64, elapsed, window time.Duration) float64 {
 func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
 	now := time.Now()
 	breakdown := SchedulerBreakdown{}
+	premium5hLimited := a.premium5hRateLimitedLocked(now)
 
 	// 线性衰减惩罚：随时间平滑更无突变
 	if !a.LastUnauthorizedAt.IsZero() {
@@ -359,10 +412,12 @@ func (a *Account) schedulerBreakdownLocked() SchedulerBreakdown {
 	}
 
 	breakdown.FailurePenalty = float64(clampInt(a.FailureStreak*6, 0, 24))
-	breakdown.SuccessBonus = float64(clampInt(a.SuccessStreak*2, 0, 12))
+	if !premium5hLimited {
+		breakdown.SuccessBonus = float64(clampInt(a.SuccessStreak*2, 0, 12))
+	}
 
 	// 经过验证的账号（累计请求 > 10 次）优先调度
-	if atomic.LoadInt64(&a.TotalRequests) > 10 {
+	if !premium5hLimited && atomic.LoadInt64(&a.TotalRequests) > 10 {
 		breakdown.ProvenBonus = 20
 	}
 
@@ -484,6 +539,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	if a.HealthTier == HealthTierBanned {
 		tier = HealthTierBanned
 	}
+	if a.premium5hRateLimitedLocked(now) && tier != HealthTierBanned {
+		tier = HealthTierRisky
+	}
 
 	baseConcurrencyEffective := a.effectiveBaseConcurrencyLocked(baseLimit)
 	scoreBiasEffective := a.effectiveScoreBiasLocked(now, tier)
@@ -495,6 +553,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	a.ScoreBiasEffective = scoreBiasEffective
 	a.BaseConcurrencyEffective = baseConcurrencyEffective
 	a.DynamicConcurrencyLimit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
+	if a.premium5hRateLimitedLocked(now) && a.DynamicConcurrencyLimit > 1 {
+		a.DynamicConcurrencyLimit = 1
+	}
 }
 
 func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64, float64, int64) {
@@ -508,6 +569,9 @@ func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64
 func (a *Account) IsAvailable() bool {
 	// 原子标志优先：401 时瞬间置位，无需等锁即可拦截并发请求
 	if atomic.LoadInt32(&a.Disabled) != 0 {
+		return false
+	}
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
 		return false
 	}
 
@@ -525,6 +589,9 @@ func (a *Account) IsAvailable() bool {
 		return false
 	}
 	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
+		return false
+	}
+	if a.premium5hRateLimitedLocked(time.Now()) {
 		return false
 	}
 	// 冷却期过了自动恢复
@@ -586,6 +653,12 @@ func (a *Account) GetCooldownReason() string {
 	return a.CooldownReason
 }
 
+func (a *Account) GetCooldownSnapshot() (string, time.Time) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.CooldownReason, a.CooldownUtil
+}
+
 // HasActiveCooldown 检查账号是否仍处于冷却期
 func (a *Account) HasActiveCooldown() bool {
 	a.mu.RLock()
@@ -604,6 +677,7 @@ func (a *Account) IsBanned() bool {
 func (a *Account) RuntimeStatus() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	now := time.Now()
 	if a.healthTierLocked() == HealthTierBanned {
 		return "unauthorized"
 	}
@@ -611,20 +685,32 @@ func (a *Account) RuntimeStatus() string {
 	if a.usageExhaustedLocked() {
 		return "usage_exhausted"
 	}
+	if a.premium5hRateLimitedLocked(now) {
+		return "rate_limited"
+	}
 	switch a.Status {
 	case StatusError:
 		return "error"
 	case StatusCooldown:
-		if time.Now().Before(a.CooldownUtil) {
+		if now.Before(a.CooldownUtil) {
 			if a.CooldownReason != "" {
 				return a.CooldownReason
 			}
 			return "cooldown"
 		}
-		return "active" // 冷却过期，已恢复
+		if a.AccessToken != "" {
+			return "active" // 冷却过期，已恢复
+		}
+		if a.RefreshToken != "" {
+			return "refreshing"
+		}
+		return "error"
 	default:
 		if a.AccessToken != "" {
 			return "active"
+		}
+		if a.RefreshToken != "" && a.ErrorMsg == "" {
+			return "refreshing"
 		}
 		return "error"
 	}
@@ -708,6 +794,24 @@ func (a *Account) GetPlanType() string {
 	return a.PlanType
 }
 
+// applyRefreshedPlanTypeLocked applies a plan parsed from refreshed tokens.
+// Caller must hold a.mu.
+func (a *Account) applyRefreshedPlanTypeLocked(planType string, now time.Time) (string, bool) {
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	if plan == "" {
+		return "", false
+	}
+	if plan != "free" &&
+		strings.EqualFold(a.PlanType, "free") &&
+		a.UsagePercent7dValid &&
+		a.UsagePercent7d >= 100 &&
+		a.Reset7dAt.After(now) {
+		return plan, false
+	}
+	a.PlanType = plan
+	return plan, true
+}
+
 // GetHealthTier 获取当前健康层级
 func (a *Account) GetHealthTier() string {
 	a.mu.RLock()
@@ -763,6 +867,171 @@ func (a *Account) GetBaseConcurrencyEffective() int64 {
 	return a.BaseConcurrencyEffective
 }
 
+func (a *Account) setAllowedAPIKeyIDsLocked(values []int64) {
+	normalized := normalizeAllowedAPIKeyIDs(values)
+	a.AllowedAPIKeyIDs = cloneInt64Slice(normalized)
+	if len(normalized) == 0 {
+		a.allowedAPIKeySet = nil
+		return
+	}
+	a.allowedAPIKeySet = make(map[int64]struct{}, len(normalized))
+	for _, value := range normalized {
+		a.allowedAPIKeySet[value] = struct{}{}
+	}
+}
+
+func (a *Account) SetAllowedAPIKeyIDs(values []int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.setAllowedAPIKeyIDsLocked(values)
+}
+
+func (a *Account) GetAllowedAPIKeyIDs() []int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneInt64Slice(a.AllowedAPIKeyIDs)
+}
+
+func (a *Account) AllowsAPIKey(apiKeyID int64) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if len(a.AllowedAPIKeyIDs) == 0 {
+		return true
+	}
+	if apiKeyID <= 0 {
+		return false
+	}
+	_, ok := a.allowedAPIKeySet[apiKeyID]
+	return ok
+}
+
+func normalizeModelCooldownKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
+func (a *Account) SetModelCooldownUntil(model, reason string, resetAt time.Time) ModelCooldown {
+	key := normalizeModelCooldownKey(model)
+	if key == "" || resetAt.IsZero() {
+		return ModelCooldown{}
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	now := time.Now()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ModelCooldowns == nil {
+		a.ModelCooldowns = make(map[string]ModelCooldown)
+	}
+	current := a.ModelCooldowns[key]
+	level := current.BackoffLevel
+	if current.ResetAt.After(now) {
+		level++
+	}
+	if level < 0 {
+		level = 0
+	}
+	cooldown := ModelCooldown{
+		Model:        key,
+		Reason:       reason,
+		ResetAt:      resetAt,
+		UpdatedAt:    now,
+		BackoffLevel: level,
+	}
+	a.ModelCooldowns[key] = cooldown
+	return cooldown
+}
+
+func (a *Account) RestoreModelCooldown(model, reason string, resetAt, updatedAt time.Time) {
+	key := normalizeModelCooldownKey(model)
+	if key == "" || resetAt.IsZero() || !resetAt.After(time.Now()) {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ModelCooldowns == nil {
+		a.ModelCooldowns = make(map[string]ModelCooldown)
+	}
+	a.ModelCooldowns[key] = ModelCooldown{
+		Model:     key,
+		Reason:    reason,
+		ResetAt:   resetAt,
+		UpdatedAt: updatedAt,
+	}
+}
+
+func (a *Account) IsModelRateLimited(model string) bool {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cooldown, ok := a.ModelCooldowns[key]
+	return ok && cooldown.ResetAt.After(time.Now())
+}
+
+func (a *Account) ModelCooldownRemaining(model string) time.Duration {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return 0
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cooldown, ok := a.ModelCooldowns[key]
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(cooldown.ResetAt)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (a *Account) ActiveModelCooldowns() []ModelCooldown {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.ModelCooldowns) == 0 {
+		return nil
+	}
+	now := time.Now()
+	result := make([]ModelCooldown, 0, len(a.ModelCooldowns))
+	for _, cooldown := range a.ModelCooldowns {
+		if cooldown.ResetAt.After(now) {
+			result = append(result, cooldown)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Model < result[j].Model
+	})
+	return result
+}
+
+func (a *Account) ClearModelCooldown(model string) bool {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.ModelCooldowns) == 0 {
+		return false
+	}
+	if _, ok := a.ModelCooldowns[key]; !ok {
+		return false
+	}
+	delete(a.ModelCooldowns, key)
+	return true
+}
+
 // GetDynamicConcurrencyLimit 获取当前动态并发上限
 func (a *Account) GetDynamicConcurrencyLimit() int64 {
 	a.mu.RLock()
@@ -797,14 +1066,18 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	now := time.Now()
 
 	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
 		return false
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" {
+	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" {
+	if a.premium5hRateLimitedLocked(now) {
+		return false
+	}
+	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false // 429 冷却期间不探活，避免加重限流
 	}
 	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() {
@@ -910,11 +1183,13 @@ type Store struct {
 	autoCleanExpired          atomic.Bool
 	autoCleanupBatch          atomic.Bool
 	maxRetries                int64 // 请求失败最大重试次数（换号重试）
+	maxRateLimitRetries       int64 // 429 最大换号重试次数
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
 	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
 	backgroundRefreshWakeCh   chan struct{}
 	stopCh                    chan struct{}
+	stopOnce                  sync.Once
 	wg                        sync.WaitGroup
 
 	// 代理池
@@ -931,6 +1206,7 @@ type Store struct {
 
 	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
+	promptFilterConfig   atomic.Value // promptfilter.Config
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
 }
@@ -941,7 +1217,21 @@ type sessionAffinity struct {
 	expiresAt time.Time
 }
 
-const sessionAffinityTTL = 30 * time.Minute
+const defaultSessionAffinityTTL = time.Hour
+
+func sessionAffinityTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CODEX_SESSION_AFFINITY_TTL"))
+	if raw == "" {
+		return defaultSessionAffinityTTL
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultSessionAffinityTTL
+}
 
 func fastSchedulerEnabledFromEnv() bool {
 	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
@@ -972,6 +1262,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			UsageProbeMaxAgeMinutes:          10,
 			RecoveryProbeIntervalMinutes:     30,
 			ProxyURL:                         "",
+			MaxRateLimitRetries:              1,
 		}
 	}
 	s := &Store{
@@ -999,10 +1290,16 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		retries = 2 // 默认重试 2 次
 	}
 	atomic.StoreInt64(&s.maxRetries, retries)
+	rateLimitRetries := int64(settings.MaxRateLimitRetries)
+	if rateLimitRetries < 0 {
+		rateLimitRetries = 0
+	}
+	atomic.StoreInt64(&s.maxRateLimitRetries, rateLimitRetries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
+	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -1127,6 +1424,53 @@ func (s *Store) NextProxy() string {
 	}
 	idx := atomic.AddUint64(&s.proxyRoundRobin, 1)
 	return pool[idx%uint64(len(pool))]
+}
+
+// ResolveProxyForAccount returns the effective proxy for account-bound internal calls.
+// Priority: account proxy > sticky proxy pool > global proxy > direct.
+func (s *Store) ResolveProxyForAccount(acc *Account) string {
+	if s == nil {
+		return ""
+	}
+
+	var accountID int64
+	if acc != nil {
+		acc.mu.RLock()
+		accountID = acc.DBID
+		if proxy := strings.TrimSpace(acc.ProxyURL); proxy != "" {
+			acc.mu.RUnlock()
+			return proxy
+		}
+		acc.mu.RUnlock()
+	}
+
+	return s.resolveFallbackProxyForAccount(accountID)
+}
+
+func (s *Store) resolveFallbackProxyForAccount(accountID int64) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.proxyPoolEnabled && len(s.proxyPool) > 0 {
+		start := stickyProxyIndex(accountID, len(s.proxyPool))
+		for i := 0; i < len(s.proxyPool); i++ {
+			if proxy := strings.TrimSpace(s.proxyPool[(start+i)%len(s.proxyPool)]); proxy != "" {
+				return proxy
+			}
+		}
+	}
+
+	return strings.TrimSpace(s.globalProxy)
+}
+
+func stickyProxyIndex(accountID int64, poolSize int) int {
+	if poolSize <= 1 {
+		return 0
+	}
+	if accountID <= 0 {
+		return 0
+	}
+	return int((accountID - 1) % int64(poolSize))
 }
 
 // GetProxyPoolEnabled 获取代理池开关状态
@@ -1303,31 +1647,48 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("从数据库加载账号失败: %w", err)
 	}
+	modelCooldowns := make(map[int64][]*database.AccountModelCooldownRow)
+	if cooldownRows, err := s.db.ListActiveModelCooldowns(ctx); err == nil {
+		for _, row := range cooldownRows {
+			modelCooldowns[row.AccountID] = append(modelCooldowns[row.AccountID], row)
+		}
+	} else {
+		log.Printf("加载模型冷却状态失败: %v", err)
+	}
+	if err := s.db.ClearExpiredModelCooldowns(ctx); err != nil {
+		log.Printf("清理过期模型冷却状态失败: %v", err)
+	}
 
 	for _, row := range rows {
 		rt := row.GetCredential("refresh_token")
+		st := row.GetCredential("session_token")
 		at := row.GetCredential("access_token")
-		if rt == "" && at == "" {
-			log.Printf("[账号 %d] 缺少 refresh_token 和 access_token，跳过", row.ID)
+		if rt == "" && st == "" && at == "" {
+			log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
 			continue
-		}
-
-		proxy := row.ProxyURL
-		if proxy == "" {
-			proxy = s.globalProxy
 		}
 
 		account := &Account{
 			DBID:         row.ID,
 			RefreshToken: rt,
-			ProxyURL:     proxy,
+			SessionToken: st,
+			ProxyURL:     strings.TrimSpace(row.ProxyURL),
 			HealthTier:   HealthTierWarm,
 			AddedAt:      row.CreatedAt.UnixNano(),
 		}
 		account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
 		account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
+		account.setAllowedAPIKeyIDsLocked(row.GetCredentialInt64Slice("allowed_api_key_ids"))
 		if row.Locked {
 			atomic.StoreInt32(&account.Locked, 1)
+		}
+		if !row.Enabled {
+			atomic.StoreInt32(&account.DispatchPaused, 1)
+		}
+		if row.Status == "error" {
+			account.Status = StatusError
+			account.ErrorMsg = row.ErrorMessage
+			account.HealthTier = HealthTierRisky
 		}
 
 		// 尝试从 credentials 恢复已有的 AT
@@ -1336,7 +1697,9 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			account.AccountID = row.GetCredential("account_id")
 			account.Email = row.GetCredential("email")
 			account.PlanType = row.GetCredential("plan_type")
-			account.HealthTier = HealthTierHealthy
+			if account.Status != StatusError {
+				account.HealthTier = HealthTierHealthy
+			}
 			if expiresAt := row.GetCredential("expires_at"); expiresAt != "" {
 				if parsed, err := time.Parse(time.RFC3339, expiresAt); err == nil {
 					account.ExpiresAt = parsed
@@ -1386,6 +1749,9 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				}
 				account.SetUsageSnapshot5h(parsed, resetAt)
 			}
+		}
+		for _, cooldown := range modelCooldowns[row.ID] {
+			account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 		}
 		account.mu.Lock()
 		account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -1459,7 +1825,9 @@ func (s *Store) StartBackgroundRefresh() {
 
 // Stop 停止后台刷新
 func (s *Store) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 	s.wg.Wait()
 }
 
@@ -1472,6 +1840,9 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 		if acc == nil || acc.RuntimeStatus() != targetStatus {
 			continue
 		}
+		if targetStatus == "rate_limited" && acc.IsPremium5hRateLimited() {
+			continue
+		}
 
 		// 锁定账号跳过自动清理
 		if atomic.LoadInt32(&acc.Locked) == 1 {
@@ -1479,7 +1850,7 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 		}
 
 		if s.db != nil {
-			if err := s.db.SetError(ctx, acc.DBID, "deleted"); err != nil {
+			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
 				log.Printf("[账号 %d] 清理 %s 状态失败: %v", acc.DBID, targetStatus, err)
 				continue
 			}
@@ -1499,14 +1870,19 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 
 // Next 获取下一个可用账号（健康优先 + 低负载择优 + warm 公平调度）
 func (s *Store) Next() *Account {
-	return s.NextExcluding(nil)
+	return s.NextExcluding(0, nil)
 }
 
 // NextExcluding 获取下一个可用账号，排除指定的账号 ID 集合
 // 用于重试时避免再次选到已失败（如 401）的账号
-func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
+func (s *Store) NextExcluding(apiKeyID int64, exclude map[int64]bool) *Account {
+	return s.NextExcludingWithFilter(apiKeyID, exclude, nil)
+}
+
+// NextExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
+func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
 	if scheduler := s.getFastScheduler(); scheduler != nil {
-		return scheduler.AcquireExcluding(exclude)
+		return scheduler.AcquireExcludingWithFilter(apiKeyID, exclude, filter)
 	}
 
 	s.mu.RLock()
@@ -1523,6 +1899,12 @@ func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 			continue
 		}
 		if !acc.IsAvailable() {
+			continue
+		}
+		if !acc.AllowsAPIKey(apiKeyID) {
+			continue
+		}
+		if filter != nil && !filter(acc) {
 			continue
 		}
 
@@ -1573,7 +1955,7 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	s.sessionBindings[key] = sessionAffinity{
 		accountID: account.DBID,
 		proxyURL:  strings.TrimSpace(proxyURL),
-		expiresAt: time.Now().Add(sessionAffinityTTL),
+		expiresAt: time.Now().Add(sessionAffinityTTL()),
 	}
 	s.sessionMu.Unlock()
 }
@@ -1596,13 +1978,18 @@ func (s *Store) UnbindSessionAffinity(key string, accountID int64) {
 }
 
 // NextForSession 优先复用已绑定的账号和代理，失败时回退到普通选号。
-func (s *Store) NextForSession(key string, exclude map[int64]bool) (*Account, string) {
+func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]bool) (*Account, string) {
+	return s.NextForSessionWithFilter(key, apiKeyID, exclude, nil)
+}
+
+// NextForSessionWithFilter 优先复用已绑定的账号和代理，并应用请求级账号过滤器。
+func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
 	if s == nil {
 		return nil, ""
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return s.NextExcluding(exclude), ""
+		return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
 	}
 
 	now := time.Now()
@@ -1617,15 +2004,15 @@ func (s *Store) NextForSession(key string, exclude map[int64]bool) (*Account, st
 				delete(s.sessionBindings, key)
 			}
 			s.sessionMu.Unlock()
-		} else if acc := s.takeByIDExcluding(binding.accountID, exclude); acc != nil {
+		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
 			return acc, binding.proxyURL
 		}
 	}
 
-	return s.NextExcluding(exclude), ""
+	return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
 }
 
-func (s *Store) takeByIDExcluding(id int64, exclude map[int64]bool) *Account {
+func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
 	if s == nil || id == 0 {
 		return nil
 	}
@@ -1645,6 +2032,12 @@ func (s *Store) takeByIDExcluding(id int64, exclude map[int64]bool) *Account {
 	if target == nil || !target.IsAvailable() {
 		return nil
 	}
+	if !target.AllowsAPIKey(apiKeyID) {
+		return nil
+	}
+	if filter != nil && !filter(target) {
+		return nil
+	}
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	now := time.Now()
@@ -1659,18 +2052,70 @@ func (s *Store) takeByIDExcluding(id int64, exclude map[int64]bool) *Account {
 }
 
 // WaitForAvailable 等待可用账号（带超时的请求排队）
-func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Account {
-	acc, _ := s.WaitForSessionAvailable(ctx, "", timeout, nil)
+func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration, apiKeyID int64) *Account {
+	acc, _ := s.WaitForSessionAvailable(ctx, "", timeout, apiKeyID, nil)
 	return acc
 }
 
 // WaitForSessionAvailable waits for a session-preferred account and proxy pair.
-func (s *Store) WaitForSessionAvailable(ctx context.Context, key string, timeout time.Duration, exclude map[int64]bool) (*Account, string) {
+func (s *Store) WaitForSessionAvailable(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool) (*Account, string) {
+	return s.WaitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, nil)
+}
+
+func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) bool {
+	if s == nil {
+		return false
+	}
+
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, acc := range s.accounts {
+		if acc == nil {
+			continue
+		}
+		if exclude != nil && exclude[acc.DBID] {
+			continue
+		}
+		if !acc.IsAvailable() {
+			continue
+		}
+		if !acc.AllowsAPIKey(apiKeyID) {
+			continue
+		}
+		if filter != nil && !filter(acc) {
+			continue
+		}
+
+		_, _, _, limit := acc.schedulerSnapshot(maxConcurrency)
+		if limit > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// WaitForSessionAvailableWithFilter waits for an account that satisfies the request-level filter.
+func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !s.hasDispatchCandidateWithFilter(apiKeyID, exclude, filter) {
+		return nil, ""
+	}
+
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
 	backoff := 50 * time.Millisecond
 	backoffTimer := time.NewTimer(backoff)
+	if !backoffTimer.Stop() {
+		select {
+		case <-backoffTimer.C:
+		default:
+		}
+	}
 	defer backoffTimer.Stop()
 
 	for {
@@ -1680,9 +2125,12 @@ func (s *Store) WaitForSessionAvailable(ctx context.Context, key string, timeout
 		case <-deadline.C:
 			return nil, ""
 		default:
-			acc, proxyURL := s.NextForSession(key, exclude)
+			acc, proxyURL := s.NextForSessionWithFilter(key, apiKeyID, exclude, filter)
 			if acc != nil {
 				return acc, proxyURL
+			}
+			if !s.hasDispatchCandidateWithFilter(apiKeyID, exclude, filter) {
+				return nil, ""
 			}
 			// 等待一下再重试（指数退避，最大 500ms）
 			backoffTimer.Reset(backoff)
@@ -1735,6 +2183,17 @@ func (s *Store) SetMaxRetries(n int) {
 // GetMaxRetries 获取当前最大重试次数
 func (s *Store) GetMaxRetries() int {
 	return int(atomic.LoadInt64(&s.maxRetries))
+}
+
+func (s *Store) SetMaxRateLimitRetries(n int) {
+	if n < 0 {
+		n = 0
+	}
+	atomic.StoreInt64(&s.maxRateLimitRetries, int64(n))
+}
+
+func (s *Store) GetMaxRateLimitRetries() int {
+	return int(atomic.LoadInt64(&s.maxRateLimitRetries))
 }
 
 // GetAllowRemoteMigration 获取是否允许远程迁移
@@ -1796,6 +2255,38 @@ func (s *Store) GetModelMapping() string {
 		return v
 	}
 	return "{}"
+}
+
+func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfilter.Config {
+	cfg := promptfilter.DefaultConfig()
+	if settings == nil {
+		return cfg
+	}
+	cfg.Enabled = settings.PromptFilterEnabled
+	cfg.Mode = settings.PromptFilterMode
+	cfg.Threshold = settings.PromptFilterThreshold
+	cfg.StrictThreshold = settings.PromptFilterStrictThreshold
+	cfg.LogMatches = settings.PromptFilterLogMatches
+	cfg.MaxTextLength = settings.PromptFilterMaxTextLength
+	cfg.SensitiveWords = settings.PromptFilterSensitiveWords
+	if patterns, err := promptfilter.ParseCustomPatterns(settings.PromptFilterCustomPatterns); err == nil {
+		cfg.CustomPatterns = patterns
+	}
+	if disabled, err := promptfilter.ParseDisabledPatterns(settings.PromptFilterDisabledPatterns); err == nil {
+		cfg.DisabledPatterns = disabled
+	}
+	return promptfilter.NormalizeConfig(cfg)
+}
+
+func (s *Store) SetPromptFilterConfig(cfg promptfilter.Config) {
+	s.promptFilterConfig.Store(promptfilter.NormalizeConfig(cfg))
+}
+
+func (s *Store) GetPromptFilterConfig() promptfilter.Config {
+	if v, ok := s.promptFilterConfig.Load().(promptfilter.Config); ok {
+		return promptfilter.NormalizeConfig(v)
+	}
+	return promptfilter.DefaultConfig()
 }
 
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
@@ -1862,6 +2353,33 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	return true
 }
 
+func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	acc.setAllowedAPIKeyIDsLocked(allowedAPIKeyIDs)
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	if enabled {
+		atomic.StoreInt32(&acc.DispatchPaused, 0)
+	} else {
+		atomic.StoreInt32(&acc.DispatchPaused, 1)
+	}
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
 func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string) {
 	if acc == nil {
@@ -1911,6 +2429,128 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 	}
 }
 
+func (s *Store) MarkModelCooldown(acc *Account, model string, duration time.Duration, reason string) ModelCooldown {
+	if acc == nil {
+		return ModelCooldown{}
+	}
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return ModelCooldown{}
+	}
+	if duration <= 0 {
+		duration = 5 * time.Minute
+	}
+	if duration > 30*time.Minute {
+		duration = 30 * time.Minute
+	}
+
+	now := time.Now()
+	acc.mu.Lock()
+	if acc.ModelCooldowns == nil {
+		acc.ModelCooldowns = make(map[string]ModelCooldown)
+	}
+	current := acc.ModelCooldowns[key]
+	level := current.BackoffLevel
+	if current.ResetAt.After(now) {
+		level++
+		duration *= 2
+		for i := 0; i < level-1; i++ {
+			duration *= 2
+		}
+		if duration > 30*time.Minute {
+			duration = 30 * time.Minute
+		}
+	}
+	resetAt := now.Add(duration)
+	if reason == "" {
+		reason = "rate_limited"
+	}
+	cooldown := ModelCooldown{
+		Model:        key,
+		Reason:       reason,
+		ResetAt:      resetAt,
+		UpdatedAt:    now,
+		BackoffLevel: level,
+	}
+	acc.ModelCooldowns[key] = cooldown
+	acc.LastRateLimitedAt = now
+	acc.LastFailureAt = now
+	acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
+	acc.SuccessStreak = 0
+	if acc.healthTierLocked() == HealthTierHealthy {
+		acc.HealthTier = HealthTierWarm
+	} else if acc.HealthTier != HealthTierBanned {
+		acc.HealthTier = HealthTierRisky
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.db.SetModelCooldown(ctx, acc.DBID, key, reason, resetAt); err != nil {
+			log.Printf("[账号 %d] 持久化模型冷却失败 model=%s: %v", acc.DBID, key, err)
+		}
+	}
+	return cooldown
+}
+
+func (s *Store) ClearModelCooldown(acc *Account, model string) {
+	if acc == nil || !acc.ClearModelCooldown(model) {
+		return
+	}
+	if s.db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.ClearModelCooldown(ctx, acc.DBID, normalizeModelCooldownKey(model)); err != nil {
+		log.Printf("[账号 %d] 清理模型冷却失败 model=%s: %v", acc.DBID, model, err)
+	}
+}
+
+// MarkError 标记账号为错误状态，并持久化到数据库。
+func (s *Store) MarkError(acc *Account, errorMsg string) {
+	if acc == nil {
+		return
+	}
+
+	errorMsg = strings.TrimSpace(errorMsg)
+	if errorMsg == "" {
+		errorMsg = "账号测试失败"
+	}
+	if len(errorMsg) > 500 {
+		errorMsg = errorMsg[:500]
+	}
+
+	now := time.Now()
+	acc.mu.Lock()
+	acc.Status = StatusError
+	acc.ErrorMsg = errorMsg
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.LastFailureAt = now
+	acc.FailureStreak++
+	acc.SuccessStreak = 0
+	if acc.HealthTier != HealthTierBanned {
+		acc.HealthTier = HealthTierRisky
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+
+	if s.db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.SetError(ctx, acc.DBID, errorMsg); err != nil {
+		log.Printf("[账号 %d] 持久化错误状态失败: %v", acc.DBID, err)
+	}
+}
+
 // ClearCooldown 清除账号冷却状态，并同步清理数据库
 func (s *Store) ClearCooldown(acc *Account) {
 	if acc == nil {
@@ -1920,12 +2560,17 @@ func (s *Store) ClearCooldown(acc *Account) {
 	atomic.StoreInt32(&acc.Disabled, 0) // 清除原子禁用标志
 	acc.mu.Lock()
 	wasCooling := acc.Status == StatusCooldown
-	if acc.Status == StatusCooldown {
+	wasError := acc.Status == StatusError
+	premium5hLimited := acc.premium5hRateLimitedLocked(time.Now())
+	if acc.Status == StatusCooldown || acc.Status == StatusError {
 		acc.Status = StatusReady
 	}
+	acc.ErrorMsg = ""
 	acc.CooldownUtil = time.Time{}
 	acc.CooldownReason = ""
-	if wasCooling {
+	if wasCooling && !premium5hLimited {
+		acc.HealthTier = HealthTierWarm
+	} else if wasError && acc.HealthTier != HealthTierBanned {
 		acc.HealthTier = HealthTierWarm
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -1938,8 +2583,8 @@ func (s *Store) ClearCooldown(acc *Account) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.ClearCooldown(ctx, acc.DBID); err != nil {
-		log.Printf("[账号 %d] 清理冷却状态失败: %v", acc.DBID, err)
+	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 清理账号状态失败: %v", acc.DBID, err)
 	}
 }
 
@@ -2044,6 +2689,45 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 	}
 }
 
+// ApplyUsageLimitMetadata applies metadata returned by Codex usage_limit_reached errors.
+func (s *Store) ApplyUsageLimitMetadata(acc *Account, planType string, resetAt time.Time) {
+	if acc == nil {
+		return
+	}
+
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	now := time.Now()
+	fields := make(map[string]interface{})
+
+	acc.mu.Lock()
+	if plan != "" {
+		acc.PlanType = plan
+		fields["plan_type"] = plan
+	}
+	if plan == "free" && !resetAt.IsZero() && resetAt.After(now) {
+		acc.UsagePercent7d = 100
+		acc.UsagePercent7dValid = true
+		acc.Reset7dAt = resetAt
+		acc.UsageUpdatedAt = now
+		fields["codex_7d_used_percent"] = float64(100)
+		fields["codex_7d_reset_at"] = resetAt.Format(time.RFC3339)
+		fields["codex_usage_updated_at"] = now.Format(time.RFC3339)
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+
+	if s.db == nil || len(fields) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, fields); err != nil {
+		log.Printf("[账号 %d] 持久化 usage_limit 元数据失败: %v", acc.DBID, err)
+	}
+}
+
 // SetUsageProbeFunc 注册主动探针回调
 func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 	s.usageProbeMu.Lock()
@@ -2141,7 +2825,7 @@ func (s *Store) CleanFullUsageAccounts(ctx context.Context) int {
 		}
 
 		if s.db != nil {
-			if err := s.db.SetError(ctx, acc.DBID, "deleted"); err != nil {
+			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
 				log.Printf("[账号 %d] 清理用量满账号失败: %v", acc.DBID, err)
 				continue
 			}
@@ -2211,7 +2895,7 @@ func (s *Store) CleanExpiredAccounts(ctx context.Context, maxAge time.Duration) 
 
 	// 2. 批量更新数据库状态
 	if s.db != nil {
-		if err := s.db.BatchSetError(ctx, expiredIDs, "deleted"); err != nil {
+		if err := s.db.BatchSoftDeleteAccounts(ctx, expiredIDs); err != nil {
 			log.Printf("过期清理: 批量更新数据库失败: %v，回退逐条处理", err)
 			return s.cleanExpiredFallback(ctx, expiredIDs)
 		}
@@ -2233,7 +2917,7 @@ func (s *Store) CleanExpiredAccounts(ctx context.Context, maxAge time.Duration) 
 func (s *Store) cleanExpiredFallback(ctx context.Context, ids []int64) int {
 	cleaned := 0
 	for _, id := range ids {
-		if err := s.db.SetError(ctx, id, "deleted"); err != nil {
+		if err := s.db.SoftDeleteAccount(ctx, id); err != nil {
 			log.Printf("[账号 %d] 过期清理失败: %v", id, err)
 			continue
 		}
@@ -2411,7 +3095,7 @@ func (s *Store) RefreshSingle(ctx context.Context, dbID int64) error {
 	if target == nil {
 		return fmt.Errorf("账号 %d 不存在", dbID)
 	}
-	return s.refreshAccount(ctx, target)
+	return s.refreshAccountForced(ctx, target)
 }
 
 // AccountCount 返回账号数量
@@ -2492,21 +3176,34 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// refreshAccount 刷新单个账号的 AT（带缓存锁与 token 缓存）
 func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
+	return s.refreshAccountWithOptions(ctx, acc, false)
+}
+
+func (s *Store) refreshAccountForced(ctx context.Context, acc *Account) error {
+	return s.refreshAccountWithOptions(ctx, acc, true)
+}
+
+// refreshAccountWithOptions 刷新单个账号的 AT（带缓存锁与 token 缓存）
+func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, forceRefresh bool) error {
 	acc.mu.RLock()
 	rt := acc.RefreshToken
-	proxy := acc.ProxyURL
+	st := acc.SessionToken
 	dbID := acc.DBID
 	cooldownUntil := acc.CooldownUtil
 	cooldownReason := acc.CooldownReason
-	activeCooldown := acc.Status == StatusCooldown && time.Now().Before(acc.CooldownUtil)
-	expiredCooldown := acc.Status == StatusCooldown && !time.Now().Before(acc.CooldownUtil)
+	now := time.Now()
+	activeCooldown := acc.Status == StatusCooldown && now.Before(acc.CooldownUtil)
+	expiredCooldown := acc.Status == StatusCooldown && !now.Before(acc.CooldownUtil)
 	acc.mu.RUnlock()
 
 	// 1. 尝试从缓存读取 AT
-	cachedToken, err := s.tokenCache.GetAccessToken(ctx, dbID)
-	if err == nil && cachedToken != "" {
+	cachedToken := ""
+	var err error
+	if s.tokenCache != nil && !forceRefresh {
+		cachedToken, err = s.tokenCache.GetAccessToken(ctx, dbID)
+	}
+	if cachedToken != "" {
 		acc.mu.Lock()
 		acc.AccessToken = cachedToken
 		if acc.ExpiresAt.IsZero() || time.Until(acc.ExpiresAt) < 5*time.Minute {
@@ -2526,46 +3223,84 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		s.fastSchedulerUpdate(acc)
 		if expiredCooldown {
 			_ = s.db.ClearCooldown(ctx, dbID)
+		} else if !activeCooldown && s.db != nil {
+			_ = s.db.ClearError(ctx, dbID)
 		}
 		return nil
 	}
 
 	// 2. 获取刷新锁
-	acquired, lockErr := s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
-	if lockErr != nil {
-		log.Printf("[账号 %d] 获取刷新锁失败: %v", dbID, lockErr)
-	}
-	if !acquired && lockErr == nil {
-		// 另一个进程在刷新，等待它完成
-		token, waitErr := s.tokenCache.WaitForRefreshComplete(ctx, dbID, 30*time.Second)
-		if waitErr == nil && token != "" {
-			acc.mu.Lock()
-			acc.AccessToken = token
-			acc.ExpiresAt = time.Now().Add(55 * time.Minute)
-			if activeCooldown {
-				acc.Status = StatusCooldown
-				acc.CooldownUtil = cooldownUntil
-				acc.CooldownReason = cooldownReason
-			} else {
-				acc.Status = StatusReady
-				acc.CooldownUtil = time.Time{}
-				acc.CooldownReason = ""
-			}
-			acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-			acc.mu.Unlock()
-			s.fastSchedulerUpdate(acc)
-			if expiredCooldown {
-				_ = s.db.ClearCooldown(ctx, dbID)
-			}
-			return nil
+	if s.tokenCache != nil {
+		acquired, lockErr := s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
+		if lockErr != nil {
+			log.Printf("[账号 %d] 获取刷新锁失败: %v", dbID, lockErr)
 		}
-	} else if acquired {
-		defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
+		if !acquired && lockErr == nil {
+			// 另一个进程在刷新，等待它完成
+			token, waitErr := s.tokenCache.WaitForRefreshComplete(ctx, dbID, 30*time.Second)
+			if !forceRefresh && waitErr == nil && token != "" {
+				acc.mu.Lock()
+				acc.AccessToken = token
+				acc.ExpiresAt = time.Now().Add(55 * time.Minute)
+				if activeCooldown {
+					acc.Status = StatusCooldown
+					acc.CooldownUtil = cooldownUntil
+					acc.CooldownReason = cooldownReason
+				} else {
+					acc.Status = StatusReady
+					acc.CooldownUtil = time.Time{}
+					acc.CooldownReason = ""
+				}
+				acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+				acc.mu.Unlock()
+				s.fastSchedulerUpdate(acc)
+				if expiredCooldown && s.db != nil {
+					_ = s.db.ClearCooldown(ctx, dbID)
+				} else if !activeCooldown && s.db != nil {
+					_ = s.db.ClearError(ctx, dbID)
+				}
+				return nil
+			}
+			if forceRefresh {
+				if waitErr != nil {
+					log.Printf("[账号 %d] 等待已有刷新任务完成失败，继续尝试强制刷新: %v", dbID, waitErr)
+				}
+				acquired, lockErr = s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
+				if lockErr != nil {
+					log.Printf("[账号 %d] 获取强制刷新锁失败: %v", dbID, lockErr)
+				}
+				if !acquired && lockErr == nil {
+					return fmt.Errorf("账号 %d 正在刷新，请稍后重试", dbID)
+				}
+			}
+		}
+		if acquired {
+			defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
+		}
 	}
 
 	// 3. 执行 RT 刷新（Resin 启用时传入 DBID 用于粘性代理）
 	resinID := fmt.Sprintf("%d", dbID)
-	td, info, err := RefreshWithRetry(ctx, rt, proxy, resinID)
+	proxy := s.ResolveProxyForAccount(acc)
+	var td *TokenData
+	var info *AccountInfo
+	if rt != "" {
+		td, info, err = RefreshWithRetry(ctx, rt, proxy, resinID)
+	} else {
+		err = fmt.Errorf("refresh_token 为空")
+	}
+	if err != nil && st != "" {
+		rtErr := err
+		if stTD, stInfo, stErr := RefreshWithSessionTokenRetry(ctx, st, proxy, resinID); stErr == nil {
+			td, info, err = stTD, stInfo, nil
+			if td.RefreshToken == "" {
+				td.RefreshToken = rt
+			}
+			log.Printf("[账号 %d] RT 刷新失败后已使用 session_token 回退刷新 AT", dbID)
+		} else {
+			err = fmt.Errorf("RT 刷新失败: %v；session_token 回退失败: %w", rtErr, stErr)
+		}
+	}
 	if err != nil {
 		if isNonRetryable(err) {
 			acc.mu.Lock()
@@ -2580,9 +3315,14 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	}
 
 	// 4. 更新内存状态
+	appliedPlanType := ""
+	skippedPlanType := ""
 	acc.mu.Lock()
 	acc.AccessToken = td.AccessToken
-	acc.RefreshToken = td.RefreshToken
+	if td.RefreshToken != "" {
+		acc.RefreshToken = td.RefreshToken
+	}
+	acc.SessionToken = st
 	acc.ExpiresAt = td.ExpiresAt
 	acc.ErrorMsg = ""
 	if info != nil {
@@ -2594,7 +3334,11 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		}
 		// 不用空值覆盖已有的 PlanType，避免 plus 号被误标为 free
 		if info.PlanType != "" {
-			acc.PlanType = info.PlanType
+			if plan, applied := acc.applyRefreshedPlanTypeLocked(info.PlanType, now); applied {
+				appliedPlanType = plan
+			} else {
+				skippedPlanType = plan
+			}
 		} else if acc.PlanType == "" {
 			log.Printf("[账号 %d] 刷新后 plan_type 为空，无法识别套餐类型", dbID)
 		}
@@ -2611,19 +3355,27 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	if skippedPlanType != "" {
+		log.Printf("[账号 %d] 刷新返回 plan_type=%s，但 Codex free 7d 额度仍处于耗尽窗口，保留 plan_type=free", dbID, skippedPlanType)
+	}
 
 	// 5. 写入缓存
 	ttl := time.Until(td.ExpiresAt) - 5*time.Minute
-	if ttl > 0 {
+	if s.tokenCache != nil && ttl > 0 {
 		_ = s.tokenCache.SetAccessToken(ctx, dbID, td.AccessToken, ttl)
 	}
 
 	// 6. 更新数据库 credentials
 	credentials := map[string]interface{}{
-		"refresh_token": td.RefreshToken,
-		"access_token":  td.AccessToken,
-		"id_token":      td.IDToken,
-		"expires_at":    td.ExpiresAt.Format(time.RFC3339),
+		"access_token": td.AccessToken,
+		"id_token":     td.IDToken,
+		"expires_at":   td.ExpiresAt.Format(time.RFC3339),
+	}
+	if td.RefreshToken != "" {
+		credentials["refresh_token"] = td.RefreshToken
+	}
+	if st != "" {
+		credentials["session_token"] = st
 	}
 	if info != nil {
 		if info.ChatGPTAccountID != "" {
@@ -2632,21 +3384,23 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		if info.Email != "" {
 			credentials["email"] = info.Email
 		}
-		if info.PlanType != "" {
-			credentials["plan_type"] = info.PlanType
+		if appliedPlanType != "" {
+			credentials["plan_type"] = appliedPlanType
 		}
 	}
 	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
 		log.Printf("[账号 %d] 更新数据库失败: %v", dbID, err)
 	}
+	if err := s.db.ClearError(ctx, dbID); err != nil {
+		log.Printf("[账号 %d] 清理错误状态失败: %v", dbID, err)
+	}
 
 	// 自动锁定 free 以上的账号（pro/plus/team/teamplus 等）
-	if info != nil && atomic.LoadInt32(&acc.Locked) == 0 {
-		plan := strings.ToLower(info.PlanType)
-		if plan != "" && plan != "free" {
+	if appliedPlanType != "" && atomic.LoadInt32(&acc.Locked) == 0 {
+		if appliedPlanType != "free" {
 			atomic.StoreInt32(&acc.Locked, 1)
 			_ = s.db.SetAccountLocked(ctx, dbID, true)
-			log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, info.PlanType)
+			log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, appliedPlanType)
 		}
 	}
 

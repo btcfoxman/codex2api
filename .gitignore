@@ -34,3 +34,7 @@ scripts
 logs/
 codex2api.db
 codex2api.db-*
+AGMENT.md
+CLIProxyAPI/
+sub2api/
+new-api/
