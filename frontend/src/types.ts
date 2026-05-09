@@ -257,6 +257,7 @@ export interface SystemSettings {
   image_s3_access_key: string
   image_s3_secret_key: string
   image_s3_prefix: string
+  image_s3_public_base_url: string
   image_s3_force_path_style: boolean
 }
 

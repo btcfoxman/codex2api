@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/base64"
 	"strings"
 	"testing"
@@ -268,6 +269,43 @@ func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "usage.images").Int(); got != 1 {
 		t.Fatalf("usage.images = %d, want 1", got)
+	}
+}
+
+func TestCollectImagesResponseUploadsURLWhenB64NotRequested(t *testing.T) {
+	upstream := `data: {"type":"response.completed","response":{"created_at":1710000000,"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"` + tinyPNGBase64 + `","revised_prompt":"draw a cat","output_format":"png"}]}}` + "\n\n"
+	uploaderCalled := false
+
+	out, _, imageCount, _, err := collectImagesResponseWithUploader(
+		context.Background(),
+		strings.NewReader(upstream),
+		"",
+		"gpt-image-2",
+		func(_ context.Context, image imageCallResult, index int) (string, error) {
+			uploaderCalled = true
+			if index != 0 {
+				t.Fatalf("upload index = %d, want 0", index)
+			}
+			if image.Result != tinyPNGBase64 {
+				t.Fatalf("upload image result mismatch")
+			}
+			return "https://cdn.example.com/images/generated.png", nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("collectImagesResponseWithUploader returned error: %v", err)
+	}
+	if !uploaderCalled {
+		t.Fatal("expected uploader to be called")
+	}
+	if imageCount != 1 {
+		t.Fatalf("imageCount = %d, want 1", imageCount)
+	}
+	if got := gjson.GetBytes(out, "data.0.url").String(); got != "https://cdn.example.com/images/generated.png" {
+		t.Fatalf("url = %q, want uploaded URL", got)
+	}
+	if gjson.GetBytes(out, "data.0.b64_json").Exists() {
+		t.Fatalf("b64_json should be omitted when URL response is requested: %s", string(out))
 	}
 }
 

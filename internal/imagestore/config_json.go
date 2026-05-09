@@ -17,6 +17,7 @@ type ConfigJSON struct {
 	AccessKey      string `json:"access_key,omitempty"`
 	SecretKey      string `json:"secret_key,omitempty"`
 	Prefix         string `json:"prefix,omitempty"`
+	PublicBaseURL  string `json:"public_base_url,omitempty"`
 	ForcePathStyle bool   `json:"force_path_style,omitempty"`
 }
 
@@ -39,6 +40,7 @@ func ParseConfigJSON(raw string) (Config, error) {
 	cfg.AccessKey = v.AccessKey
 	cfg.SecretKey = v.SecretKey
 	cfg.Prefix = v.Prefix
+	cfg.PublicBaseURL = v.PublicBaseURL
 	cfg.ForcePathStyle = v.ForcePathStyle
 	return cfg.Normalize(), nil
 }
@@ -54,6 +56,7 @@ func EncodeConfigJSON(cfg Config) (string, error) {
 		AccessKey:      cfg.AccessKey,
 		SecretKey:      cfg.SecretKey,
 		Prefix:         strings.TrimSuffix(cfg.Prefix, "/"), // 持久化时去掉末尾斜杠，加载时再补
+		PublicBaseURL:  cfg.PublicBaseURL,
 		ForcePathStyle: cfg.ForcePathStyle,
 	}
 	if v.Backend == BackendLocal {

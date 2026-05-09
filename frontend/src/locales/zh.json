@@ -806,6 +806,8 @@
     "imageS3SecretKeyDesc": "访问密钥的私有部分；保存时会持久化到数据库。",
     "imageS3Prefix": "对象前缀",
     "imageS3PrefixDesc": "可选；为所有对象 key 加一段前缀，例如 codex/images。",
+    "imageS3PublicBaseUrl": "公开访问基址",
+    "imageS3PublicBaseUrlDesc": "可选；配置后 API 会直接返回对象公开 URL，例如 https://cdn.example.com。对象前缀会自动拼到路径中；留空则返回 codex2api 签名代理链接。",
     "imageS3ForcePathStyle": "Path-Style 寻址",
     "imageS3ForcePathStyleDesc": "MinIO 等需要打开；AWS S3 / R2 一般保持关闭。",
     "imageS3Test": "测试连接",

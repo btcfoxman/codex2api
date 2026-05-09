@@ -2240,6 +2240,7 @@ type settingsResponse struct {
 	ImageS3AccessKey                 string `json:"image_s3_access_key"`
 	ImageS3SecretKey                 string `json:"image_s3_secret_key"`
 	ImageS3Prefix                    string `json:"image_s3_prefix"`
+	ImageS3PublicBaseURL             string `json:"image_s3_public_base_url"`
 	ImageS3ForcePathStyle            bool   `json:"image_s3_force_path_style"`
 }
 
@@ -2291,6 +2292,7 @@ type updateSettingsReq struct {
 	ImageS3AccessKey                 *string `json:"image_s3_access_key"`
 	ImageS3SecretKey                 *string `json:"image_s3_secret_key"`
 	ImageS3Prefix                    *string `json:"image_s3_prefix"`
+	ImageS3PublicBaseURL             *string `json:"image_s3_public_base_url"`
 	ImageS3ForcePathStyle            *bool   `json:"image_s3_force_path_style"`
 }
 
@@ -2366,6 +2368,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ImageS3AccessKey:                 imgCfg.AccessKey,
 		ImageS3SecretKey:                 imgCfg.SecretKey,
 		ImageS3Prefix:                    imgPrefix,
+		ImageS3PublicBaseURL:             imgCfg.PublicBaseURL,
 		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
 	})
 }
@@ -2743,6 +2746,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		imgCfg.Prefix = *req.ImageS3Prefix
 		imgChanged = true
 	}
+	if req.ImageS3PublicBaseURL != nil {
+		imgCfg.PublicBaseURL = *req.ImageS3PublicBaseURL
+		imgChanged = true
+	}
 	if req.ImageS3ForcePathStyle != nil {
 		imgCfg.ForcePathStyle = *req.ImageS3ForcePathStyle
 		imgChanged = true
@@ -2878,6 +2885,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3AccessKey:                 imgCfg.AccessKey,
 		ImageS3SecretKey:                 imgCfg.SecretKey,
 		ImageS3Prefix:                    strings.TrimSuffix(imgCfg.Prefix, "/"),
+		ImageS3PublicBaseURL:             imgCfg.PublicBaseURL,
 		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
 	})
 }

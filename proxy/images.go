@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -18,7 +19,10 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/signedasset"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -519,6 +523,126 @@ func mimeTypeFromOutputFormat(outputFormat string) string {
 	}
 }
 
+func imagesResponseWantsB64(responseFormat string) bool {
+	switch strings.ToLower(strings.TrimSpace(responseFormat)) {
+	case "b64", "b64_json", "base64":
+		return true
+	default:
+		return false
+	}
+}
+
+func imageExtensionFromFormatAndMime(outputFormat, mimeType string) string {
+	format := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(outputFormat)), ".")
+	switch format {
+	case "png", "jpg", "jpeg", "webp", "gif":
+		if format == "jpeg" {
+			return "jpg"
+		}
+		return format
+	}
+	switch strings.ToLower(strings.TrimSpace(mimeType)) {
+	case "image/jpeg":
+		return "jpg"
+	case "image/webp":
+		return "webp"
+	case "image/gif":
+		return "gif"
+	default:
+		return "png"
+	}
+}
+
+func (h *Handler) imageResponseURLUploader(c *gin.Context) imageResponseURLUploader {
+	return func(ctx context.Context, image imageCallResult, index int) (string, error) {
+		return h.saveImageResponseAsURL(ctx, c, image, index)
+	}
+}
+
+func (h *Handler) saveImageResponseAsURL(ctx context.Context, c *gin.Context, image imageCallResult, index int) (string, error) {
+	data, ok := decodeImageBase64(image.Result)
+	if !ok || len(data) == 0 {
+		return "", fmt.Errorf("image upload failed: generated image data is not valid base64")
+	}
+	mimeType := mimeTypeFromOutputFormat(image.OutputFormat)
+	if detected := strings.TrimSpace(http.DetectContentType(data)); detected != "" && strings.TrimSpace(image.OutputFormat) == "" {
+		mimeType = detected
+	}
+	ext := imageExtensionFromFormatAndMime(image.OutputFormat, mimeType)
+	backend, err := imagestore.Primary()
+	if err != nil {
+		return "", fmt.Errorf("image upload failed: %w", err)
+	}
+	filename := fmt.Sprintf("api-%d-%02d-%s.%s", time.Now().UnixNano(), index+1, uuid.NewString()[:8], ext)
+	ref, err := backend.Save(ctx, filename, data, mimeType)
+	if err != nil {
+		return "", fmt.Errorf("image upload failed: %w", err)
+	}
+	if publicURL, ok := imagestore.PublicURL(ref); ok {
+		return publicURL, nil
+	}
+	if h == nil || h.db == nil {
+		return "data:" + mimeType + ";base64," + image.Result, nil
+	}
+	populateImageStats(&image)
+	actualSize := ""
+	if image.Width > 0 && image.Height > 0 {
+		actualSize = fmt.Sprintf("%dx%d", image.Width, image.Height)
+	}
+	assetID, err := h.db.InsertImageAsset(ctx, database.ImageAssetInput{
+		JobID:         0,
+		Filename:      filename,
+		StoragePath:   ref,
+		MimeType:      mimeType,
+		Bytes:         len(data),
+		Width:         image.Width,
+		Height:        image.Height,
+		Model:         image.Model,
+		RequestedSize: image.Size,
+		ActualSize:    actualSize,
+		Quality:       image.Quality,
+		OutputFormat:  ext,
+		RevisedPrompt: image.RevisedPrompt,
+	})
+	if err != nil {
+		_ = backend.Delete(ctx, ref)
+		return "", fmt.Errorf("image asset record failed: %w", err)
+	}
+	return absoluteRequestURL(c, signedasset.ImageAssetURL(assetID, 0)), nil
+}
+
+func absoluteRequestURL(c *gin.Context, rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" || strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://") || strings.HasPrefix(rawURL, "data:") {
+		return rawURL
+	}
+	if c == nil || c.Request == nil {
+		return rawURL
+	}
+	proto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto"))
+	if proto == "" {
+		proto = strings.TrimSpace(c.GetHeader("X-Real-Scheme"))
+	}
+	if proto == "" {
+		if c.Request.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+	host := strings.TrimSpace(c.GetHeader("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(c.Request.Host)
+	}
+	if host == "" {
+		return rawURL
+	}
+	if !strings.HasPrefix(rawURL, "/") {
+		rawURL = "/" + rawURL
+	}
+	return proto + "://" + host + rawURL
+}
+
 func parseIntField(raw string, fallback int64) int64 {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -599,7 +723,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawBody, "response_format").String())
 	if responseFormat == "" {
-		responseFormat = "b64_json"
+		responseFormat = "url"
 	}
 	stream := gjson.GetBytes(rawBody, "stream").Bool()
 
@@ -698,7 +822,7 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 
 	responseFormat := strings.TrimSpace(c.PostForm("response_format"))
 	if responseFormat == "" {
-		responseFormat = "b64_json"
+		responseFormat = "url"
 	}
 	stream := parseBoolField(c.PostForm("stream"), false)
 
@@ -788,7 +912,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	responseFormat := strings.TrimSpace(gjson.GetBytes(rawBody, "response_format").String())
 	if responseFormat == "" {
-		responseFormat = "b64_json"
+		responseFormat = "url"
 	}
 	stream := gjson.GetBytes(rawBody, "stream").Bool()
 
@@ -968,7 +1092,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start)
 		} else {
 			var out []byte
-			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(resp.Body, responseFormat, requestModel)
+			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponseWithUploader(c.Request.Context(), resp.Body, responseFormat, requestModel, h.imageResponseURLUploader(c))
 			if readErr == nil {
 				c.Data(http.StatusOK, "application/json", out)
 			} else {
@@ -1025,7 +1149,13 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 
 }
 
+type imageResponseURLUploader func(context.Context, imageCallResult, int) (string, error)
+
 func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
+	return collectImagesResponseWithUploader(context.Background(), body, responseFormat, fallbackModel, nil)
+}
+
+func collectImagesResponseWithUploader(ctx context.Context, body io.Reader, responseFormat, fallbackModel string, uploader imageResponseURLUploader) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
 	var (
 		out            []byte
 		usage          *UsageInfo
@@ -1071,7 +1201,7 @@ func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string)
 				readErr = fmt.Errorf("upstream did not return image output")
 				return false
 			}
-			out, readErr = buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
+			out, readErr = buildImagesAPIResponse(ctx, results, createdAt, usageRaw, firstMeta, responseFormat, uploader)
 			imageLogInfo = imageUsageLogInfoFromImages(results)
 			return false
 		case "error":
@@ -1094,7 +1224,7 @@ func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string)
 			for i := range pendingResults {
 				mergeImageMeta(&pendingResults[i], firstMeta)
 			}
-			out, readErr = buildImagesAPIResponse(pendingResults, createdAt, nil, firstMeta, responseFormat)
+			out, readErr = buildImagesAPIResponse(ctx, pendingResults, createdAt, nil, firstMeta, responseFormat, uploader)
 			if readErr != nil {
 				return nil, usage, 0, imageLogInfo, readErr
 			}
@@ -1199,7 +1329,17 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			eventName := streamPrefix + ".completed"
 			for _, image := range results {
 				mergeImageMeta(&image, streamMeta)
-				writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, usageRaw))
+				imageURL := ""
+				if !imagesResponseWantsB64(responseFormat) {
+					var uploadErr error
+					imageURL, uploadErr = h.saveImageResponseAsURL(c.Request.Context(), c, image, imageCount)
+					if uploadErr != nil {
+						readErr = uploadErr
+						writeEvent("error", buildImagesStreamErrorPayload(uploadErr.Error()))
+						return false
+					}
+				}
+				writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, imageURL, createdAt, usageRaw))
 				imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				imageCount++
 			}
@@ -1225,7 +1365,17 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		eventName := streamPrefix + ".completed"
 		for _, image := range pendingResults {
 			mergeImageMeta(&image, streamMeta)
-			writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, nil))
+			imageURL := ""
+			if !imagesResponseWantsB64(responseFormat) {
+				var uploadErr error
+				imageURL, uploadErr = h.saveImageResponseAsURL(c.Request.Context(), c, image, imageCount)
+				if uploadErr != nil {
+					readErr = uploadErr
+					writeEvent("error", buildImagesStreamErrorPayload(uploadErr.Error()))
+					break
+				}
+			}
+			writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, imageURL, createdAt, nil))
 			imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 			imageCount++
 		}
@@ -1402,24 +1552,32 @@ func mergeImageMeta(target *imageCallResult, source imageCallResult) {
 	}
 }
 
-func buildImagesAPIResponse(results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, responseFormat string) ([]byte, error) {
+func buildImagesAPIResponse(ctx context.Context, results []imageCallResult, createdAt int64, usageRaw []byte, firstMeta imageCallResult, responseFormat string, uploader imageResponseURLUploader) ([]byte, error) {
 	if createdAt <= 0 {
 		createdAt = time.Now().Unix()
 	}
 	out := []byte(`{"created":0,"data":[]}`)
 	out, _ = sjson.SetBytes(out, "created", createdAt)
 
-	format := strings.ToLower(strings.TrimSpace(responseFormat))
-	if format == "" {
-		format = "b64_json"
-	}
-	for _, image := range results {
+	wantsB64 := imagesResponseWantsB64(responseFormat)
+	for idx, image := range results {
 		populateImageStats(&image)
 		item := []byte(`{}`)
-		if format == "url" {
-			item, _ = sjson.SetBytes(item, "url", "data:"+mimeTypeFromOutputFormat(image.OutputFormat)+";base64,"+image.Result)
-		} else {
+		if wantsB64 {
 			item, _ = sjson.SetBytes(item, "b64_json", image.Result)
+		} else {
+			imageURL := ""
+			if uploader != nil {
+				var err error
+				imageURL, err = uploader(ctx, image, idx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if imageURL == "" {
+				imageURL = "data:" + mimeTypeFromOutputFormat(image.OutputFormat) + ";base64," + image.Result
+			}
+			item, _ = sjson.SetBytes(item, "url", imageURL)
 		}
 		if image.ByteSize > 0 {
 			item, _ = sjson.SetBytes(item, "bytes", image.ByteSize)
@@ -1476,23 +1634,27 @@ func buildImagesStreamPartialPayload(eventType, b64 string, partialImageIndex in
 			payload, _ = sjson.SetBytes(payload, "height", stats.Height)
 		}
 	}
-	if strings.EqualFold(strings.TrimSpace(responseFormat), "url") {
+	if !imagesResponseWantsB64(responseFormat) {
 		payload, _ = sjson.SetBytes(payload, "url", "data:"+mimeTypeFromOutputFormat(meta.OutputFormat)+";base64,"+b64)
 	}
 	return addImageMetaToPayload(payload, meta)
 }
 
-func buildImagesStreamCompletedPayload(eventType string, image imageCallResult, responseFormat string, createdAt int64, usageRaw []byte) []byte {
+func buildImagesStreamCompletedPayload(eventType string, image imageCallResult, responseFormat string, imageURL string, createdAt int64, usageRaw []byte) []byte {
 	if createdAt <= 0 {
 		createdAt = time.Now().Unix()
 	}
-	payload := []byte(`{"type":"","created_at":0,"b64_json":""}`)
+	payload := []byte(`{"type":"","created_at":0}`)
 	payload, _ = sjson.SetBytes(payload, "type", eventType)
 	payload, _ = sjson.SetBytes(payload, "created_at", createdAt)
-	payload, _ = sjson.SetBytes(payload, "b64_json", image.Result)
 	populateImageStats(&image)
-	if strings.EqualFold(strings.TrimSpace(responseFormat), "url") {
-		payload, _ = sjson.SetBytes(payload, "url", "data:"+mimeTypeFromOutputFormat(image.OutputFormat)+";base64,"+image.Result)
+	if imagesResponseWantsB64(responseFormat) {
+		payload, _ = sjson.SetBytes(payload, "b64_json", image.Result)
+	} else {
+		if imageURL == "" {
+			imageURL = "data:" + mimeTypeFromOutputFormat(image.OutputFormat) + ";base64," + image.Result
+		}
+		payload, _ = sjson.SetBytes(payload, "url", imageURL)
 	}
 	payload = addImageMetaToPayload(payload, image)
 	if len(usageRaw) > 0 && json.Valid(usageRaw) {

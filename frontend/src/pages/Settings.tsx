@@ -281,6 +281,7 @@ export default function Settings() {
     image_s3_access_key: '',
     image_s3_secret_key: '',
     image_s3_prefix: '',
+    image_s3_public_base_url: '',
     image_s3_force_path_style: false,
   })
   const [savingSettings, setSavingSettings] = useState(false)
@@ -664,6 +665,13 @@ export default function Settings() {
                       value={settingsForm.image_s3_prefix}
                       placeholder="codex/images"
                       onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_prefix: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3PublicBaseUrl')} description={t('settings.imageS3PublicBaseUrlDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_public_base_url}
+                      placeholder="https://cdn.example.com"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_public_base_url: e.target.value }))}
                     />
                   </SettingField>
                   <SettingField label={t('settings.imageS3ForcePathStyle')} description={t('settings.imageS3ForcePathStyleDesc')}>

@@ -45,6 +45,7 @@ type Config struct {
 	AccessKey      string
 	SecretKey      string
 	Prefix         string // 例如 "images/"，会自动拼到对象 key 前
+	PublicBaseURL  string // 公开访问基址，例如 https://cdn.example.com/images
 	ForcePathStyle bool   // MinIO / 部分自建服务必须开启
 	LocalDir       string // LocalBackend 使用的目录；为空则由调用方提供默认
 }
@@ -61,6 +62,7 @@ func (c Config) Normalize() Config {
 	c.AccessKey = strings.TrimSpace(c.AccessKey)
 	c.SecretKey = strings.TrimSpace(c.SecretKey)
 	c.Prefix = strings.TrimSpace(c.Prefix)
+	c.PublicBaseURL = strings.TrimRight(strings.TrimSpace(c.PublicBaseURL), "/")
 	if c.Prefix != "" {
 		c.Prefix = strings.Trim(c.Prefix, "/") + "/"
 	}
@@ -159,6 +161,24 @@ func Primary() (Backend, error) {
 		return nil, ErrNotConfigured
 	}
 	return st.primary, nil
+}
+
+// PublicURL returns a directly usable object URL when the current S3-compatible
+// backend has a public base URL configured.
+func PublicURL(ref string) (string, bool) {
+	st := current.Load()
+	if st == nil {
+		return "", false
+	}
+	cfg := st.cfg.Normalize()
+	if cfg.PublicBaseURL == "" || !IsS3Ref(ref) {
+		return "", false
+	}
+	_, key, err := parseS3Ref(ref)
+	if err != nil || strings.TrimSpace(key) == "" {
+		return "", false
+	}
+	return cfg.PublicBaseURL + "/" + strings.TrimLeft(key, "/"), true
 }
 
 // Resolve 按 ref 路由到正确后端。
