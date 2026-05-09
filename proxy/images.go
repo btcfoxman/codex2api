@@ -13,6 +13,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -553,13 +554,13 @@ func imageExtensionFromFormatAndMime(outputFormat, mimeType string) string {
 	}
 }
 
-func (h *Handler) imageResponseURLUploader(c *gin.Context) imageResponseURLUploader {
+func (h *Handler) imageResponseURLUploader(c *gin.Context, sourceImageURLs []string) imageResponseURLUploader {
 	return func(ctx context.Context, image imageCallResult, index int) (string, error) {
-		return h.saveImageResponseAsURL(ctx, c, image, index)
+		return h.saveImageResponseAsURL(ctx, c, image, index, sourceImageURLs)
 	}
 }
 
-func (h *Handler) saveImageResponseAsURL(ctx context.Context, c *gin.Context, image imageCallResult, index int) (string, error) {
+func (h *Handler) saveImageResponseAsURL(ctx context.Context, c *gin.Context, image imageCallResult, index int, sourceImageURLs []string) (string, error) {
 	data, ok := decodeImageBase64(image.Result)
 	if !ok || len(data) == 0 {
 		return "", fmt.Errorf("image upload failed: generated image data is not valid base64")
@@ -579,7 +580,9 @@ func (h *Handler) saveImageResponseAsURL(ctx context.Context, c *gin.Context, im
 		return "", fmt.Errorf("image upload failed: %w", err)
 	}
 	if publicURL, ok := imagestore.PublicURL(ref); ok {
-		return publicURL, nil
+		if !imageURLMatchesAny(publicURL, sourceImageURLs) {
+			return publicURL, nil
+		}
 	}
 	if h == nil || h.db == nil {
 		return "data:" + mimeType + ";base64," + image.Result, nil
@@ -609,6 +612,34 @@ func (h *Handler) saveImageResponseAsURL(ctx context.Context, c *gin.Context, im
 		return "", fmt.Errorf("image asset record failed: %w", err)
 	}
 	return absoluteRequestURL(c, signedasset.ImageAssetURL(assetID, 0)), nil
+}
+
+func imageURLMatchesAny(candidate string, sources []string) bool {
+	candidateKey := comparableImageURL(candidate)
+	if candidateKey == "" {
+		return false
+	}
+	for _, source := range sources {
+		if candidateKey == comparableImageURL(source) {
+			return true
+		}
+	}
+	return false
+}
+
+func comparableImageURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(strings.ToLower(raw), "data:") {
+		return raw
+	}
+	parsed, err := neturl.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return raw
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Host)
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	return scheme + "://" + host + path
 }
 
 func absoluteRequestURL(c *gin.Context, rawURL string) string {
@@ -748,7 +779,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, nil, tool)
-	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, responsesBody, responseFormat, "image_generation", stream)
+	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, responsesBody, responseFormat, "image_generation", stream, nil)
 }
 
 func (h *Handler) ImagesEdits(c *gin.Context) {
@@ -833,7 +864,7 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream, images)
 }
 
 func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
@@ -940,7 +971,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream, images)
 }
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
@@ -983,7 +1014,7 @@ func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool) (*aut
 	return h.nextAccountForSession("", apiKeyID, exclude)
 }
 
-func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
+func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool, sourceImageURLs []string) {
 	if err := validateResponsesImageGenerationSizes(responsesBody); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -1089,10 +1120,10 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		var imageLogInfo imageUsageLogInfo
 		var readErr error
 		if stream {
-			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start)
+			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start, sourceImageURLs)
 		} else {
 			var out []byte
-			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponseWithUploader(c.Request.Context(), resp.Body, responseFormat, requestModel, h.imageResponseURLUploader(c))
+			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponseWithUploader(c.Request.Context(), resp.Body, responseFormat, requestModel, h.imageResponseURLUploader(c, sourceImageURLs))
 			if readErr == nil {
 				c.Data(http.StatusOK, "application/json", out)
 			} else {
@@ -1236,7 +1267,7 @@ func collectImagesResponseWithUploader(ctx context.Context, body io.Reader, resp
 	return out, usage, len(gjson.GetBytes(out, "data").Array()), imageLogInfo, nil
 }
 
-func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseFormat, streamPrefix, fallbackModel string, start time.Time) (*UsageInfo, int, int, imageUsageLogInfo, error) {
+func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseFormat, streamPrefix, fallbackModel string, start time.Time, sourceImageURLs []string) (*UsageInfo, int, int, imageUsageLogInfo, error) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -1332,7 +1363,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				imageURL := ""
 				if !imagesResponseWantsB64(responseFormat) {
 					var uploadErr error
-					imageURL, uploadErr = h.saveImageResponseAsURL(c.Request.Context(), c, image, imageCount)
+					imageURL, uploadErr = h.saveImageResponseAsURL(c.Request.Context(), c, image, imageCount, sourceImageURLs)
 					if uploadErr != nil {
 						readErr = uploadErr
 						writeEvent("error", buildImagesStreamErrorPayload(uploadErr.Error()))
@@ -1368,7 +1399,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			imageURL := ""
 			if !imagesResponseWantsB64(responseFormat) {
 				var uploadErr error
-				imageURL, uploadErr = h.saveImageResponseAsURL(c.Request.Context(), c, image, imageCount)
+				imageURL, uploadErr = h.saveImageResponseAsURL(c.Request.Context(), c, image, imageCount, sourceImageURLs)
 				if uploadErr != nil {
 					readErr = uploadErr
 					writeEvent("error", buildImagesStreamErrorPayload(uploadErr.Error()))

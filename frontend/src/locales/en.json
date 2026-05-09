@@ -807,7 +807,7 @@
     "imageS3Prefix": "Object prefix",
     "imageS3PrefixDesc": "Optional; prepended to every object key, e.g. codex/images.",
     "imageS3PublicBaseUrl": "Public base URL",
-    "imageS3PublicBaseUrlDesc": "Optional. When set, image APIs return direct object URLs such as https://cdn.example.com. The object prefix is appended automatically; otherwise they return codex2api signed proxy URLs.",
+    "imageS3PublicBaseUrlDesc": "Optional. When set, image APIs return direct object URLs. This can be the bucket/CDN root or the object prefix directory; duplicate prefixes are avoided automatically. Otherwise they return codex2api signed proxy URLs.",
     "imageS3ForcePathStyle": "Path-Style addressing",
     "imageS3ForcePathStyleDesc": "Required by MinIO; usually off for AWS S3 / R2.",
     "imageS3Test": "Test connection",

@@ -309,6 +309,18 @@ func TestCollectImagesResponseUploadsURLWhenB64NotRequested(t *testing.T) {
 	}
 }
 
+func TestImageURLMatchesAnySourceURL(t *testing.T) {
+	sources := []string{
+		"https://www.zejiaonly.top:8953/miniofile/aaa/2026/05/08/source.png?sign=old",
+	}
+	if !imageURLMatchesAny("https://www.zejiaonly.top:8953/miniofile/aaa/2026/05/08/source.png", sources) {
+		t.Fatal("expected same source image URL to match even with different query")
+	}
+	if imageURLMatchesAny("https://www.zejiaonly.top:8953/miniofile/aaa/2026/05/08/api-new.png", sources) {
+		t.Fatal("generated object URL should not match source image URL")
+	}
+}
+
 func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	upstream := `data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"An error occurred while processing your request. Please include the request ID req-123."}}}` + "\n\n"
 

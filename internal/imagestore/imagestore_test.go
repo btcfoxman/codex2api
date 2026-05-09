@@ -48,6 +48,7 @@ func TestConfigJSONRoundtrip(t *testing.T) {
 		AccessKey:      "ak",
 		SecretKey:      "sk",
 		Prefix:         "p/",
+		PublicBaseURL:  "https://cdn.example.com/p",
 		ForcePathStyle: true,
 	}
 	raw, err := EncodeConfigJSON(cfg)
@@ -58,7 +59,7 @@ func TestConfigJSONRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if parsed.Backend != cfg.Backend || parsed.Bucket != cfg.Bucket || parsed.Prefix != "p/" || !parsed.ForcePathStyle {
+	if parsed.Backend != cfg.Backend || parsed.Bucket != cfg.Bucket || parsed.Prefix != "p/" || parsed.PublicBaseURL != "https://cdn.example.com/p" || !parsed.ForcePathStyle {
 		t.Fatalf("roundtrip mismatch: %+v", parsed)
 	}
 
@@ -305,6 +306,37 @@ func TestParseS3RefAndBuild(t *testing.T) {
 		if _, _, err := parseS3Ref(bad); err == nil {
 			t.Fatalf("expected error for %q", bad)
 		}
+	}
+}
+
+func TestPublicURLSupportsBucketRootAndPrefixBase(t *testing.T) {
+	defer func() {
+		_ = Configure(Config{Backend: BackendLocal, LocalDir: t.TempDir()})
+	}()
+
+	cfg := Config{
+		Backend:       BackendS3,
+		Bucket:        "bk",
+		AccessKey:     "ak",
+		SecretKey:     "sk",
+		Prefix:        "2026/05/08",
+		PublicBaseURL: "https://cdn.example.com/miniofile/aaa",
+	}
+	if err := Configure(cfg); err != nil {
+		t.Fatalf("configure s3: %v", err)
+	}
+	got, ok := PublicURL("s3://bk/2026/05/08/api-1.png")
+	if !ok || got != "https://cdn.example.com/miniofile/aaa/2026/05/08/api-1.png" {
+		t.Fatalf("bucket-root public url = %q ok=%v", got, ok)
+	}
+
+	cfg.PublicBaseURL = "https://cdn.example.com/miniofile/aaa/2026/05/08"
+	if err := Configure(cfg); err != nil {
+		t.Fatalf("configure s3 prefix base: %v", err)
+	}
+	got, ok = PublicURL("s3://bk/2026/05/08/api-1.png")
+	if !ok || got != "https://cdn.example.com/miniofile/aaa/2026/05/08/api-1.png" {
+		t.Fatalf("prefix-base public url = %q ok=%v", got, ok)
 	}
 }
 

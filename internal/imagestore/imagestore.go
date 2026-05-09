@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	neturl "net/url"
 	"strings"
 	"sync/atomic"
 )
@@ -164,7 +165,8 @@ func Primary() (Backend, error) {
 }
 
 // PublicURL returns a directly usable object URL when the current S3-compatible
-// backend has a public base URL configured.
+// backend has a public base URL configured. The base URL may point either to
+// the bucket root or to the configured Prefix directory.
 func PublicURL(ref string) (string, bool) {
 	st := current.Load()
 	if st == nil {
@@ -178,7 +180,26 @@ func PublicURL(ref string) (string, bool) {
 	if err != nil || strings.TrimSpace(key) == "" {
 		return "", false
 	}
+	key = publicURLRelativeKey(cfg, key)
 	return cfg.PublicBaseURL + "/" + strings.TrimLeft(key, "/"), true
+}
+
+func publicURLRelativeKey(cfg Config, key string) string {
+	key = strings.TrimLeft(strings.TrimSpace(key), "/")
+	prefix := strings.Trim(cfg.Prefix, "/")
+	if prefix == "" || key == "" {
+		return key
+	}
+	basePath := ""
+	if parsed, err := neturl.Parse(cfg.PublicBaseURL); err == nil {
+		basePath = strings.Trim(parsed.Path, "/")
+	}
+	rawBase := strings.Trim(strings.TrimRight(cfg.PublicBaseURL, "/"), "/")
+	if basePath == prefix || strings.HasSuffix(basePath, "/"+prefix) ||
+		rawBase == prefix || strings.HasSuffix(rawBase, "/"+prefix) {
+		return strings.TrimLeft(strings.TrimPrefix(key, cfg.Prefix), "/")
+	}
+	return key
 }
 
 // Resolve 按 ref 路由到正确后端。
