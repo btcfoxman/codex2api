@@ -4,6 +4,9 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -18,6 +21,7 @@ type openAIRequest struct {
 	Model           string            `json:"model"`
 	Messages        []openAIMessage   `json:"messages"`
 	Tools           []json.RawMessage `json:"tools"`
+	ResponseFormat  json.RawMessage   `json:"response_format,omitempty"`
 	ReasoningEffort string            `json:"reasoning_effort"`
 	ServiceTier     string            `json:"service_tier"`
 	ServiceTierAlt  string            `json:"serviceTier"` // 兼容驼峰命名
@@ -83,10 +87,15 @@ type streamChoice struct {
 	FinishReason *string      `json:"finish_reason"`
 }
 
-// streamDelta 流式块中的增量内容
+// streamDelta 流式块中的增量内容。
+//
+// reasoning 字段同时输出两种命名,兼容不同客户端:
+//   - reasoning:  OpenAI 官方 o1/GPT-5 风格(Cherry Studio 等默认走这个)
+//   - reasoning_content: DeepSeek / OpenRouter / new-api 等克隆站点风格
 type streamDelta struct {
 	Role             string          `json:"role,omitempty"`
 	Content          *string         `json:"content,omitempty"`
+	Reasoning        *string         `json:"reasoning,omitempty"`
 	ReasoningContent *string         `json:"reasoning_content,omitempty"`
 	ToolCalls        []toolCallDelta `json:"tool_calls,omitempty"`
 }
@@ -122,11 +131,13 @@ type compactChoice struct {
 	FinishReason string         `json:"finish_reason"`
 }
 
-// compactMessage 非流式响应中的消息
+// compactMessage 非流式响应中的消息。reasoning / reasoning_content 同时输出兼容多端。
 type compactMessage struct {
-	Role      string               `json:"role"`
-	Content   *string              `json:"content"`
-	ToolCalls []compactToolCallOut `json:"tool_calls,omitempty"`
+	Role             string               `json:"role"`
+	Content          *string              `json:"content"`
+	Reasoning        *string              `json:"reasoning,omitempty"`
+	ReasoningContent *string              `json:"reasoning_content,omitempty"`
+	ToolCalls        []compactToolCallOut `json:"tool_calls,omitempty"`
 }
 
 // compactToolCallOut 非流式响应中的工具调用
@@ -157,6 +168,7 @@ const maxTools = 128
 const (
 	codexImageGenerationBridgeMarker = "<codex2api-codex-image-generation>"
 	codexImageGenerationBridgeText   = codexImageGenerationBridgeMarker + "\nWhen the user asks for raster image generation or editing, use the OpenAI Responses native `image_generation` tool attached to this request. The local Codex client may not expose an `image_gen` namespace, but that does not mean image generation is unavailable. Do not ask the user to switch to CLI fallback solely because `image_gen` is absent.\n</codex2api-codex-image-generation>"
+	jsonObjectFormatInputHint        = "Return a valid JSON object."
 )
 
 var responsesImageGenerationOptionFields = []string{
@@ -293,6 +305,24 @@ func hasResponsesImageGenerationTool(body map[string]any) bool {
 	return false
 }
 
+func responsesImageGenerationToolChoice(body map[string]any) string {
+	if len(body) == 0 {
+		return ""
+	}
+	switch choice := body["tool_choice"].(type) {
+	case string:
+		return strings.TrimSpace(choice)
+	case map[string]any:
+		return strings.TrimSpace(firstNonEmptyAnyString(choice["type"]))
+	default:
+		return ""
+	}
+}
+
+func hasResponsesImageGenerationToolChoice(body map[string]any) bool {
+	return strings.EqualFold(responsesImageGenerationToolChoice(body), "image_generation")
+}
+
 func ensureResponsesImageGenerationTool(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -386,6 +416,86 @@ func moveTopLevelResponsesImageOptions(body map[string]any) bool {
 	return modified
 }
 
+// codexWebSearchAllowedFields 是 Codex 上游接受的 web_search 配置字段白名单。
+// 实测来源：直连 chatgpt.com/backend-api/codex/responses 用 gpt-5.4-mini 探测，
+// 这三个字段会被原样回显并生效；任何不在该集合的字段会触发
+// 400 unknown_parameter。
+var codexWebSearchAllowedFields = map[string]struct{}{
+	"search_context_size": {},
+	"user_location":       {},
+	"filters":             {},
+}
+
+// normalizeResponsesWebSearchTools 把所有 OpenAI Responses 协议下的 web_search
+// 变体（web_search_preview / web_search_preview_2025_03_11 /
+// web_search_2025_08_26 等）归一为 Codex 上游唯一接受的 {"type":"web_search"}。
+//
+// Codex 后端只识别裸 "web_search"，对其他变体一律返回
+// 400 {"detail":"Unsupported tool type: ..."}。OpenAI 原生 Responses
+// 端点支持这些变体——所以本函数只能在 Codex 上游路径调用。
+//
+// 归一时保留 Codex 已知接受的配置字段（search_context_size / user_location /
+// filters），其它未知字段一律丢弃，避免触发上游的 unknown_parameter 校验。
+func normalizeResponsesWebSearchTools(body map[string]any) bool {
+	rawTools, ok := body["tools"]
+	if !ok || rawTools == nil {
+		return false
+	}
+	tools, ok := rawTools.([]any)
+	if !ok {
+		return false
+	}
+	modified := false
+	for i, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		toolType := strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"]))
+		if toolType == "" || !strings.HasPrefix(toolType, "web_search") {
+			continue
+		}
+		normalized := normalizeCodexWebSearchTool(toolMap)
+		if mapsEqual(toolMap, normalized) {
+			continue
+		}
+		tools[i] = normalized
+		modified = true
+	}
+	if modified {
+		body["tools"] = tools
+	}
+	return modified
+}
+
+// normalizeCodexWebSearchTool 返回一个仅包含 {type, <白名单字段>} 的新 map。
+// 调用前请确保 toolMap.type 以 "web_search" 开头。
+func normalizeCodexWebSearchTool(toolMap map[string]any) map[string]any {
+	out := map[string]any{"type": "web_search"}
+	for k, v := range toolMap {
+		if _, ok := codexWebSearchAllowedFields[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func mapsEqual(a, b map[string]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if !reflect.DeepEqual(va, vb) {
+			return false
+		}
+	}
+	return true
+}
+
 func normalizeResponsesImageGenerationTools(body map[string]any, promptText string) bool {
 	rawTools, ok := body["tools"]
 	if !ok || rawTools == nil {
@@ -476,6 +586,83 @@ func applyResponsesImageGenerationBridgeInstructions(body map[string]any) bool {
 	return true
 }
 
+func hasTopLevelResponsesImageOptions(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	for _, key := range responsesImageGenerationOptionFields {
+		if value, exists := body[key]; exists && value != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func isStructuredResponsesFormatType(formatType string) bool {
+	switch strings.ToLower(strings.TrimSpace(formatType)) {
+	case "json_schema", "json_object":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasStructuredResponsesFormat(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	if text, ok := body["text"].(map[string]any); ok {
+		if format, ok := text["format"].(map[string]any); ok {
+			if isStructuredResponsesFormatType(firstNonEmptyAnyString(format["type"])) {
+				return true
+			}
+		}
+	}
+	if responseFormat, ok := body["response_format"].(map[string]any); ok {
+		return isStructuredResponsesFormatType(firstNonEmptyAnyString(responseFormat["type"]))
+	}
+	return false
+}
+
+// responsesModelRejectsHostedImageTool 判断模型是否不支持 hosted image_generation
+// 工具。gpt-5.3-codex-spark 是 ChatGPT 账号下的纯文本 Codex 模型，上游会直接拒绝
+// 带 hosted 图片工具的请求（issue #230）。
+func responsesModelRejectsHostedImageTool(body map[string]any) bool {
+	model := strings.TrimSpace(firstNonEmptyAnyString(body["model"]))
+	return strings.EqualFold(model, proOnlySparkModel)
+}
+
+func shouldAutoInjectResponsesImageGenerationTool(body map[string]any) bool {
+	if len(body) == 0 || hasResponsesImageGenerationTool(body) {
+		return false
+	}
+	// 不为拒绝 hosted 图片工具的模型自动注入默认图片工具及桥接 instructions；
+	// 用户显式自带的图片工具仍由上面 hasResponsesImageGenerationTool 分支保留。
+	if responsesModelRejectsHostedImageTool(body) {
+		return false
+	}
+	if hasResponsesImageGenerationToolChoice(body) {
+		return true
+	}
+	if hasTopLevelResponsesImageOptions(body) {
+		return true
+	}
+	return !hasStructuredResponsesFormat(body)
+}
+
+func shouldInjectOpenAIResponsesImageGenerationTool(body map[string]any) bool {
+	if len(body) == 0 || hasResponsesImageGenerationTool(body) {
+		return false
+	}
+	if hasResponsesImageGenerationToolChoice(body) {
+		return true
+	}
+	if hasTopLevelResponsesImageOptions(body) {
+		return true
+	}
+	return isImageOnlyModel(strings.TrimSpace(firstNonEmptyAnyString(body["model"])))
+}
+
 func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -532,6 +719,10 @@ func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 // are dropped. Codex CLI compresses prior turns into compaction items expecting
 // them to be forwarded as conversation context; the upstream rejects the type
 // with "Invalid input type 'compaction' at index N", so we translate in place.
+//
+// Compact v2 (newer Codex CLI) items are left untouched: compaction items
+// carrying "encrypted_content" originate from the upstream itself and must be
+// forwarded verbatim, or the compacted conversation context is lost.
 func normalizeResponsesCompactionItems(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -552,6 +743,12 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			continue
 		}
 		if firstNonEmptyAnyString(itemMap["type"]) != "compaction" {
+			out = append(out, raw)
+			continue
+		}
+
+		// compact v2: 加密压缩项由上游生成并原生支持，必须原样透传
+		if firstNonEmptyAnyString(itemMap["encrypted_content"]) != "" {
 			out = append(out, raw)
 			continue
 		}
@@ -582,6 +779,353 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 		body["input"] = out
 	}
 	return modified
+}
+
+func normalizeResponsesInputMessageContent(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok || !isResponsesMessageInputItem(itemMap) {
+			continue
+		}
+		if content, exists := itemMap["content"]; !exists || content == nil {
+			itemMap["content"] = ""
+			modified = true
+		}
+	}
+	return modified
+}
+
+func isResponsesMessageInputItem(item map[string]any) bool {
+	itemType := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+	if itemType == "message" {
+		return true
+	}
+	if itemType != "" {
+		return false
+	}
+
+	switch strings.TrimSpace(firstNonEmptyAnyString(item["role"])) {
+	case "user", "assistant", "developer", "system":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeResponsesInputItemIDs(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := itemMap["id"]; exists {
+			delete(itemMap, "id")
+			modified = true
+		}
+	}
+	return modified
+}
+
+func normalizeResponsesContentPartTypes(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role := strings.TrimSpace(firstNonEmptyAnyString(itemMap["role"]))
+		if normalizeResponsesContentItemType(itemMap, role) {
+			modified = true
+		}
+		contentItems, ok := itemMap["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawContent := range contentItems {
+			contentMap, ok := rawContent.(map[string]any)
+			if !ok {
+				continue
+			}
+			if normalizeResponsesContentItemType(contentMap, role) {
+				modified = true
+			}
+		}
+	}
+	return modified
+}
+
+func normalizeResponsesContentItemType(item map[string]any, role string) bool {
+	itemType := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+	modified := false
+
+	switch itemType {
+	case "file":
+		item["type"] = "input_file"
+		itemType = "input_file"
+		modified = true
+	case "image", "image_url":
+		item["type"] = "input_image"
+		itemType = "input_image"
+		modified = true
+	case "text":
+		if strings.TrimSpace(role) == "assistant" {
+			item["type"] = "output_text"
+		} else {
+			item["type"] = "input_text"
+		}
+		itemType = firstNonEmptyAnyString(item["type"])
+		modified = true
+	case "input_text":
+		if strings.TrimSpace(role) == "assistant" {
+			item["type"] = "output_text"
+			itemType = "output_text"
+			modified = true
+		}
+	case "output_text":
+		if strings.TrimSpace(role) != "assistant" {
+			item["type"] = "input_text"
+			itemType = "input_text"
+			modified = true
+		}
+	}
+
+	if itemType == "input_file" {
+		if normalizeResponsesInputFileFields(item) {
+			modified = true
+		}
+	}
+	if itemType == "input_image" || itemType == "computer_screenshot" {
+		if normalizeResponsesImageURLField(item) {
+			modified = true
+		}
+	}
+	return modified
+}
+
+func isInvalidEncryptedContentError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	if isMissingEncryptedContentError(body) {
+		return true
+	}
+	for _, path := range []string{"error.code", "detail.code", "code"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "invalid_encrypted_content") {
+			return true
+		}
+	}
+	msgParts := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "detail").String(),
+		string(body),
+	}
+	for _, msg := range msgParts {
+		msg = strings.ToLower(msg)
+		if strings.Contains(msg, "invalid_encrypted_content") {
+			return true
+		}
+		if strings.Contains(msg, "encrypted content") &&
+			(strings.Contains(msg, "could not be verified") || strings.Contains(msg, "could not be decrypted")) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMissingEncryptedContentError(body []byte) bool {
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	param := strings.TrimSpace(gjson.GetBytes(body, "error.param").String())
+	if !strings.EqualFold(code, "missing_required_parameter") || !strings.HasSuffix(param, ".encrypted_content") {
+		return false
+	}
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	return strings.Contains(msg, "encrypted_content")
+}
+
+func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
+		return body, false
+	}
+	input, ok := root["input"]
+	if !ok {
+		return body, false
+	}
+	strippedInput, changed, keep := stripInvalidEncryptedContentValue(input, false)
+	if !changed {
+		return body, false
+	}
+	if keep {
+		root["input"] = strippedInput
+	} else {
+		delete(root, "input")
+	}
+	stripped, err := json.Marshal(root)
+	if err != nil {
+		return body, false
+	}
+	return stripped, true
+}
+
+func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bool) {
+	switch v := value.(type) {
+	case []any:
+		changed := false
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			stripped, itemChanged, keep := stripInvalidEncryptedContentValue(item, true)
+			if itemChanged {
+				changed = true
+			}
+			if !keep {
+				changed = true
+				continue
+			}
+			out = append(out, stripped)
+		}
+		return out, changed, true
+	case map[string]any:
+		changed := false
+		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" {
+			if arrayItem {
+				return nil, true, false
+			}
+			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
+				delete(v, "encrypted_content")
+			}
+			if len(v) == 1 {
+				return nil, true, false
+			}
+			changed = true
+		} else if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
+			delete(v, "encrypted_content")
+			changed = true
+		}
+		for key, child := range v {
+			stripped, childChanged, keep := stripInvalidEncryptedContentValue(child, false)
+			if childChanged {
+				changed = true
+			}
+			if keep {
+				v[key] = stripped
+			} else {
+				delete(v, key)
+			}
+		}
+		return v, changed, true
+	default:
+		return value, false, true
+	}
+}
+
+func responsesInputRaw(body []byte) string {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() {
+		return ""
+	}
+	return input.Raw
+}
+
+func dropBareReasoningInputItems(body map[string]any) bool {
+	input, ok := body["input"]
+	if !ok {
+		return false
+	}
+	cleaned, changed, keep := dropBareReasoningInputValue(input)
+	if !changed {
+		return false
+	}
+	if keep {
+		body["input"] = cleaned
+	} else {
+		delete(body, "input")
+	}
+	return true
+}
+
+func dropBareReasoningInputValue(value any) (any, bool, bool) {
+	switch v := value.(type) {
+	case []any:
+		changed := false
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			cleaned, itemChanged, keep := dropBareReasoningInputValue(item)
+			if itemChanged {
+				changed = true
+			}
+			if !keep {
+				changed = true
+				continue
+			}
+			out = append(out, cleaned)
+		}
+		return out, changed, true
+	case map[string]any:
+		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" &&
+			firstNonEmptyAnyString(v["encrypted_content"]) == "" {
+			return nil, true, false
+		}
+		return v, false, true
+	default:
+		return value, false, true
+	}
+}
+
+func normalizeResponsesInputFileFields(item map[string]any) bool {
+	rawFile, hasFile := item["file"]
+	if !hasFile {
+		return false
+	}
+
+	if fileMap, ok := rawFile.(map[string]any); ok {
+		for _, key := range []string{"file_id", "file_data", "file_url", "filename"} {
+			if _, exists := item[key]; exists {
+				continue
+			}
+			if value, exists := fileMap[key]; exists && value != nil {
+				item[key] = value
+			}
+		}
+	} else if fileID := strings.TrimSpace(firstNonEmptyAnyString(rawFile)); fileID != "" {
+		if _, exists := item["file_id"]; !exists {
+			item["file_id"] = fileID
+		}
+	}
+	delete(item, "file")
+	return true
+}
+
+func normalizeResponsesImageURLField(item map[string]any) bool {
+	rawImageURL, ok := item["image_url"]
+	if !ok {
+		return false
+	}
+	imageURLMap, ok := rawImageURL.(map[string]any)
+	if !ok {
+		return false
+	}
+	if url := strings.TrimSpace(firstNonEmptyAnyString(imageURLMap["url"])); url != "" {
+		item["image_url"] = url
+		return true
+	}
+	return false
 }
 
 // compactionSummaryText extracts a usable summary string from a compaction
@@ -676,6 +1220,9 @@ func cachedOrParse(rawJSON []byte) openAIRequest {
 // 采用 Unmarshal→构造 map→Marshal 模式，只做一次 JSON 序列化
 func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	req := cachedOrParse(rawJSON)
+	if err := validateChatCompletionFunctionNames(req); err != nil {
+		return nil, err
+	}
 
 	// 构建输出 map（只包含 Codex 需要的字段）
 	out := map[string]any{
@@ -687,20 +1234,32 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 
 	// 1. messages → input
 	out["input"] = convertMessagesToInputSlice(req.Messages)
+	normalizeResponsesContentPartTypes(out)
+	normalizeResponsesInputMessageContent(out)
+	normalizeResponsesInputItemIDs(out)
 
-	// 2. reasoning effort
+	// 2. reasoning effort + summary
+	// 显式向 Codex 请求 summary,否则上游不会发 response.reasoning_summary_text.delta,
+	// chat/completions 客户端就拿不到思考内容(issue #156)。
 	if effort := normalizeReasoningEffort(req.ReasoningEffort); effort != "" {
-		out["reasoning"] = map[string]any{"effort": effort}
+		out["reasoning"] = map[string]any{
+			"effort":  effort,
+			"summary": "auto",
+		}
+	} else {
+		out["reasoning"] = map[string]any{"summary": "auto"}
 	}
 
-	// 3. service tier（保留合法值，丢弃不支持的；fast 映射为上游接受的 priority）
+	// 3. service tier（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
 	tier := req.ServiceTier
 	if tier == "" {
 		tier = req.ServiceTierAlt
 	}
 	tier = strings.TrimSpace(tier)
 	if isAllowedServiceTier(tier) {
-		out["service_tier"] = upstreamServiceTier(tier)
+		if upstreamTier, ok := upstreamServiceTier(tier); ok {
+			out["service_tier"] = upstreamTier
+		}
 	}
 
 	// 4. tools 格式转换 + schema 清理
@@ -710,13 +1269,268 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		}
 	}
 
+	// 5. response_format → Responses text.format，并清理结构化输出 schema
+	if len(req.ResponseFormat) > 0 && string(req.ResponseFormat) != "null" {
+		var responseFormat map[string]any
+		if json.Unmarshal(req.ResponseFormat, &responseFormat) == nil && responseFormat != nil {
+			out["response_format"] = responseFormat
+			normalizeResponsesStructuredOutputFormat(out)
+			delete(out, "response_format")
+		}
+	}
+
 	return json.Marshal(out)
+}
+
+func invalidFunctionNameError(path string) error {
+	return fmt.Errorf("Invalid '%s': empty string. Expected a string with minimum length 1, but got an empty string instead.", path)
+}
+
+func validateChatCompletionFunctionNames(req openAIRequest) error {
+	for msgIdx, msg := range req.Messages {
+		for callIdx, toolCall := range msg.ToolCalls {
+			if strings.TrimSpace(toolCall.Function.Name) == "" {
+				return invalidFunctionNameError(fmt.Sprintf("messages[%d].tool_calls[%d].function.name", msgIdx, callIdx))
+			}
+		}
+	}
+	for toolIdx, rawTool := range req.Tools {
+		var parsed openAIToolParsed
+		if err := json.Unmarshal(rawTool, &parsed); err != nil || parsed.Type != "function" || parsed.Function == nil {
+			continue
+		}
+		if strings.TrimSpace(parsed.Function.Name) == "" {
+			return invalidFunctionNameError(fmt.Sprintf("tools[%d].function.name", toolIdx))
+		}
+	}
+	return nil
+}
+
+// ValidateResponsesFunctionNames rejects malformed tool-call names before they
+// reach the upstream Responses API. The upstream reports these as HTTP 400
+// empty_string errors; local validation makes the bad client field obvious.
+func ValidateResponsesFunctionNames(rawBody []byte) error {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return nil
+	}
+	return validateResponsesFunctionNames(body)
+}
+
+func validateResponsesFunctionNames(body map[string]any) error {
+	inputItems, _ := body["input"].([]any)
+	for itemIdx, rawItem := range inputItems {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(item["type"])) != "function_call" {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(item["name"])) == "" {
+			return invalidFunctionNameError(fmt.Sprintf("input[%d].name", itemIdx))
+		}
+	}
+
+	tools, _ := body["tools"].([]any)
+	for toolIdx, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok || strings.TrimSpace(firstNonEmptyAnyString(tool["type"])) != "function" {
+			continue
+		}
+		if responsesFunctionToolName(tool) == "" {
+			path := fmt.Sprintf("tools[%d].name", toolIdx)
+			if _, ok := tool["function"].(map[string]any); ok {
+				path = fmt.Sprintf("tools[%d].function.name", toolIdx)
+			}
+			return invalidFunctionNameError(path)
+		}
+	}
+	return nil
+}
+
+func responsesFunctionToolName(tool map[string]any) string {
+	if name := strings.TrimSpace(firstNonEmptyAnyString(tool["name"])); name != "" {
+		return name
+	}
+	function, _ := tool["function"].(map[string]any)
+	if function == nil {
+		return ""
+	}
+	return strings.TrimSpace(firstNonEmptyAnyString(function["name"]))
+}
+
+func normalizeResponsesFunctionTools(body map[string]any) bool {
+	tools, ok := body["tools"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	kept := make([]any, 0, len(tools))
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			kept = append(kept, rawTool)
+			continue
+		}
+		toolType := strings.TrimSpace(firstNonEmptyAnyString(tool["type"]))
+		if toolType == "" {
+			// 上游对缺失或为 null 的工具 type 返回 400 "Unsupported tool
+			// type: None"（issue #219）。带 function 形态（function 子对象
+			// 或顶层 name）的工具按 OpenAI SDK 惯例视为 function；无法识别
+			// 形态的工具直接剔除，避免整个请求被上游拒绝。
+			function, _ := tool["function"].(map[string]any)
+			if function == nil &&
+				strings.TrimSpace(firstNonEmptyAnyString(tool["name"])) == "" {
+				modified = true
+				continue
+			}
+			tool["type"] = "function"
+			modified = true
+		} else if toolType != "function" {
+			kept = append(kept, tool)
+			continue
+		}
+		kept = append(kept, tool)
+		function, _ := tool["function"].(map[string]any)
+		if function == nil {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(tool["name"])) == "" {
+			if name := strings.TrimSpace(firstNonEmptyAnyString(function["name"])); name != "" {
+				tool["name"] = name
+				modified = true
+			}
+		}
+		if _, ok := tool["description"]; !ok {
+			if desc := strings.TrimSpace(firstNonEmptyAnyString(function["description"])); desc != "" {
+				tool["description"] = desc
+				modified = true
+			}
+		}
+		if _, ok := tool["parameters"]; !ok {
+			if params, ok := function["parameters"]; ok {
+				tool["parameters"] = params
+				modified = true
+			}
+		}
+		if _, ok := tool["strict"]; !ok {
+			if strict, ok := function["strict"]; ok {
+				tool["strict"] = strict
+				modified = true
+			}
+		}
+		delete(tool, "function")
+		modified = true
+	}
+	if modified {
+		body["tools"] = kept
+	}
+	return modified
+}
+
+func normalizeResponsesToolChoice(body map[string]any) bool {
+	rawChoice, ok := body["tool_choice"]
+	if !ok {
+		return false
+	}
+	choice, ok := rawChoice.(map[string]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	toolType := strings.TrimSpace(firstNonEmptyAnyString(choice["type"]))
+	function, _ := choice["function"].(map[string]any)
+	name := strings.TrimSpace(firstNonEmptyAnyString(choice["name"]))
+	if toolType == "" && (function != nil || name != "") {
+		choice["type"] = "function"
+		toolType = "function"
+		modified = true
+	}
+	if toolType != "function" {
+		return modified
+	}
+	if name == "" && function != nil {
+		if nestedName := strings.TrimSpace(firstNonEmptyAnyString(function["name"])); nestedName != "" {
+			choice["name"] = nestedName
+			modified = true
+		}
+	}
+	if function != nil {
+		delete(choice, "function")
+		modified = true
+	}
+	return modified
+}
+
+type responsesBodyPrepareOptions struct {
+	forceStoreFalse            bool
+	expandPreviousResponse     bool
+	preservePreviousResponseID bool
 }
 
 // PrepareResponsesBody 将 Responses API 原始请求转换为上游可接受的格式
 // 采用 Unmarshal→map 操作→Marshal 模式，替代逐字段 sjson 操作
 // 返回: (处理后的 body, 展开后的 input JSON 原始文本)
 func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
+	return prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		forceStoreFalse:        true,
+		expandPreviousResponse: true,
+	})
+}
+
+// PrepareResponsesWebSocketBody keeps upstream response storage linkage for
+// native Responses WebSocket sessions.
+func PrepareResponsesWebSocketBody(rawBody []byte) ([]byte, string) {
+	return prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		preservePreviousResponseID: true,
+	})
+}
+
+const codexReasoningEncryptedContentInclude = "reasoning.encrypted_content"
+
+func ensureDefaultCodexInclude(body map[string]any) {
+	if body == nil {
+		return
+	}
+	if _, ok := body["include"]; !ok {
+		body["include"] = []string{codexReasoningEncryptedContentInclude}
+	}
+}
+
+func ensureCodexReasoningInclude(body map[string]any) {
+	if body == nil {
+		return
+	}
+	if _, ok := body["reasoning"]; !ok {
+		return
+	}
+	if _, ok := body["include"]; !ok {
+		body["include"] = []string{codexReasoningEncryptedContentInclude}
+		return
+	}
+
+	switch includes := body["include"].(type) {
+	case []any:
+		for _, item := range includes {
+			if s, ok := item.(string); ok && s == codexReasoningEncryptedContentInclude {
+				return
+			}
+		}
+		body["include"] = append(includes, codexReasoningEncryptedContentInclude)
+	case []string:
+		for _, item := range includes {
+			if item == codexReasoningEncryptedContentInclude {
+				return
+			}
+		}
+		body["include"] = append(includes, codexReasoningEncryptedContentInclude)
+	}
+}
+
+func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOptions) ([]byte, string) {
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""
@@ -724,18 +1538,18 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 
 	// 1. 强制设置 Codex 必需字段
 	body["stream"] = true
-	body["store"] = false
-	if _, ok := body["include"]; !ok {
-		body["include"] = []string{"reasoning.encrypted_content"}
+	if opts.forceStoreFalse {
+		body["store"] = false
 	}
+	ensureDefaultCodexInclude(body)
 
 	normalizeResponsesImageOnlyModel(body)
 	normalizeResponsesPromptCompat(body)
 
 	// 2. 字符串 input → 数组包装（Codex 要求 input 为 list）
 	if inputStr, ok := body["input"].(string); ok {
-		body["input"] = []map[string]string{
-			{"role": "user", "content": inputStr},
+		body["input"] = []any{
+			map[string]any{"role": "user", "content": inputStr},
 		}
 	}
 	promptText := extractResponsesPromptText(body)
@@ -762,17 +1576,24 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 			}
 		}
 	}
+	ensureCodexReasoningInclude(body)
 
-	// 4. service tier 清理（fast 映射为上游接受的 priority）
+	// 4. service tier 清理（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
 	delete(body, "serviceTier")
 	if tier, ok := body["service_tier"].(string); ok {
 		tier = strings.TrimSpace(tier)
 		if !isAllowedServiceTier(tier) {
 			delete(body, "service_tier")
+		} else if upstreamTier, ok := upstreamServiceTier(tier); ok {
+			body["service_tier"] = upstreamTier
 		} else {
-			body["service_tier"] = upstreamServiceTier(tier)
+			delete(body, "service_tier")
 		}
 	}
+	normalizeResponsesStructuredOutputFormat(body)
+	normalizeResponsesFunctionTools(body)
+	normalizeResponsesToolChoice(body)
+	normalizeResponsesWebSearchTools(body)
 
 	// 5. 工具描述补充 + schema 清理 + 上游数量限制
 	if tools, ok := body["tools"].([]any); ok {
@@ -798,19 +1619,23 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 				}
 			}
 			// 递归清理不支持的 JSON Schema 关键字，并修正上游要求的结构
-			if params, ok := toolMap["parameters"].(map[string]any); ok {
+			if isFunctionTool(toolMap) {
+				normalizeFunctionToolParameters(toolMap)
+			} else if params, ok := toolMap["parameters"].(map[string]any); ok {
 				sanitizeSchemaForUpstream(params)
 			}
 		}
 	}
-	ensureResponsesImageGenerationTool(body)
+	if shouldAutoInjectResponsesImageGenerationTool(body) {
+		ensureResponsesImageGenerationTool(body)
+	}
 	moveTopLevelResponsesImageOptions(body)
 	normalizeResponsesImageGenerationTools(body, promptText)
 	applyResponsesImageGenerationBridgeInstructions(body)
 
 	// 6. 展开 previous_response_id
 	prevID, _ := body["previous_response_id"].(string)
-	if prevID != "" {
+	if opts.expandPreviousResponse && prevID != "" {
 		if cached := getResponseCache(prevID); cached != nil {
 			var cachedItems []any
 			for _, item := range cached {
@@ -825,6 +1650,10 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	}
 	// 6b. 把 input[] 中的 compaction 项翻译为 developer message（上游不识别 compaction）
 	normalizeResponsesCompactionItems(body)
+	normalizeResponsesContentPartTypes(body)
+	normalizeResponsesInputMessageContent(body)
+	normalizeResponsesInputItemIDs(body)
+	dropBareReasoningInputItems(body)
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string
@@ -835,16 +1664,21 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	}
 
 	// 7. 删除 Codex 不支持的字段
+	// 注意：prompt_cache_retention 上游(HTTP 与 WS 路径)均不接受，会返回
+	// 400 Unsupported parameter，因此在此一并剥离，executor / wsrelay 层也各自兜底删除。
 	for _, field := range []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "serviceTier", "metadata",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
-		"disable_response_storage", "verbosity", "previous_response_id",
+		"disable_response_storage", "verbosity",
 		"prompt_cache_retention", "safety_identifier",
 	} {
 		delete(body, field)
+	}
+	if !opts.preservePreviousResponseID {
+		delete(body, "previous_response_id")
 	}
 
 	result, err := json.Marshal(body)
@@ -852,6 +1686,54 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		return rawBody, expandedInputRaw
 	}
 	return result, expandedInputRaw
+}
+
+// PrepareOpenAIResponsesBody keeps native OpenAI Responses requests compatible
+// without applying Codex-specific fields such as store/include/tool injection.
+func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return rawBody
+	}
+
+	if re, ok := body["reasoning_effort"].(string); ok {
+		if normalized := normalizeReasoningEffort(re); normalized != "" {
+			reasoning, _ := body["reasoning"].(map[string]any)
+			if reasoning == nil {
+				reasoning = map[string]any{}
+			}
+			if _, hasEffort := reasoning["effort"]; !hasEffort {
+				reasoning["effort"] = normalized
+				body["reasoning"] = reasoning
+			}
+		}
+	}
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok {
+			if normalized := normalizeReasoningEffort(effort); normalized != "" {
+				reasoning["effort"] = normalized
+			} else {
+				delete(reasoning, "effort")
+			}
+		}
+	}
+
+	normalizeResponsesStructuredOutputFormat(body)
+	normalizeResponsesFunctionTools(body)
+	normalizeResponsesToolChoice(body)
+	normalizeResponsesContentPartTypes(body)
+	normalizeResponsesInputMessageContent(body)
+	if shouldInjectOpenAIResponsesImageGenerationTool(body) {
+		ensureResponsesImageGenerationTool(body)
+	}
+	moveTopLevelResponsesImageOptions(body)
+	normalizeResponsesImageGenerationTools(body, extractResponsesPromptText(body))
+
+	result, err := json.Marshal(body)
+	if err != nil {
+		return rawBody
+	}
+	return result
 }
 
 // PrepareCompactResponsesBody 将 /responses/compact 请求转换为上游可接受的格式。
@@ -862,6 +1744,17 @@ func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
 	body, _ = sjson.DeleteBytes(body, "store")
 	body, _ = sjson.DeleteBytes(body, "stream")
 	return body, expandedInputRaw
+}
+
+// PrepareOpenAIResponsesCompactBody 为中转（OpenAI Responses API）账号准备
+// /responses/compact 请求体。它复用 OpenAI Responses 预处理，并移除 compact
+// 端点不接受的自动注入字段（include/store/stream）。
+func PrepareOpenAIResponsesCompactBody(rawBody []byte) []byte {
+	body := PrepareOpenAIResponsesBody(rawBody)
+	body, _ = sjson.DeleteBytes(body, "include")
+	body, _ = sjson.DeleteBytes(body, "store")
+	body, _ = sjson.DeleteBytes(body, "stream")
+	return body
 }
 
 // normalizeReasoningEffort 将 reasoning_effort 钳位到上游支持的值
@@ -890,12 +1783,17 @@ func isAllowedServiceTier(tier string) bool {
 	}
 }
 
-// upstreamServiceTier 将客户端 service_tier 映射为上游接受的值（fast → priority）
-func upstreamServiceTier(tier string) string {
-	if tier == "fast" {
-		return "priority"
+// upstreamServiceTier 将客户端 service_tier 映射为上游接受的值。
+// Codex 上游当前只接受 priority；auto/default/flex/scale 都不应显式转发。
+func upstreamServiceTier(tier string) (string, bool) {
+	switch tier {
+	case "fast", "priority":
+		return "priority", true
+	case "auto", "default", "flex", "scale":
+		return "", false
+	default:
+		return "", false
 	}
-	return tier
 }
 
 // convertMessagesToInputSlice 将 OpenAI messages 转换为 Codex input 数组（纯内存操作，零中间序列化）
@@ -1036,8 +1934,37 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 			continue
 		}
 
-		if parsed.Type != "function" || parsed.Function == nil {
+		// type 缺失或为 null 时按 OpenAI SDK 惯例视为 function（前提是带
+		// function 对象）；上游对空 type 一律返回 400 "Unsupported tool
+		// type: None"（issue #219），无法识别形态的工具直接丢弃。
+		isFunction := parsed.Function != nil &&
+			(parsed.Type == "function" || parsed.Type == "")
+		if !isFunction {
+			if parsed.Type == "" {
+				// 无 function 对象但有顶层 name（Codex 格式缺 type）→ 补全
+				// type 后保留；其余直接丢弃。
+				var toolMap map[string]any
+				if json.Unmarshal(raw, &toolMap) == nil &&
+					strings.TrimSpace(firstNonEmptyAnyString(toolMap["name"])) != "" {
+					toolMap["type"] = "function"
+					normalizeFunctionToolParameters(toolMap)
+					tools = append(tools, toolMap)
+				}
+				continue
+			}
 			// 非 function 类型 → 透传原始 JSON
+			// 例外：把 web_search_preview 等变体归一为 web_search，
+			// Codex 上游只认裸 "web_search"。归一时保留白名单字段，
+			// 与 PrepareResponsesBody 路径行为一致。
+			if strings.HasPrefix(parsed.Type, "web_search") {
+				var toolMap map[string]any
+				if json.Unmarshal(raw, &toolMap) == nil && toolMap != nil {
+					tools = append(tools, normalizeCodexWebSearchTool(toolMap))
+				} else {
+					tools = append(tools, map[string]any{"type": "web_search"})
+				}
+				continue
+			}
 			var passThrough any
 			_ = json.Unmarshal(raw, &passThrough)
 			tools = append(tools, passThrough)
@@ -1054,11 +1981,11 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 		}
 		if len(parsed.Function.Parameters) > 0 {
 			var params map[string]any
-			if json.Unmarshal(parsed.Function.Parameters, &params) == nil {
-				sanitizeSchemaForUpstream(params)
+			if json.Unmarshal(parsed.Function.Parameters, &params) == nil && params != nil {
 				item["parameters"] = params
 			}
 		}
+		normalizeFunctionToolParameters(item)
 		if parsed.Function.Strict != nil {
 			item["strict"] = *parsed.Function.Strict
 		}
@@ -1091,9 +2018,10 @@ func sanitizeServiceTierForUpstream(body []byte) []byte {
 	switch tier {
 	case "auto", "default", "flex", "priority", "scale", "fast":
 		body, _ = sjson.DeleteBytes(body, "serviceTier")
-		// fast 映射为上游接受的 priority
-		if tier == "fast" {
-			body, _ = sjson.SetBytes(body, "service_tier", "priority")
+		if upstreamTier, ok := upstreamServiceTier(tier); ok {
+			body, _ = sjson.SetBytes(body, "service_tier", upstreamTier)
+		} else {
+			body, _ = sjson.DeleteBytes(body, "service_tier")
 		}
 		return body
 	default:
@@ -1103,13 +2031,70 @@ func sanitizeServiceTierForUpstream(body []byte) []byte {
 	}
 }
 
-// resolveServiceTier 从实际 tier 和请求 tier 中选择最终值
-func resolveServiceTier(actualTier, requestedTier string) string {
-	requestedTier = strings.TrimSpace(requestedTier)
-	if requestedTier == "fast" {
-		return requestedTier
+type usageServiceTiers struct {
+	ServiceTier          string
+	RequestedServiceTier string
+	ActualServiceTier    string
+	BillingServiceTier   string
+}
+
+func normalizeServiceTierValue(tier string) string {
+	return strings.ToLower(strings.TrimSpace(tier))
+}
+
+func normalizeDisplayServiceTier(tier string) string {
+	tier = normalizeServiceTierValue(tier)
+	if tier == "priority" {
+		return "fast"
 	}
-	actualTier = strings.TrimSpace(actualTier)
+	return tier
+}
+
+func normalizeBillingServiceTier(tier string) string {
+	tier = normalizeServiceTierValue(tier)
+	if tier == "priority" || tier == "fast" {
+		return "priority"
+	}
+	return tier
+}
+
+// resolveServiceTier is the legacy service_tier field for usage logs.
+// It now prefers the upstream actual tier so response.service_tier="default"
+// is not masked by a requested fast/priority intent.
+func resolveServiceTier(actualTier, requestedTier string) string {
+	if actual := normalizeDisplayServiceTier(actualTier); actual != "" {
+		return actual
+	}
+	return normalizeDisplayServiceTier(requestedTier)
+}
+
+func resolveUsageServiceTiers(actualTier, requestedTier string) usageServiceTiers {
+	return usageServiceTiers{
+		ServiceTier:          resolveServiceTier(actualTier, requestedTier),
+		RequestedServiceTier: normalizeServiceTierValue(requestedTier),
+		ActualServiceTier:    normalizeServiceTierValue(actualTier),
+		BillingServiceTier:   resolveBillingServiceTier(actualTier, requestedTier),
+	}
+}
+
+// resolveBillingServiceTier selects the tier used for money. The default policy
+// follows upstream actual service_tier; requested policy preserves the old
+// "client asked for fast/priority, bill priority" behavior.
+func resolveBillingServiceTier(actualTier, requestedTier string) string {
+	return resolveBillingServiceTierForPolicy(actualTier, requestedTier, CurrentRuntimeSettings().BillingTierPolicy)
+}
+
+func resolveBillingServiceTierForPolicy(actualTier, requestedTier, policy string) string {
+	actualTier = normalizeBillingServiceTier(actualTier)
+	requestedTier = normalizeBillingServiceTier(requestedTier)
+
+	if NormalizeBillingTierPolicy(policy) == BillingTierPolicyRequested {
+		if requestedTier != "" {
+			return requestedTier
+		}
+		return actualTier
+	}
+
 	if actualTier != "" {
 		return actualTier
 	}
@@ -1172,7 +2157,262 @@ func stripUnsupportedSchemaKeys(schema map[string]interface{}) {
 
 func sanitizeSchemaForUpstream(schema map[string]interface{}) {
 	stripUnsupportedSchemaKeys(schema)
+	normalizeSchemaRequiredFields(schema)
 	ensureArrayItems(schema)
+}
+
+func sanitizeStructuredOutputSchemaForUpstream(schema map[string]interface{}) {
+	sanitizeSchemaForUpstream(schema)
+	ensureObjectAdditionalPropertiesFalse(schema)
+}
+
+func normalizeResponsesStructuredOutputFormat(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	modified := false
+	if responseFormat, ok := body["response_format"].(map[string]any); ok {
+		if textFormat := responsesTextFormatFromResponseFormat(responseFormat); textFormat != nil {
+			text, _ := body["text"].(map[string]any)
+			if text == nil {
+				text = map[string]any{}
+				body["text"] = text
+			}
+			if _, hasFormat := text["format"]; !hasFormat {
+				text["format"] = textFormat
+				modified = true
+			}
+		}
+		if sanitizeStructuredOutputSchema(responseFormat) {
+			modified = true
+		}
+	}
+
+	text, ok := body["text"].(map[string]any)
+	if !ok {
+		return modified
+	}
+	format, ok := text["format"].(map[string]any)
+	if !ok {
+		return modified
+	}
+	if sanitizeStructuredOutputSchema(format) {
+		modified = true
+	}
+	if ensureJSONModeInputMentionsJSON(body, format) {
+		modified = true
+	}
+	return modified
+}
+
+func ensureJSONModeInputMentionsJSON(body map[string]any, format map[string]any) bool {
+	if strings.TrimSpace(firstNonEmptyAnyString(format["type"])) != "json_object" {
+		return false
+	}
+	input, ok := body["input"]
+	if !ok || responsesInputContainsJSON(input) {
+		return false
+	}
+
+	switch inputValue := input.(type) {
+	case string:
+		body["input"] = jsonObjectFormatInputHint + "\n\n" + inputValue
+		return true
+	case []any:
+		body["input"] = append([]any{jsonObjectDeveloperMessage()}, inputValue...)
+		return true
+	case []map[string]string:
+		inputItems := make([]any, 0, len(inputValue)+1)
+		inputItems = append(inputItems, jsonObjectDeveloperMessage())
+		for _, item := range inputValue {
+			inputItems = append(inputItems, item)
+		}
+		body["input"] = inputItems
+		return true
+	case []map[string]any:
+		inputItems := make([]any, 0, len(inputValue)+1)
+		inputItems = append(inputItems, jsonObjectDeveloperMessage())
+		for _, item := range inputValue {
+			inputItems = append(inputItems, item)
+		}
+		body["input"] = inputItems
+		return true
+	default:
+		return false
+	}
+}
+
+func jsonObjectDeveloperMessage() map[string]any {
+	return map[string]any{
+		"type": "message",
+		"role": "developer",
+		"content": []any{
+			map[string]any{"type": "input_text", "text": jsonObjectFormatInputHint},
+		},
+	}
+}
+
+func responsesInputContainsJSON(value any) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.Contains(strings.ToLower(v), "json")
+	case []any:
+		for _, item := range v {
+			if responsesInputContainsJSON(item) {
+				return true
+			}
+		}
+	case []map[string]string:
+		for _, item := range v {
+			if responsesInputContainsJSON(item) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, item := range v {
+			if responsesInputContainsJSON(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, key := range []string{"content", "text", "output"} {
+			if child, ok := v[key]; ok && responsesInputContainsJSON(child) {
+				return true
+			}
+		}
+	case map[string]string:
+		for _, key := range []string{"content", "text", "output"} {
+			if child, ok := v[key]; ok && responsesInputContainsJSON(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func responsesTextFormatFromResponseFormat(responseFormat map[string]any) map[string]any {
+	formatType := strings.TrimSpace(firstNonEmptyAnyString(responseFormat["type"]))
+	switch formatType {
+	case "json_schema":
+		if jsonSchema, ok := responseFormat["json_schema"].(map[string]any); ok && jsonSchema != nil {
+			out := make(map[string]any, len(jsonSchema)+1)
+			for key, value := range jsonSchema {
+				out[key] = value
+			}
+			out["type"] = "json_schema"
+			return out
+		}
+		out := make(map[string]any, len(responseFormat))
+		for key, value := range responseFormat {
+			if key == "json_schema" {
+				continue
+			}
+			out[key] = value
+		}
+		out["type"] = "json_schema"
+		return out
+	case "json_object", "text":
+		return map[string]any{"type": formatType}
+	default:
+		return nil
+	}
+}
+
+func sanitizeStructuredOutputSchema(format map[string]any) bool {
+	modified := false
+	if schema, ok := format["schema"].(map[string]any); ok && schema != nil {
+		sanitizeStructuredOutputSchemaForUpstream(schema)
+		modified = true
+	}
+	if jsonSchema, ok := format["json_schema"].(map[string]any); ok && jsonSchema != nil {
+		if schema, ok := jsonSchema["schema"].(map[string]any); ok && schema != nil {
+			sanitizeStructuredOutputSchemaForUpstream(schema)
+			modified = true
+		}
+	}
+	return modified
+}
+
+func isFunctionTool(tool map[string]any) bool {
+	toolType, _ := tool["type"].(string)
+	return strings.TrimSpace(toolType) == "function"
+}
+
+func normalizeFunctionToolParameters(tool map[string]any) {
+	params, ok := tool["parameters"].(map[string]any)
+	if !ok || params == nil {
+		tool["parameters"] = defaultFunctionParametersSchema()
+		return
+	}
+	sanitizeSchemaForUpstream(params)
+	ensureFunctionParametersRootObject(params)
+}
+
+func defaultFunctionParametersSchema() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+}
+
+func ensureFunctionParametersRootObject(schema map[string]any) {
+	if schemaType, ok := schema["type"].(string); !ok || strings.TrimSpace(schemaType) != "object" {
+		schema["type"] = "object"
+	}
+	if props, ok := schema["properties"].(map[string]any); !ok || props == nil {
+		schema["properties"] = map[string]any{}
+	}
+}
+
+func normalizeSchemaRequiredFields(schema map[string]interface{}) {
+	if rawRequired, exists := schema["required"]; exists {
+		required, ok := rawRequired.([]interface{})
+		if !ok {
+			delete(schema, "required")
+		} else {
+			cleaned := make([]interface{}, 0, len(required))
+			for _, item := range required {
+				if name, ok := item.(string); ok && strings.TrimSpace(name) != "" {
+					cleaned = append(cleaned, name)
+				}
+			}
+			if len(cleaned) == 0 {
+				delete(schema, "required")
+			} else {
+				schema["required"] = cleaned
+			}
+		}
+	}
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				normalizeSchemaRequiredFields(sub)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		normalizeSchemaRequiredFields(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					normalizeSchemaRequiredFields(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		normalizeSchemaRequiredFields(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, v := range defs {
+			if sub, ok := v.(map[string]interface{}); ok {
+				normalizeSchemaRequiredFields(sub)
+			}
+		}
+	}
 }
 
 // ensureArrayItems 递归为缺失 items 的数组 schema 补上空 schema，
@@ -1214,6 +2454,41 @@ func ensureArrayItems(schema map[string]interface{}) {
 	}
 }
 
+func ensureObjectAdditionalPropertiesFalse(schema map[string]interface{}) {
+	if schemaDeclaresObject(schema) {
+		schema["additionalProperties"] = false
+	}
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureObjectAdditionalPropertiesFalse(sub)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		ensureObjectAdditionalPropertiesFalse(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					ensureObjectAdditionalPropertiesFalse(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		ensureObjectAdditionalPropertiesFalse(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, v := range defs {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureObjectAdditionalPropertiesFalse(sub)
+			}
+		}
+	}
+}
+
 func schemaDeclaresArray(schema map[string]interface{}) bool {
 	switch t := schema["type"].(type) {
 	case string:
@@ -1221,6 +2496,20 @@ func schemaDeclaresArray(schema map[string]interface{}) bool {
 	case []interface{}:
 		for _, item := range t {
 			if s, ok := item.(string); ok && s == "array" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaDeclaresObject(schema map[string]interface{}) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == "object"
+	case []interface{}:
+		for _, item := range t {
+			if s, ok := item.(string); ok && s == "object" {
 				return true
 			}
 		}
@@ -1278,17 +2567,48 @@ func newContentChunk(id, model string, created int64, content string) []byte {
 	return b
 }
 
-// newReasoningChunk 构建推理内容流式块
+// newReasoningChunk 构建推理内容流式块。
+// 同时填入 reasoning 与 reasoning_content,兼容 OpenAI/DeepSeek 两套客户端风格。
 func newReasoningChunk(id, model string, created int64, reasoning string) []byte {
 	chunk := openAIStreamChunk{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []streamChoice{{
 			Index: 0,
-			Delta: &streamDelta{ReasoningContent: &reasoning},
+			Delta: &streamDelta{
+				Reasoning:        &reasoning,
+				ReasoningContent: &reasoning,
+			},
 		}},
 	}
 	b, _ := json.Marshal(chunk)
 	return b
+}
+
+func isCodexToolCallItemType(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodexToolInputDeltaEvent(eventType string) bool {
+	switch eventType {
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodexToolInputDoneEvent(eventType string) bool {
+	switch eventType {
+	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
+		return true
+	default:
+		return false
+	}
 }
 
 // newToolCallAnnouncementChunk 构建 tool call 首块（含 id、type、function.name）
@@ -1369,6 +2689,9 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		delta := gjson.GetBytes(eventData, "delta").String()
 		return newReasoningChunk(chunkID, model, created, delta), false
 
+	case "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
+		return nil, false
+
 	case "response.completed":
 		usage := extractUsage(eventData)
 		return newFinalChunk(chunkID, model, created, "stop", usage), true
@@ -1427,47 +2750,64 @@ func NewStreamTranslator(chunkID, model string, created int64) *StreamTranslator
 
 // Translate 将单个 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式
 func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
-	eventType := gjson.GetBytes(eventData, "type").String()
+	return st.TranslateParsed(gjson.ParseBytes(eventData))
+}
+
+// TranslateParsed 将已解析的 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式。
+func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) {
+	eventType := parsed.Get("type").String()
 
 	switch eventType {
 	case "response.output_text.delta":
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newContentChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newReasoningChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.output_item.added":
-		itemType := gjson.GetBytes(eventData, "item.type").String()
-		if itemType != "function_call" {
+		itemType := parsed.Get("item.type").String()
+		if !isCodexToolCallItemType(itemType) {
 			return nil, false
 		}
-		callID := gjson.GetBytes(eventData, "item.call_id").String()
-		name := gjson.GetBytes(eventData, "item.name").String()
-		itemID := gjson.GetBytes(eventData, "item.id").String()
+		callID := parsed.Get("item.call_id").String()
+		if callID == "" {
+			callID = parsed.Get("item.id").String()
+		}
+		name := parsed.Get("item.name").String()
+		itemID := parsed.Get("item.id").String()
+		if itemID == "" {
+			itemID = callID
+		}
 
 		tcIdx := st.nextIdx
 		st.toolCallMap[itemID] = tcIdx
+		if callID != "" && callID != itemID {
+			st.toolCallMap[callID] = tcIdx
+		}
 		st.nextIdx++
 		st.HasToolCalls = true
 
 		return newToolCallAnnouncementChunk(st.ChunkID, st.Model, st.Created, tcIdx, callID, name), false
 
-	case "response.function_call_arguments.delta":
-		itemID := gjson.GetBytes(eventData, "item_id").String()
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		itemID := parsed.Get("item_id").String()
+		if itemID == "" {
+			itemID = parsed.Get("call_id").String()
+		}
 		tcIdx, ok := st.toolCallMap[itemID]
 		if !ok {
 			return nil, false
 		}
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newToolCallDeltaChunk(st.ChunkID, st.Model, st.Created, tcIdx, delta), false
 
-	case "response.function_call_arguments.done":
+	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
 		return nil, false
 
 	case "response.completed":
-		usage := extractUsage(eventData)
+		usage := extractUsageFromResult(parsed.Get("response.usage"))
 		finishReason := "stop"
 		if st.HasToolCalls {
 			finishReason = "tool_calls"
@@ -1475,7 +2815,7 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return newFinalChunk(st.ChunkID, st.Model, st.Created, finishReason, usage), true
 
 	case "response.failed":
-		errMsg := gjson.GetBytes(eventData, "response.error.message").String()
+		errMsg := parsed.Get("response.error.message").String()
 		if errMsg == "" {
 			errMsg = "Codex upstream error"
 		}
@@ -1490,7 +2830,7 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return nil, false
 
 	default:
-		if delta := gjson.GetBytes(eventData, "delta"); delta.Exists() && delta.Type == gjson.String {
+		if delta := parsed.Get("delta"); delta.Exists() && delta.Type == gjson.String {
 			return newContentChunk(st.ChunkID, st.Model, st.Created, delta.String()), false
 		}
 		return nil, false
@@ -1501,17 +2841,35 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 
 // TranslateCompactResponse 将 Codex 非流式响应转换为 OpenAI 格式
 func TranslateCompactResponse(responseData []byte, model string, id string) []byte {
-	var outputText string
+	var outputText, reasoningText string
 	output := gjson.GetBytes(responseData, "output")
 	if output.IsArray() {
 		output.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "message" {
+			switch item.Get("type").String() {
+			case "message":
 				content := item.Get("content")
 				if content.IsArray() {
 					content.ForEach(func(_, part gjson.Result) bool {
 						if part.Get("type").String() == "output_text" {
 							outputText += part.Get("text").String()
 						}
+						return true
+					})
+				}
+			case "reasoning":
+				// Codex 在 response.output 里把思考过程作为 reasoning item,
+				// content/summary 数组下每个元素是 {type, text} 形式。
+				summary := item.Get("summary")
+				if summary.IsArray() {
+					summary.ForEach(func(_, part gjson.Result) bool {
+						reasoningText += part.Get("text").String()
+						return true
+					})
+				}
+				content := item.Get("content")
+				if content.IsArray() {
+					content.ForEach(func(_, part gjson.Result) bool {
+						reasoningText += part.Get("text").String()
 						return true
 					})
 				}
@@ -1522,16 +2880,23 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 
 	usage := extractUsage(responseData)
 
+	msg := compactMessage{
+		Role:    "assistant",
+		Content: &outputText,
+	}
+	if reasoningText != "" {
+		r := reasoningText
+		msg.Reasoning = &r
+		msg.ReasoningContent = &r
+	}
+
 	resp := openAICompactResponse{
 		ID:     id,
 		Object: "chat.completion",
 		Model:  model,
 		Choices: []compactChoice{{
-			Index: 0,
-			Message: compactMessage{
-				Role:    "assistant",
-				Content: &outputText,
-			},
+			Index:        0,
+			Message:      msg,
 			FinishReason: "stop",
 		}},
 		Usage: usage,
@@ -1542,11 +2907,17 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 
 // BuildCompactResponse 构建非流式完整响应（供 handler.go 调用，替代内联 sjson）
 // 当有 toolCalls 且 content 为空时，content 输出为 JSON null
-func BuildCompactResponse(id, model string, created int64, content string, toolCalls []ToolCallResult, usage *UsageInfo) []byte {
+// reasoning 为思考过程拼接文本,空字符串时 reasoning / reasoning_content 字段被省略。
+func BuildCompactResponse(id, model string, created int64, content, reasoning string, toolCalls []ToolCallResult, usage *UsageInfo) []byte {
 	finishReason := "stop"
 	msg := compactMessage{
 		Role:    "assistant",
 		Content: &content,
+	}
+	if reasoning != "" {
+		r := reasoning
+		msg.Reasoning = &r
+		msg.ReasoningContent = &r
 	}
 
 	if len(toolCalls) > 0 {
@@ -1608,11 +2979,20 @@ func ExtractToolCallsFromOutput(eventData []byte) []ToolCallResult {
 		return nil
 	}
 	output.ForEach(func(_, item gjson.Result) bool {
-		if item.Get("type").String() == "function_call" {
+		itemType := item.Get("type").String()
+		if isCodexToolCallItemType(itemType) {
+			callID := item.Get("call_id").String()
+			if callID == "" {
+				callID = item.Get("id").String()
+			}
+			arguments := item.Get("arguments").String()
+			if itemType == "custom_tool_call" {
+				arguments = item.Get("input").String()
+			}
 			toolCalls = append(toolCalls, ToolCallResult{
-				ID:        item.Get("call_id").String(),
+				ID:        callID,
 				Name:      item.Get("name").String(),
-				Arguments: item.Get("arguments").String(),
+				Arguments: arguments,
 			})
 		}
 		return true

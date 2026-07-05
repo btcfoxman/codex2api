@@ -14,6 +14,7 @@ import (
 	neturl "net/url"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -36,6 +37,14 @@ type Backend interface {
 	// Delete 删除对应 ref。
 	Delete(ctx context.Context, ref string) error
 }
+
+// Presigner 由能为对象生成限时直链的后端实现（当前仅 S3Backend）。
+type Presigner interface {
+	PresignGetURL(ctx context.Context, ref string, ttl time.Duration) (string, error)
+}
+
+// ErrPresignUnsupported 表示当前后端无法生成云直链（如 LocalBackend）。
+var ErrPresignUnsupported = errors.New("imagestore: 当前后端不支持生成云存储直链")
 
 // Config 集中描述一份运行时配置。来源于 system_settings。
 type Config struct {
@@ -227,4 +236,18 @@ func LocalDir() string {
 		}
 	}
 	return ""
+}
+
+// PresignURL 为 ref 生成限时直链。按 ref 前缀路由到对应后端，
+// 若该后端不支持预签名（如本地后端）返回 ErrPresignUnsupported。
+func PresignURL(ctx context.Context, ref string, ttl time.Duration) (string, error) {
+	backend, err := Resolve(ref)
+	if err != nil {
+		return "", err
+	}
+	presigner, ok := backend.(Presigner)
+	if !ok {
+		return "", ErrPresignUnsupported
+	}
+	return presigner.PresignGetURL(ctx, ref, ttl)
 }

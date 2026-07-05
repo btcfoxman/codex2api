@@ -35,8 +35,14 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 			t.Errorf("Header %s = %q, expected %q", header, value, expected)
 		}
 	}
-	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "img-src 'self' data: blob:") {
-		t.Errorf("Content-Security-Policy = %q, expected blob: image previews to be allowed", csp)
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "img-src 'self' data: blob: https: http:") {
+		t.Errorf("Content-Security-Policy = %q, expected local, inline, and remote images to be allowed", csp)
+	}
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "media-src 'self' data: blob: https: http:") {
+		t.Errorf("Content-Security-Policy = %q, expected local, inline, and remote media to be allowed", csp)
+	}
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'self' https://api.github.com") {
+		t.Errorf("Content-Security-Policy = %q, expected GitHub release API to be allowed for update checks", csp)
 	}
 }
 
@@ -73,6 +79,17 @@ func TestRequestSizeLimiter(t *testing.T) {
 	r.Use(RequestSizeLimiter(100))
 	r.POST("/test", func(c *gin.Context) {
 		body, _ := c.GetRawData()
+		cached, exists := c.Get("raw_body")
+		if !exists {
+			t.Fatal("raw_body was not cached")
+		}
+		cachedBody, ok := cached.([]byte)
+		if !ok {
+			t.Fatalf("raw_body type = %T, want []byte", cached)
+		}
+		if string(cachedBody) != string(body) {
+			t.Fatalf("cached body = %q, want %q", string(cachedBody), string(body))
+		}
 		c.String(200, "Received %d bytes", len(body))
 	})
 
@@ -91,6 +108,37 @@ func TestRequestSizeLimiter(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != 413 {
 		t.Errorf("Large request: expected 413, got %d", w.Code)
+	}
+}
+
+func TestRequestSizeLimiterAllowsEmptyBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(RequestSizeLimiter(100))
+	r.POST("/test", func(c *gin.Context) {
+		body, _ := c.GetRawData()
+		if len(body) != 0 {
+			t.Fatalf("body length = %d, want 0", len(body))
+		}
+		cached, exists := c.Get("raw_body")
+		if !exists {
+			t.Fatal("raw_body was not cached for empty body")
+		}
+		cachedBody, ok := cached.([]byte)
+		if !ok {
+			t.Fatalf("raw_body type = %T, want []byte", cached)
+		}
+		if len(cachedBody) != 0 {
+			t.Fatalf("cached body length = %d, want 0", len(cachedBody))
+		}
+		c.String(200, "OK")
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/test", strings.NewReader(""))
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
 	}
 }
 

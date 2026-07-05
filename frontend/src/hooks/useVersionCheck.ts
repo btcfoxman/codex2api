@@ -1,86 +1,91 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { api } from '../api'
+import type { SystemUpdateInfo } from '../types'
 
-const GITHUB_API = 'https://api.github.com/repos/james-6-23/codex2api/releases/latest'
 const CACHE_KEY = 'codex2api_latest_version'
-const CACHE_TTL = 10 * 60 * 1000 // 10 分钟缓存
-const POLL_INTERVAL = 30 * 60 * 1000 // 30 分钟轮询
+const CACHE_TTL = 10 * 60 * 1000
+const POLL_INTERVAL = 30 * 60 * 1000
 
-interface CachedVersion {
-  version: string
+interface CachedUpdateInfo {
+  info: SystemUpdateInfo
   checkedAt: number
 }
 
-/** 解析版本号字符串为数字数组，如 "v1.0.5" → [1, 0, 5] */
-function parseVersion(tag: string): number[] | null {
-  const m = tag.replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)/)
-  if (!m) return null
-  return [Number(m[1]), Number(m[2]), Number(m[3])]
+function versionLabel(version?: string | null): string | null {
+  if (!version) return null
+  return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`
 }
 
-/** 判断 remote 是否比 local 更新 */
-function isNewer(remote: number[], local: number[]): boolean {
-  for (let i = 0; i < 3; i++) {
-    if (remote[i] > local[i]) return true
-    if (remote[i] < local[i]) return false
-  }
-  return false
-}
-
-async function fetchLatestVersion(): Promise<string | null> {
-  // 优先读取未过期的缓存
+function readCachedInfo(ignoreTTL = false): SystemUpdateInfo | null {
   try {
     const raw = localStorage.getItem(CACHE_KEY)
-    if (raw) {
-      const cached: CachedVersion = JSON.parse(raw)
-      if (Date.now() - cached.checkedAt < CACHE_TTL) {
-        return cached.version
-      }
+    if (!raw) return null
+    const cached = JSON.parse(raw) as Partial<CachedUpdateInfo>
+    if (!ignoreTTL && typeof cached.checkedAt === 'number' && Date.now() - cached.checkedAt >= CACHE_TTL) {
+      return null
     }
-  } catch { /* 缓存损坏忽略 */ }
-
-  try {
-    const res = await fetch(GITHUB_API, {
-      headers: { Accept: 'application/vnd.github.v3+json' },
-      signal: AbortSignal.timeout(10000),
-    })
-    if (!res.ok) return null
-    const data = await res.json()
-    const version = data.tag_name as string
-    if (version) {
-      localStorage.setItem(CACHE_KEY, JSON.stringify({ version, checkedAt: Date.now() }))
-    }
-    return version || null
+    return cached.info?.latest_version ? cached.info : null
   } catch {
     return null
   }
 }
 
-export function useVersionCheck() {
+function writeCachedInfo(info: SystemUpdateInfo) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ info, checkedAt: Date.now() }))
+  } catch {
+    // ignore localStorage write failures
+  }
+}
+
+async function fetchUpdateInfo(forceNetwork = false): Promise<SystemUpdateInfo | null> {
+  if (!forceNetwork) {
+    const cached = readCachedInfo()
+    if (cached) return cached
+  }
+
+  try {
+    const info = await api.getSystemUpdate()
+    writeCachedInfo(info)
+    return info
+  } catch {
+    return readCachedInfo(true)
+  }
+}
+
+export function useVersionCheck(triggerKey?: string) {
+  const [updateInfo, setUpdateInfo] = useState<SystemUpdateInfo | null>(null)
   const [latestVersion, setLatestVersion] = useState<string | null>(null)
   const [hasUpdate, setHasUpdate] = useState(false)
+  const lastTriggerRef = useRef<string | undefined>(undefined)
+
+  const check = useCallback(async (forceNetwork = false) => {
+    if (__APP_VERSION__ === 'dev') return
+
+    const info = await fetchUpdateInfo(forceNetwork)
+    if (!info) return
+
+    setUpdateInfo(info)
+    setLatestVersion(versionLabel(info.latest_version))
+    setHasUpdate(Boolean(info.has_update))
+  }, [])
 
   useEffect(() => {
-    const currentVersion = __APP_VERSION__
-    // 开发模式不检查
-    if (currentVersion === 'dev') return
-
-    const localParsed = parseVersion(currentVersion)
-    if (!localParsed) return
-
-    const check = async () => {
-      const remote = await fetchLatestVersion()
-      if (!remote) return
-      const remoteParsed = parseVersion(remote)
-      if (!remoteParsed) return
-
-      setLatestVersion(remote)
-      setHasUpdate(isNewer(remoteParsed, localParsed))
-    }
-
     void check()
     const timer = setInterval(() => void check(), POLL_INTERVAL)
     return () => clearInterval(timer)
-  }, [])
+  }, [check])
 
-  return { hasUpdate, latestVersion }
+  useEffect(() => {
+    if (triggerKey === undefined) return
+    if (lastTriggerRef.current === undefined) {
+      lastTriggerRef.current = triggerKey
+      return
+    }
+    if (lastTriggerRef.current === triggerKey) return
+    lastTriggerRef.current = triggerKey
+    void check(true)
+  }, [check, triggerKey])
+
+  return { hasUpdate, latestVersion, updateInfo, refreshVersion: check }
 }

@@ -1,9 +1,15 @@
 package admin
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -26,6 +32,79 @@ func TestBuildTestPayloadUsesSelectedModel(t *testing.T) {
 	}
 	if !gjson.GetBytes(payload, "stream").Bool() {
 		t.Fatal("stream should be true")
+	}
+}
+
+func TestBuildConnectionTestPayloadUsesStoreContent(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.SetTestContent("say pong")
+
+	payload := buildConnectionTestPayload(store, "gpt-5.5")
+	if got := gjson.GetBytes(payload, "input.0.content.0.text").String(); got != "say pong" {
+		t.Fatalf("test content = %q, want say pong", got)
+	}
+}
+
+func TestFormatUsageLimitedTestErrorReportsSuccessfulProbeAsLimited(t *testing.T) {
+	msg, limited := formatUsageLimitedTestError(proxy.CodexUsageSyncResult{
+		Premium5hRateLimited: true,
+		UsagePct5h:           100,
+		Reset5hAt:            time.Now().Add(time.Hour),
+	})
+
+	if !limited {
+		t.Fatal("limited = false, want true")
+	}
+	for _, want := range []string{"返回 200", "5h 用量头", "限流状态"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message %q does not contain %q", msg, want)
+		}
+	}
+}
+
+func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstreamBody := `{"error":{"message":"Your authentication token has been invalidated.","code":"token_invalidated"},"status":401}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	router := gin.New()
+	router.GET("/api/admin/accounts/:id/test", handler.TestConnection)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/accounts/42/test", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "token_invalidated") {
+		t.Fatalf("SSE response %q does not contain token_invalidated", recorder.Body.String())
+	}
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "token_invalidated") {
+		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
 	}
 }
 

@@ -16,6 +16,8 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 	xproxy "golang.org/x/net/proxy"
+
+	"github.com/codex2api/security"
 )
 
 // ==================== utls RoundTripper（Chrome 指纹 + HTTP/2） ====================
@@ -34,6 +36,10 @@ type utlsRoundTripper struct {
 	pending     map[string]*sync.Cond        // 防止重复连接创建
 	dialer     xproxy.Dialer                 // 底层拨号器（支持代理）
 }
+
+// utlsSessionCache 在所有 uTLS 连接间共享 TLS 会话缓存，让重连走 TLS resumption。
+// 必须实例级共享（而非每次 new），否则缓存无法命中。
+var utlsSessionCache = utls.NewLRUClientSessionCache(256)
 
 // NewUTLSTransport 创建使用 Chrome TLS 指纹的 RoundTripper
 // 支持 HTTP(S) 和 SOCKS5 代理
@@ -67,7 +73,7 @@ func NewUTLSHttpClient(proxyURL string) *http.Client {
 
 // buildProxyDialer 根据代理 URL 创建拨号器
 func buildProxyDialer(proxyURL string) (xproxy.Dialer, error) {
-	u, err := url.Parse(proxyURL)
+	u, err := security.ParseProxyURL(proxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("解析代理 URL 失败: %w", err)
 	}
@@ -243,9 +249,10 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, fmt.Errorf("TCP 连接失败: %w", err)
 	}
 
-	// 2. 配置 TLS
+	// 2. 配置 TLS（共享会话缓存，握手走 resumption 降低重连成本）
 	tlsConfig := &utls.Config{
-		ServerName: host,
+		ServerName:         host,
+		ClientSessionCache: utlsSessionCache,
 	}
 
 	// 3. 使用 utls 握手（Chrome 指纹）

@@ -30,12 +30,20 @@ func normalizePlanType(plan string) string {
 	return NormalizePlanType(plan)
 }
 
+// isPremium5hPlan reports whether the plan carries a rolling 5h usage window
+// (premium 5h rate-limit semantics). Free-tier plans only have the 7d window.
+// Education (k12/edu) and other paid workspace plans do have the 5h window —
+// excluding them made 429'd k12 accounts show as available and let the wham
+// usage probe clear their cooldown while still limited (issue #306/#309).
+// The plan gate errs broad on purpose: MarkPremium5hRateLimited and
+// premium5hRateLimitedLocked additionally require an actually observed 5h
+// window at 100%, so a plan without a real 5h window can never get stuck.
 func isPremium5hPlan(plan string) bool {
 	switch normalizePlanType(plan) {
-	case "plus", "pro", "team":
+	case "plus", "pro", "team", "k12", "edu", "education", "go":
 		return true
 	default:
-		return false
+		return IsPlusOrHigherPlan(plan)
 	}
 }
 
@@ -48,7 +56,7 @@ func IsPlusOrHigherPlan(plan string) bool {
 		return false
 	}
 	switch normalized {
-	case "plus", "pro", "team", "teamplus", "enterprise", "business", "edu", "education":
+	case "plus", "pro", "team", "teamplus", "enterprise", "business", "edu", "education", "k12", "go":
 		return true
 	default:
 		return strings.Contains(normalized, "plus") ||
@@ -67,6 +75,9 @@ func (a *Account) IsPremium5hPlan() bool {
 }
 
 func (a *Account) premium5hRateLimitedLocked(now time.Time) bool {
+	if a.creditSkipsUsageWindowLocked() {
+		return false
+	}
 	if !isPremium5hPlan(a.PlanType) {
 		return false
 	}
@@ -98,7 +109,7 @@ func (a *Account) GetUsageSnapshot5h() (pct float64, resetAt time.Time, ok bool)
 
 // PersistUsageSnapshot5hOnly 持久化仅包含 5h 数据的用量快照。
 func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
-	if acc == nil || s == nil || s.db == nil {
+	if acc == nil || s == nil {
 		return
 	}
 
@@ -109,8 +120,14 @@ func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
 
 	updatedAt := time.Now()
 	acc.mu.Lock()
-	acc.UsageUpdatedAt = updatedAt
+	acc.UsageUpdatedAt5h = updatedAt
 	acc.mu.Unlock()
+
+	s.fastSchedulerUpdate(acc)
+
+	if s.db == nil {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -134,7 +151,7 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	acc.UsagePercent5h = 100
 	acc.UsagePercent5hValid = true
 	acc.Reset5hAt = resetAt
-	acc.UsageUpdatedAt = now
+	acc.UsageUpdatedAt5h = now
 	acc.LastRateLimitedAt = now
 	acc.Status = StatusCooldown
 	acc.CooldownUtil = resetAt
@@ -146,6 +163,7 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	acc.mu.Unlock()
 
 	s.fastSchedulerUpdate(acc)
+	s.setCachedAccountCooldown(acc.DBID, "rate_limited", resetAt)
 
 	if s.db == nil {
 		return

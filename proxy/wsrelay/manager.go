@@ -169,6 +169,7 @@ type Manager struct {
 	// 清理定时器
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
+	stopOnce      sync.Once
 
 	// 连接回调
 	onConnected    func(accountID int64, session *Session)
@@ -182,7 +183,13 @@ type Manager struct {
 
 	// 可选的探活函数（用于测试替换），nil 时使用默认 probeConnection
 	probeFunc func(wc *WsConnection) bool
+
+	// 可选的保活 Ping 函数（用于测试替换），nil 时使用默认 SendHeartbeat
+	keepalivePingFunc func(wc *WsConnection) error
 }
+
+// wsWriteBufferPool 在所有上游 WS 连接间共享写缓冲，降低高并发下的内存占用。
+var wsWriteBufferPool = &sync.Pool{}
 
 // NewManager 创建连接池管理器
 func NewManager() *Manager {
@@ -190,6 +197,11 @@ func NewManager() *Manager {
 		dialer: &websocket.Dialer{
 			HandshakeTimeout:  HandshakeTimeout,
 			EnableCompression: true,
+			// 上游 Codex WS 帧可达 48-91KB，默认 4KB 缓冲会导致单帧多轮 syscall；
+			// 调大到 64KB 减少读写循环次数，写缓冲走共享池复用。
+			ReadBufferSize:  64 * 1024,
+			WriteBufferSize: 64 * 1024,
+			WriteBufferPool: wsWriteBufferPool,
 			NetDialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -218,18 +230,13 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-// evictExpired 清理过期连接、会话和对应的 keyLocks
+// evictExpired 清理过期连接和会话
 func (m *Manager) evictExpired() {
-	// 收集仍存活的 pool key
-	activeKeys := make(map[string]struct{})
-
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)
 		if wc.IsExpired() || !wc.IsConnected() {
 			m.connections.Delete(key)
 			wc.Close()
-		} else {
-			activeKeys[key.(string)] = struct{}{}
 		}
 		return true
 	})
@@ -239,16 +246,6 @@ func (m *Manager) evictExpired() {
 		if s.IsExpired() || !s.IsConnected() {
 			m.sessions.Delete(key)
 			s.Close()
-		} else {
-			activeKeys[key.(string)] = struct{}{}
-		}
-		return true
-	})
-
-	// 清理不再关联任何存活连接/会话的 keyLocks，防止 sync.Map 无限膨胀
-	m.keyLocks.Range(func(key, _ any) bool {
-		if _, alive := activeKeys[key.(string)]; !alive {
-			m.keyLocks.Delete(key)
 		}
 		return true
 	})
@@ -256,8 +253,10 @@ func (m *Manager) evictExpired() {
 
 // Stop 停止管理器
 func (m *Manager) Stop() {
-	close(m.stopCleanup)
-	m.closeAll()
+	m.stopOnce.Do(func() {
+		close(m.stopCleanup)
+		m.closeAll()
+	})
 }
 
 // closeAll 关闭所有连接
@@ -328,7 +327,8 @@ func (m *Manager) AcquireConnection(
 ) (*WsConnection, *PendingRequest, error) {
 	key := m.poolKey(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
 	lock := m.keyLock(key)
-	wait := 10 * time.Millisecond
+	wait := AcquireInitialBackoff
+	var waited time.Duration
 
 	for {
 		lock.Lock()
@@ -345,19 +345,28 @@ func (m *Manager) AcquireConnection(
 				// 探活失败，清理死连接
 				m.connections.Delete(key)
 				m.sessions.Delete(key)
-				m.keyLocks.Delete(key)
 				wc.Close()
 				lock.Unlock()
-				// 直接重新获取锁创建新连接，不等待
-				lock = m.keyLock(key)
 				continue
 			}
 			if wc.IsConnected() && !wc.IsExpired() && wc.session != nil {
 				lock.Unlock()
+				// 连接被同 session 的前一个请求占用：指数退避轮询等待其空闲，
+				// 累计等待超过上限则返回错误，避免无界阻塞与固定间隔空转抢锁。
+				if waited >= AcquireMaxWait {
+					return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for busy session", AcquireMaxWait)
+				}
 				select {
 				case <-ctx.Done():
 					return nil, nil, ctx.Err()
 				case <-time.After(wait):
+				}
+				waited += wait
+				if wait < AcquireMaxBackoff {
+					wait *= 2
+					if wait > AcquireMaxBackoff {
+						wait = AcquireMaxBackoff
+					}
 				}
 				continue
 			}
@@ -383,6 +392,79 @@ func (m *Manager) AcquireConnection(
 
 		return wc, pr, nil
 	}
+}
+
+// StatelessConnectionSlots 无显式会话的请求在每个 (account, cacheKey) 维度下
+// 复用的持久连接槽位数。槽位内空闲连接直接复用,避免每个请求都重新握手——
+// 持续高 RPM 下逐请求握手会触发上游 WS 握手限流（bad handshake → 503）。
+const StatelessConnectionSlots = 8
+
+// AcquireReusableConnection 在固定槽位内复用或创建连接，返回实际使用的 session key。
+// 第一遍只复用已存在且空闲的连接；第二遍在空槽位新建持久连接；槽位全忙时回退到
+// fallbackKey 的一次性连接，保持与原 stateless 行为一致的并发上限（无上限）。
+func (m *Manager) AcquireReusableConnection(
+	ctx context.Context,
+	account *auth.Account,
+	wsURL string,
+	baseKey string,
+	fallbackKey string,
+	slots int,
+	headers http.Header,
+	proxyOverride string,
+) (*WsConnection, *PendingRequest, string, error) {
+	proxyURL := effectiveProxyURL(account, proxyOverride)
+	// 第一遍：复用空闲连接（探活失败或已断开的顺手清理，让第二遍可以补位）
+	for i := 0; i < slots; i++ {
+		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
+		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
+		lock := m.keyLock(key)
+		lock.Lock()
+		if v, ok := m.connections.Load(key); ok {
+			wc := v.(*WsConnection)
+			if canReuseConnection(wc) {
+				if m.probe(wc) {
+					pr := wc.session.AddPendingRequest(slotSession)
+					wc.Touch()
+					lock.Unlock()
+					return wc, pr, slotSession, nil
+				}
+				m.connections.Delete(key)
+				m.sessions.Delete(key)
+				wc.Close()
+			} else if !wc.IsConnected() || wc.IsExpired() {
+				m.connections.Delete(key)
+				m.sessions.Delete(key)
+				wc.Close()
+			}
+		}
+		lock.Unlock()
+	}
+	// 第二遍：在空槽位新建持久连接
+	for i := 0; i < slots; i++ {
+		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
+		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
+		lock := m.keyLock(key)
+		lock.Lock()
+		if _, ok := m.connections.Load(key); ok {
+			lock.Unlock()
+			continue
+		}
+		wc, err := m.createConnection(ctx, account, wsURL, slotSession, headers, proxyOverride)
+		if err != nil {
+			lock.Unlock()
+			return nil, nil, "", err
+		}
+		m.connections.Store(key, wc)
+		pr := wc.session.AddPendingRequest(slotSession)
+		lock.Unlock()
+		if fn := m.getOnConnected(); fn != nil {
+			fn(account.ID(), wc.session)
+		}
+		return wc, pr, slotSession, nil
+	}
+	// 槽位全忙：回退一次性连接
+	wc, pr, err := m.AcquireConnection(ctx, account, wsURL, fallbackKey, headers, proxyOverride)
+	return wc, pr, fallbackKey, err
 }
 
 func canReuseConnection(wc *WsConnection) bool {
@@ -431,11 +513,10 @@ func (m *Manager) createConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, error) {
-	// 创建拨号器副本（避免修改共享 dialer）
-	dialer := &websocket.Dialer{
-		HandshakeTimeout:  m.dialer.HandshakeTimeout,
-		EnableCompression: m.dialer.EnableCompression,
-	}
+	// 浅拷贝共享 dialer，继承全部调优字段（NetDialContext/KeepAlive、读写缓冲、压缩等），
+	// 仅按需覆盖 Proxy；避免逐字段重建时漏抄字段（曾导致 NetDialContext/KeepAlive 失效）。
+	dialerCopy := *m.dialer
+	dialer := &dialerCopy
 
 	// 配置代理（Resin 反代模式下跳过，URL 已包含 Resin 地址）
 	proxyURL := effectiveProxyURL(account, proxyOverride)
@@ -503,7 +584,24 @@ func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey str
 		wc.Close()
 	}
 	m.sessions.Delete(key)
-	m.keyLocks.Delete(key)
+}
+
+// DiscardConnection 关闭并从连接池移除一条坏连接。
+// 用于上游 WS 异常路径(read error / close 1006/1009/1011 / broken pipe / unexpected EOF)：
+// 关闭底层 socket 解决 CLOSE_WAIT 滞留，并把连接从 connections/sessions 移除，
+// 避免坏连接被 ReleaseConnection 归还后又被 canReuseConnection 误判为可复用。
+// 使用 CompareAndDelete 按本连接精确删除，防止误删同 PoolKey 下已重建的新连接。
+func (m *Manager) DiscardConnection(wc *WsConnection) {
+	if wc == nil {
+		return
+	}
+	wc.Close()
+	if wc.PoolKey != "" {
+		m.connections.CompareAndDelete(wc.PoolKey, wc)
+		if wc.session != nil {
+			m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
+		}
+	}
 }
 
 // poolKey 生成连接池键

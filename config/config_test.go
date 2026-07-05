@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	keys := []string{
@@ -52,8 +55,11 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	if got := cfg.Port; got != 8080 {
 		t.Fatalf("Port = %d, want %d", got, 8080)
 	}
-	if got := cfg.MaxRequestBodySize; got != 32*1024*1024 {
-		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 32*1024*1024)
+	if got := cfg.MaxRequestBodySize; got != 48*1024*1024 {
+		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 48*1024*1024)
+	}
+	if got := strings.Join(cfg.TrustedProxies, ","); got != "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" {
+		t.Fatalf("TrustedProxies = %q, want loopback and private-network defaults", got)
 	}
 }
 
@@ -183,6 +189,38 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadParsesTrustedProxiesEnv(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12;192.168.1.10")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := strings.Join(cfg.TrustedProxies, ","); got != "10.0.0.0/8,172.16.0.0/12,192.168.1.10" {
+		t.Fatalf("TrustedProxies = %q", got)
+	}
+}
+
+func TestLoadCanDisableTrustedProxies(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_TRUSTED_PROXIES", "none")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if cfg.TrustedProxies != nil {
+		t.Fatalf("TrustedProxies = %#v, want nil", cfg.TrustedProxies)
+	}
+}
+
 func TestLoadDefaultsCodexUpstreamTransportToHTTP(t *testing.T) {
 	t.Setenv("DATABASE_DRIVER", "")
 	t.Setenv("DATABASE_HOST", "postgres")
@@ -299,5 +337,65 @@ func TestLoadReadsRedisTLSSettings(t *testing.T) {
 	}
 	if !cfg.Cache.Redis.InsecureSkipVerify {
 		t.Fatal("Redis.InsecureSkipVerify = false, want true")
+	}
+}
+
+func TestLoadAcceptsValidDatabaseSchema(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("DATABASE_NAME", "postgres")
+	t.Setenv("DATABASE_SCHEMA", "codex2api")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.Database.Schema; got != "codex2api" {
+		t.Fatalf("Database.Schema = %q, want codex2api", got)
+	}
+	dsn := cfg.Database.DSN()
+	if !strings.Contains(dsn, "options='-c search_path=codex2api,public'") {
+		t.Fatalf("DSN 未包含 search_path 选项: %s", dsn)
+	}
+}
+
+func TestLoadRejectsInvalidDatabaseSchema(t *testing.T) {
+	cases := []string{
+		"public; DROP TABLE users",
+		"with space",
+		"1leading-digit",
+		"with-dash",
+		"中文",
+		strings.Repeat("a", 64),
+	}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DATABASE_DRIVER", "")
+			t.Setenv("DATABASE_HOST", "postgres")
+			t.Setenv("DATABASE_SCHEMA", name)
+			t.Setenv("CACHE_DRIVER", "")
+			t.Setenv("REDIS_ADDR", "redis:6379")
+
+			if _, err := Load("__not_exists__.env"); err == nil {
+				t.Fatalf("非法 schema %q 应当被拒绝，但 Load() 通过了", name)
+			}
+		})
+	}
+}
+
+func TestDSNOmitsSchemaWhenEmpty(t *testing.T) {
+	d := DatabaseConfig{
+		Driver:   "postgres",
+		Host:     "h",
+		Port:     5432,
+		User:     "u",
+		Password: "p",
+		DBName:   "db",
+		SSLMode:  "disable",
+	}
+	if got := d.DSN(); strings.Contains(got, "search_path") {
+		t.Fatalf("空 schema 时 DSN 不应包含 search_path: %s", got)
 	}
 }

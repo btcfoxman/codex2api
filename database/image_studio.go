@@ -407,6 +407,30 @@ func (db *DB) ListImageGenerationJobs(ctx context.Context, page, pageSize int) (
 	return &ImageJobPage{Jobs: jobs, Total: total}, nil
 }
 
+func (db *DB) DeleteImageGenerationJob(ctx context.Context, id int64) error {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM image_assets WHERE job_id=$1`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM image_generation_jobs WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func scanImageGenerationJob(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*ImageGenerationJob, error) {
@@ -559,7 +583,7 @@ func normalizePage(page, pageSize int) (int, int) {
 }
 
 func (db *DB) GetAPIKeyByID(ctx context.Context, id int64) (*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, created_at FROM api_keys WHERE id=$1`, id)
+	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys WHERE id=$1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +595,7 @@ func (db *DB) GetAPIKeyByID(ctx context.Context, id int64) (*APIKeyRow, error) {
 }
 
 func (db *DB) FirstAPIKey(ctx context.Context) (*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, created_at FROM api_keys ORDER BY id LIMIT 1`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys ORDER BY id LIMIT 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -586,14 +610,55 @@ func scanAPIKeyRow(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*APIKeyRow, error) {
 	row := &APIKeyRow{}
-	var createdAtRaw interface{}
-	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw); err != nil {
+	var createdAtRaw, expiresAtRaw, lastResetAtRaw, allowedGroupsRaw, limitsRaw interface{}
+	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &row.TotalUsed, &row.ResetCount, &lastResetAtRaw, &expiresAtRaw, &allowedGroupsRaw, &limitsRaw); err != nil {
 		return nil, err
 	}
 	createdAt, err := parseDBTimeValue(createdAtRaw)
 	if err != nil {
 		return nil, fmt.Errorf("解析 API Key 创建时间失败: %w", err)
 	}
+	expiresAt, err := parseDBNullTimeValue(expiresAtRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 API Key 过期时间失败: %w", err)
+	}
+	lastResetAt, err := parseDBNullTimeValue(lastResetAtRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 API Key 重置时间失败: %w", err)
+	}
 	row.CreatedAt = createdAt
+	row.ExpiresAt = expiresAt
+	row.LastResetAt = lastResetAt
+	row.AllowedGroupIDs = decodeInt64SliceValue(allowedGroupsRaw)
+	row.Limits = decodeAPIKeyLimits(limitsRaw)
 	return row, nil
+}
+
+// decodeAPIKeyLimits 把 SQL 取出来的 JSONB / TEXT 值解到 APIKeyLimits。
+// 空值 / 非法 JSON 一律返回零值,避免 nil panic。
+func decodeAPIKeyLimits(raw interface{}) APIKeyLimits {
+	data := bytesFromDBValue(raw)
+	if len(data) == 0 {
+		return APIKeyLimits{}
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "{}" || trimmed == "null" {
+		return APIKeyLimits{}
+	}
+	var out APIKeyLimits
+	if err := json.Unmarshal(data, &out); err != nil {
+		return APIKeyLimits{}
+	}
+	return out
+}
+
+func encodeAPIKeyLimits(l APIKeyLimits) string {
+	if l.IsZero() {
+		return "{}"
+	}
+	b, err := json.Marshal(l)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
