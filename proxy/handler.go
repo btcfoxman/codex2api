@@ -1538,6 +1538,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	retryExclusions := newRetryAccountExclusions()
 	forceHTTPAfterWSMessageTooBig := false
 	invalidEncryptedContentRetried := false
+	remoteAssetsInlinedFor407 := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1653,6 +1654,25 @@ func (h *Handler) Responses(c *gin.Context) {
 				stopTTFTGuard()
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+
+				if !remoteAssetsInlinedFor407 {
+					rawInlined, rawChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses", rawBody, proxyURL, resp.StatusCode, errBody, account.ID())
+					codexInlined, codexChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses", codexBody, proxyURL, resp.StatusCode, errBody, account.ID())
+					if rawChanged || codexChanged {
+						remoteAssetsInlinedFor407 = true
+						if rawChanged {
+							rawBody = rawInlined
+							resetOpenAIResponsesBody()
+						}
+						if codexChanged {
+							codexBody = codexInlined
+							expandedInputRaw = responsesInputRaw(codexBody)
+						}
+						h.store.Release(account)
+						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						continue
+					}
+				}
 
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
@@ -1989,6 +2009,25 @@ func (h *Handler) Responses(c *gin.Context) {
 			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+
+			if !remoteAssetsInlinedFor407 {
+				rawInlined, rawChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses", rawBody, proxyURL, resp.StatusCode, errBody, account.ID())
+				codexInlined, codexChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses", codexBody, proxyURL, resp.StatusCode, errBody, account.ID())
+				if rawChanged || codexChanged {
+					remoteAssetsInlinedFor407 = true
+					if rawChanged {
+						rawBody = rawInlined
+						resetOpenAIResponsesBody()
+					}
+					if codexChanged {
+						codexBody = codexInlined
+						expandedInputRaw = responsesInputRaw(codexBody)
+					}
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
 
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
@@ -2444,6 +2483,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 	invalidEncryptedContentRetried := false
+	remoteAssetsInlinedFor407 := false
 
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
@@ -2501,6 +2541,24 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if resp.StatusCode != http.StatusOK {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+
+				if !remoteAssetsInlinedFor407 {
+					rawInlined, rawChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses/compact", rawBody, proxyURL, resp.StatusCode, errBody, account.ID())
+					codexInlined, codexChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses/compact", codexBody, proxyURL, resp.StatusCode, errBody, account.ID())
+					if rawChanged || codexChanged {
+						remoteAssetsInlinedFor407 = true
+						if rawChanged {
+							rawBody = rawInlined
+							openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+						}
+						if codexChanged {
+							codexBody = codexInlined
+						}
+						h.store.Release(account)
+						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						continue
+					}
+				}
 
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
@@ -2687,6 +2745,24 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		if resp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+
+			if !remoteAssetsInlinedFor407 {
+				rawInlined, rawChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses/compact", rawBody, proxyURL, resp.StatusCode, errBody, account.ID())
+				codexInlined, codexChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/responses/compact", codexBody, proxyURL, resp.StatusCode, errBody, account.ID())
+				if rawChanged || codexChanged {
+					remoteAssetsInlinedFor407 = true
+					if rawChanged {
+						rawBody = rawInlined
+						openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+					}
+					if codexChanged {
+						codexBody = codexInlined
+					}
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
 
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
@@ -2943,6 +3019,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	forceHTTPAfterWSMessageTooBig := false
+	remoteAssetsInlinedFor407 := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -3069,12 +3146,24 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if !remoteAssetsInlinedFor407 {
+				codexInlined, codexChanged := inlineRemoteAssetsFor407Retry(c.Request.Context(), "/v1/chat/completions", codexBody, proxyURL, resp.StatusCode, errBody, account.ID())
+				if codexChanged {
+					remoteAssetsInlinedFor407 = true
+					codexBody = codexInlined
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
+
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
