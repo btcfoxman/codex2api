@@ -80,8 +80,13 @@ jobs:
 
             DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
             COMPOSE_FILE="${{ secrets.DEPLOY_COMPOSE_FILE }}"
-            GHCR_USERNAME="${{ secrets.GHCR_USERNAME }}"
-            GHCR_TOKEN="${{ secrets.GHCR_TOKEN }}"
+            DEPLOY_SERVICE="${{ secrets.DEPLOY_SERVICE }}"
+            GHCR_USERNAME="${{ secrets.GHCR_USERNAME || github.actor }}"
+            GHCR_TOKEN="${{ secrets.GHCR_TOKEN || github.token }}"
+            IMAGE_REGISTRY="${{ env.REGISTRY }}"
+            IMAGE_NAMESPACE="${{ github.repository_owner }}"
+            IMAGE_NAME="${{ github.event.repository.name }}"
+            IMAGE_TAG="latest"
 
             if [ -z "$DEPLOY_PATH" ]; then
               echo "DEPLOY_PATH is required"
@@ -92,12 +97,30 @@ jobs:
               COMPOSE_FILE="docker-compose.yml"
             fi
 
-            cd "$DEPLOY_PATH"
-
-            if [ -n "$GHCR_USERNAME" ] && [ -n "$GHCR_TOKEN" ]; then
-              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+            if [ -z "$DEPLOY_SERVICE" ]; then
+              DEPLOY_SERVICE="codex2api"
             fi
 
-            docker compose -f "$COMPOSE_FILE" pull
-            docker compose -f "$COMPOSE_FILE" up -d
-            docker compose -f "$COMPOSE_FILE" ps
+            cd "$DEPLOY_PATH"
+
+            if [ -z "$GHCR_USERNAME" ] || [ -z "$GHCR_TOKEN" ]; then
+              echo "GHCR credentials are required"
+              exit 1
+            fi
+
+            echo "$GHCR_TOKEN" | docker login "$IMAGE_REGISTRY" -u "$GHCR_USERNAME" --password-stdin
+            trap 'docker logout "$IMAGE_REGISTRY" >/dev/null 2>&1 || true' EXIT
+
+            IMAGE_REGISTRY="$IMAGE_REGISTRY" \
+            IMAGE_NAMESPACE="$IMAGE_NAMESPACE" \
+            IMAGE_NAME="$IMAGE_NAME" \
+            IMAGE_TAG="$IMAGE_TAG" \
+              docker compose -f "$COMPOSE_FILE" pull "$DEPLOY_SERVICE"
+
+            IMAGE_REGISTRY="$IMAGE_REGISTRY" \
+            IMAGE_NAMESPACE="$IMAGE_NAMESPACE" \
+            IMAGE_NAME="$IMAGE_NAME" \
+            IMAGE_TAG="$IMAGE_TAG" \
+              docker compose -f "$COMPOSE_FILE" up -d "$DEPLOY_SERVICE"
+
+            docker compose -f "$COMPOSE_FILE" ps "$DEPLOY_SERVICE"
