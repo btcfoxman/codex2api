@@ -2,8 +2,12 @@ package proxy
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,15 +35,19 @@ func TestParseOfficialCodexModelIDs(t *testing.T) {
 		<code>codex -m gpt-4.1</code>
 	`
 	models, skipped := ParseOfficialCodexModelIDs(html)
-	for _, model := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark", "gpt-5.2"} {
+	for _, model := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark"} {
 		if !slices.Contains(models, model) {
 			t.Fatalf("parsed models missing %q in %v", model, models)
 		}
 	}
-	for _, model := range []string{"gpt-5.2-codex", "gpt-4.1"} {
+	// 5.3 只保留 spark；gpt-5.2 及以下、gpt-5.2-codex、gpt-4.1 均被过滤。
+	for _, model := range []string{"gpt-5.2", "gpt-5.2-codex", "gpt-4.1"} {
 		if !slices.Contains(skipped, model) {
 			t.Fatalf("skipped models missing %q in %v", model, skipped)
 		}
+	}
+	if slices.Contains(models, "gpt-5.2") {
+		t.Fatalf("gpt-5.2 should be filtered out, got %v", models)
 	}
 }
 
@@ -176,5 +184,183 @@ func TestReasoningEffortModelsAreIncludedInCatalog(t *testing.T) {
 	}
 	if slices.Contains(TextTestModelIDs(ctx, db), "gpt-5.5(xhigh)") {
 		t.Fatalf("reasoning alias should not be used for direct connection tests")
+	}
+}
+
+func TestExtractManifestModelSlugs(t *testing.T) {
+	manifest := []byte(`{"models":[
+		{"slug":"gpt-5.5","prefer_websockets":true},
+		{"slug":"gpt-5.5"},
+		{"slug":"  "},
+		{"slug":"bad slug with spaces"},
+		{"slug":"gpt-9-new"}
+	]}`)
+	got := ExtractManifestModelSlugs(manifest)
+	want := []string{"gpt-5.5", "gpt-9-new"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ExtractManifestModelSlugs = %v, want %v", got, want)
+	}
+
+	if got := ExtractManifestModelSlugs([]byte(`{"data":[{"id":"x"}]}`)); got != nil {
+		t.Fatalf("non-manifest shape should yield nil, got %v", got)
+	}
+	if got := ExtractManifestModelSlugs(nil); got != nil {
+		t.Fatalf("empty body should yield nil, got %v", got)
+	}
+}
+
+func TestLearnModelsFromManifest_AddsOnlyUnknownAndNeverTouchesExisting(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+
+	// 预置一条管理员禁用的行:学习绝不能翻案。
+	disabled := database.ModelRegistryRow{
+		ID: "gpt-old", Enabled: false, Category: ModelCategoryCodex, Source: "manual",
+		APIKeyAuthAvailable: true,
+	}
+	if err := db.UpsertModelRegistryRows(ctx, []database.ModelRegistryRow{disabled}); err != nil {
+		t.Fatalf("seed disabled row: %v", err)
+	}
+
+	manifest := []byte(`{"models":[
+		{"slug":"gpt-5.5"},
+		{"slug":"gpt-old"},
+		{"slug":"gpt-9.9-new"}
+	]}`)
+	added, err := LearnModelsFromManifest(ctx, db, manifest, time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("LearnModelsFromManifest error: %v", err)
+	}
+	if !slices.Equal(added, []string{"gpt-9.9-new"}) {
+		t.Fatalf("added = %v, want [gpt-9.9-new] (builtin/existing must be skipped)", added)
+	}
+
+	rows, err := db.ListModelRegistry(ctx)
+	if err != nil {
+		t.Fatalf("ListModelRegistry: %v", err)
+	}
+	var sawNew, sawOld bool
+	for _, row := range rows {
+		switch row.ID {
+		case "gpt-9.9-new":
+			sawNew = true
+			if !row.Enabled || row.Source != ModelSourceUpstreamManifest {
+				t.Fatalf("learned row = %+v, want enabled with source %s", row, ModelSourceUpstreamManifest)
+			}
+		case "gpt-old":
+			sawOld = true
+			if row.Enabled {
+				t.Fatal("disabled row must never be re-enabled by manifest learning")
+			}
+		}
+	}
+	if !sawNew || !sawOld {
+		t.Fatalf("registry rows missing expected entries: new=%v old=%v", sawNew, sawOld)
+	}
+
+	// 学习后的模型立即进入请求侧支持列表。
+	if !slices.Contains(SupportedModelIDs(ctx, db), "gpt-9.9-new") {
+		t.Fatal("learned model should appear in SupportedModelIDs immediately")
+	}
+	if slices.Contains(SupportedModelIDs(ctx, db), "gpt-old") {
+		t.Fatal("disabled model must stay out of SupportedModelIDs")
+	}
+}
+
+func TestLearnModelsFromManifest_AllKnownIsNoOp(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	added, err := LearnModelsFromManifest(context.Background(), db,
+		[]byte(`{"models":[{"slug":"gpt-5.5"},{"slug":"gpt-5.4"}]}`), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("LearnModelsFromManifest error: %v", err)
+	}
+	if len(added) != 0 {
+		t.Fatalf("added = %v, want empty for builtin-only manifest", added)
+	}
+	rows, err := db.ListModelRegistry(context.Background())
+	if err != nil {
+		t.Fatalf("ListModelRegistry: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("no rows should be written for all-known manifest, got %d", len(rows))
+	}
+}
+
+// 上游同步/学习的模型准入策略：5.4+ 放行，5.3 仅 spark，5.2 及以下下线。
+func TestIsAllowedUpstreamCodexModel_Policy(t *testing.T) {
+	cases := map[string]bool{
+		"gpt-5.6-sol":         true,
+		"gpt-5.5":             true,
+		"gpt-5.4":             true,
+		"gpt-5.4-mini":        true,
+		"gpt-6.0":             true,
+		"gpt-5.3-codex-spark": true,
+		"gpt-5.3-codex":       false,
+		"gpt-5.3":             false,
+		"gpt-5.2":             false,
+		"gpt-5.2-codex":       false,
+		"gpt-5.1-codex":       false,
+		"gpt-4.1":             false,
+		"gpt-4o":              false,
+		"gpt-image-2":         false,
+		"":                    false,
+	}
+	for id, want := range cases {
+		if got := isAllowedUpstreamCodexModel(id); got != want {
+			t.Errorf("isAllowedUpstreamCodexModel(%q) = %v, want %v", id, got, want)
+		}
+	}
+}
+
+// /models/sync 的出站请求必须遵循全局 ProxyURL（issue #371）：官方模型页
+// （https）经 HTTP 代理访问时表现为一次 CONNECT。这里用假代理记录 CONNECT
+// 目标来证明请求真的走了代理，而不是直连。
+func TestSyncOfficialCodexModelsUsesGlobalProxy(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+
+	var mu sync.Mutex
+	var connectHosts []string
+	fakeProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.Method == http.MethodConnect {
+			connectHosts = append(connectHosts, r.URL.Host)
+		}
+		mu.Unlock()
+		// 拒绝隧道，令同步以网络错误结束——本测试只关心流量是否经过代理。
+		http.Error(w, "tunnel rejected by test proxy", http.StatusBadGateway)
+	}))
+	defer fakeProxy.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := SyncOfficialCodexModels(ctx, db, fakeProxy.URL)
+	if err == nil {
+		t.Fatal("expected sync to fail through rejecting test proxy")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(connectHosts) == 0 {
+		t.Fatal("sync request bypassed the configured global proxy (no CONNECT observed)")
+	}
+	wantHost := "developers.openai.com:443"
+	if connectHosts[0] != wantHost {
+		t.Fatalf("CONNECT host = %q, want %q", connectHosts[0], wantHost)
+	}
+}
+
+// 空 proxyURL 保持直连语义：请求应命中目标站点本身（用可覆盖 URL 不可行，
+// 官方 URL 是常量——退而验证空代理不会因代理配置失败而报错，走到网络阶段）。
+func TestSyncOfficialCodexModelsEmptyProxyStillAttempts(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	// 极短超时：无论网络环境如何都快速返回；断言错误是网络类而非参数类。
+	_, err := SyncOfficialCodexModels(ctx, db, "")
+	if err == nil {
+		return // 网络环境好到 50ms 内完成同步也算通过
+	}
+	if !strings.Contains(err.Error(), "官方模型页面") {
+		t.Fatalf("unexpected error kind: %v", err)
 	}
 }

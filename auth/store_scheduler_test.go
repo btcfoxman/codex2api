@@ -218,6 +218,163 @@ func TestAccountSkipWarmTierDoesNotPromoteRiskyOrBanned(t *testing.T) {
 	}
 }
 
+func TestIgnoreUsageLimitStatusOverridePrecedence(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	forceOn := true
+	forceOff := false
+	inherit := &Account{DBID: 101, AccessToken: "inherit", Status: StatusReady}
+	off := &Account{DBID: 102, AccessToken: "off", Status: StatusReady, IgnoreUsageLimitStatusOverride: &forceOff}
+	on := &Account{DBID: 103, AccessToken: "on", Status: StatusReady, IgnoreUsageLimitStatusOverride: &forceOn}
+	store.AddAccount(inherit)
+	store.AddAccount(off)
+	store.AddAccount(on)
+
+	if !inherit.IgnoresUsageLimitStatus() || off.IgnoresUsageLimitStatus() || !on.IgnoresUsageLimitStatus() {
+		t.Fatalf("global=true effective values = inherit:%v off:%v on:%v", inherit.IgnoresUsageLimitStatus(), off.IgnoresUsageLimitStatus(), on.IgnoresUsageLimitStatus())
+	}
+
+	store.SetIgnoreUsageLimitStatus(false)
+	if inherit.IgnoresUsageLimitStatus() || off.IgnoresUsageLimitStatus() || !on.IgnoresUsageLimitStatus() {
+		t.Fatalf("global=false effective values = inherit:%v off:%v on:%v", inherit.IgnoresUsageLimitStatus(), off.IgnoresUsageLimitStatus(), on.IgnoresUsageLimitStatus())
+	}
+}
+
+func TestIgnoreUsageLimitStatusKeepsExhaustedAccountSchedulable(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &Account{
+		DBID:                104,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent5h:      100,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(time.Hour),
+		UsagePercent7d:      100,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(24 * time.Hour),
+	}
+	store.AddAccount(account)
+
+	if !account.IsAvailable() {
+		t.Fatal("account should remain available when usage windows are informational")
+	}
+	if got := store.Next(); got != account {
+		t.Fatalf("Next() = %p, want exhausted-but-usable account %p", got, account)
+	} else {
+		store.Release(got)
+	}
+	store.BindSessionAffinity("continued-session", account, "")
+	if got, _ := store.NextForSession("continued-session", 0, nil); got != account {
+		t.Fatalf("NextForSession() = %p, want bound exhausted-but-usable account %p", got, account)
+	} else {
+		store.Release(got)
+	}
+}
+
+func TestCleanFullUsageSkipsAccountsIgnoringUsageLimitStatus(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &Account{
+		DBID:                106,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      100,
+		UsagePercent7dValid: true,
+	}
+	store.AddAccount(account)
+
+	if cleaned := store.CleanFullUsageAccounts(context.Background()); cleaned != 0 {
+		t.Fatalf("CleanFullUsageAccounts() = %d, want 0: informational snapshots must not delete accounts", cleaned)
+	}
+	if store.FindByID(account.DBID) == nil {
+		t.Fatal("account ignoring usage-limit status should survive full-usage cleanup")
+	}
+
+	store.SetIgnoreUsageLimitStatus(false)
+	if cleaned := store.CleanFullUsageAccounts(context.Background()); cleaned != 1 {
+		t.Fatalf("CleanFullUsageAccounts() = %d, want 1 once snapshots are authoritative again", cleaned)
+	}
+	if store.FindByID(account.DBID) != nil {
+		t.Fatal("account should be cleaned when usage windows are authoritative")
+	}
+}
+
+func TestResponsesSuccessClearsOnlyUsageCooldownWhenIgnored(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &Account{DBID: 105, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	store.AddAccount(account)
+	store.MarkPremium5hRateLimited(account, time.Now().Add(time.Hour))
+
+	if account.IsAvailable() {
+		t.Fatal("a real usage cooldown must remain unavailable before Responses succeeds")
+	}
+	if !store.ConfirmResponsesAvailable(account) {
+		t.Fatal("ConfirmResponsesAvailable() = false, want usage cooldown cleared")
+	}
+	if !account.IsAvailable() {
+		t.Fatal("successful Responses evidence should restore scheduling despite the 100% snapshot")
+	}
+
+	account.mu.Lock()
+	account.Status = StatusCooldown
+	account.CooldownReason = "unauthorized"
+	account.CooldownUtil = time.Now().Add(time.Hour)
+	account.mu.Unlock()
+	if store.ConfirmResponsesAvailable(account) {
+		t.Fatal("Responses success must not clear an unauthorized cooldown")
+	}
+}
+
+func TestConfirmResponsesAvailableSinceRespectsLatestRateLimit(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &Account{DBID: 107, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	store.AddAccount(account)
+
+	staleRequestStartedAt := time.Now()
+	store.MarkCooldown(account, time.Hour, "rate_limited")
+	if store.ConfirmResponsesAvailableSince(account, staleRequestStartedAt) {
+		t.Fatal("a request started before the latest rate limit must not clear its cooldown")
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("newer rate-limit evidence should keep the account unavailable")
+	}
+
+	account.mu.RLock()
+	freshRequestStartedAt := account.LastRateLimitedAt.Add(time.Nanosecond)
+	account.mu.RUnlock()
+	if !store.ConfirmResponsesAvailableSince(account, freshRequestStartedAt) {
+		t.Fatal("a request started after the latest rate limit should clear its cooldown")
+	}
+	if account.HasActiveCooldown() || !account.IsAvailable() {
+		t.Fatal("fresh successful Responses evidence should restore account availability")
+	}
+}
+
 func TestNeedsUsageProbeRateLimitedAllowsResetCreditsRefresh(t *testing.T) {
 	// 429 冷却 + 重置次数从未探测过（stale）：应允许探针（wham-only）刷新「主动重置次数」。
 	acc := &Account{
@@ -285,7 +442,8 @@ func TestNeedsUsageProbeRefreshesStaleResetCreditsDespiteFreshUsage(t *testing.T
 	}
 }
 
-func TestNeedsUsageProbeRequires5hSnapshotWhen5hAutoPauseEnabled(t *testing.T) {
+func TestNeedsUsageProbeDoesNotRequireMissing5hWhenAutoPauseEnabled(t *testing.T) {
+	// issue #382：上游可永久不返回 5h。auto-pause 5h 配置在无快照时不应强制探测。
 	acc := &Account{
 		AccessToken:          "token",
 		Status:               StatusReady,
@@ -295,10 +453,32 @@ func TestNeedsUsageProbeRequires5hSnapshotWhen5hAutoPauseEnabled(t *testing.T) {
 		AutoPause5hThreshold: 0.95,
 	}
 	acc.recomputeEffectiveAutoPause(nil)
-	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响，专测 5h 快照缺失路径
+	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响
+
+	if acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = true, want false when 5h auto-pause is enabled but 5h window is absent")
+	}
+}
+
+func TestNeedsUsageProbeRefreshesStale5hWhenAutoPauseEnabled(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		AccessToken:          "token",
+		Status:               StatusReady,
+		UsagePercent7d:       12,
+		UsagePercent7dValid:  true,
+		UsageUpdatedAt:       now,
+		AutoPause5hThreshold: 0.95,
+		UsagePercent5h:       40,
+		UsagePercent5hValid:  true,
+		Reset5hAt:            now.Add(2 * time.Hour),
+		UsageUpdatedAt5h:     now.Add(-20 * time.Minute),
+	}
+	acc.recomputeEffectiveAutoPause(nil)
+	acc.MarkResetCreditsProbed(now)
 
 	if !acc.NeedsUsageProbe(10 * time.Minute) {
-		t.Fatal("NeedsUsageProbe() = false, want true when 5h auto-pause is enabled but 5h snapshot is missing")
+		t.Fatal("NeedsUsageProbe() = false, want true when valid 5h snapshot is stale under auto-pause")
 	}
 }
 
@@ -332,7 +512,8 @@ func TestNeedsUsageProbeRefreshesStale5hAfterWindowReset(t *testing.T) {
 	}
 }
 
-func TestPersistUsageSnapshotKeeps5hProbeRequiredWhen5hSnapshotMissing(t *testing.T) {
+func TestPersistUsageSnapshotDoesNotRequireMissing5hAfter7dOnly(t *testing.T) {
+	// issue #382：7d-only 持久化后，缺失 5h 不再因 auto-pause 配置强制探测。
 	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	acc := &Account{
 		DBID:                 1,
@@ -346,10 +527,10 @@ func TestPersistUsageSnapshotKeeps5hProbeRequiredWhen5hSnapshotMissing(t *testin
 	acc.recomputeEffectiveAutoPause(store)
 
 	store.PersistUsageSnapshot(acc, 20)
-	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响，专测 5h 快照缺失路径
+	acc.MarkResetCreditsProbed(time.Now())
 
-	if !acc.NeedsUsageProbe(10 * time.Minute) {
-		t.Fatal("NeedsUsageProbe() = false, want true after 7d-only persistence when 5h snapshot is still missing")
+	if acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = true, want false after 7d-only persistence when 5h window is absent")
 	}
 }
 

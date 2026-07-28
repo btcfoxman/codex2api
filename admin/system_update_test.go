@@ -8,18 +8,23 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 type fakeSystemReleaseClient struct {
-	release   *systemGitHubRelease
-	files     map[string][]byte
-	fetchErr  error
-	fetches   int
+	release  *systemGitHubRelease
+	files    map[string][]byte
+	fetchErr error
+	fetches  int
 }
 
 func (c *fakeSystemReleaseClient) FetchLatestRelease(context.Context) (*systemGitHubRelease, error) {
@@ -226,6 +231,31 @@ func TestSystemUpdaterCachesLatestRelease(t *testing.T) {
 	}
 }
 
+func TestGetSystemUpdateDegradesGracefullyWhenReleaseSourceIsUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{systemUpdate: &systemUpdater{
+		currentVersion: "v2.4.3",
+		client:         &fakeSystemReleaseClient{fetchErr: errors.New("release source unavailable")},
+		goos:           "linux",
+		goarch:         "amd64",
+	}}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/admin/system/update", nil)
+
+	handler.GetSystemUpdate(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"latest_version":"2.4.3"`) {
+		t.Fatalf("fallback response should retain the current version: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"warning"`) {
+		t.Fatalf("fallback response should expose a non-fatal warning: %s", recorder.Body.String())
+	}
+}
+
 func TestHandlerSystemUpdaterConcurrentSingleInstance(t *testing.T) {
 	handler := &Handler{}
 	const workers = 32
@@ -268,7 +298,7 @@ func TestSystemUpdaterPerformUpdateReplacesBinaryAndKeepsBackup(t *testing.T) {
 	archive := buildSystemUpdateTarball(t, "codex2api", []byte("new-binary"))
 	archiveHash := sha256.Sum256(archive)
 	archiveURL := "https://github.com/james-6-23/codex2api/releases/download/v2.4.4/codex2api_2.4.4_linux_amd64.tar.gz"
-	restarted := make(chan struct{}, 1)
+	restarted := make(chan string, 1)
 	client := &fakeSystemReleaseClient{
 		release: &systemGitHubRelease{
 			TagName: "v2.4.4",
@@ -287,8 +317,8 @@ func TestSystemUpdaterPerformUpdateReplacesBinaryAndKeepsBackup(t *testing.T) {
 		goos:           "linux",
 		goarch:         "amd64",
 		executablePath: func() (string, error) { return currentPath, nil },
-		restartProcess: func() error {
-			restarted <- struct{}{}
+		restartProcess: func(path string) error {
+			restarted <- path
 			return nil
 		},
 		restartDelay: 0,
@@ -308,7 +338,16 @@ func TestSystemUpdaterPerformUpdateReplacesBinaryAndKeepsBackup(t *testing.T) {
 		t.Fatalf("backup binary = %q, want old-binary", got)
 	}
 	select {
-	case <-restarted:
+	case path := <-restarted:
+		// 生产代码在替换前会 EvalSymlinks 解析真实路径(如 macOS 下 /var → /private/var),
+		// 断言期望值同样解析,避免在软链接临时目录的平台上误报。
+		wantPath := currentPath
+		if resolved, err := filepath.EvalSymlinks(currentPath); err == nil {
+			wantPath = resolved
+		}
+		if path != wantPath {
+			t.Fatalf("restart path = %q, want %q", path, wantPath)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("restart was not scheduled")
 	}
@@ -340,7 +379,7 @@ func TestSystemUpdaterPerformUpdateRejectsChecksumMismatch(t *testing.T) {
 		goos:           "linux",
 		goarch:         "amd64",
 		executablePath: func() (string, error) { return currentPath, nil },
-		restartProcess: func() error { t.Fatal("restart should not be called"); return nil },
+		restartProcess: func(string) error { t.Fatal("restart should not be called"); return nil },
 	}
 
 	_, err := updater.PerformUpdate(context.Background())

@@ -23,6 +23,17 @@ type statsResponse struct {
 	RateLimited   int   `json:"rate_limited"`
 	Error         int   `json:"error"`
 	TodayRequests int64 `json:"today_requests"`
+	// Channels 按上游渠道（codex/grok）拆分的账号与今日请求计数，
+	// 供仪表盘在「全部」视图并列展示、渠道视图切换主数字。
+	Channels map[string]statsChannelCounts `json:"channels,omitempty"`
+}
+
+type statsChannelCounts struct {
+	Total         int   `json:"total"`
+	Available     int   `json:"available"`
+	RateLimited   int   `json:"rate_limited"`
+	Error         int   `json:"error"`
+	TodayRequests int64 `json:"today_requests"`
 }
 
 type accountsResponse struct {
@@ -64,6 +75,7 @@ type MaskedAPIKeyRow struct {
 	Limits          database.APIKeyLimits    `json:"limits"`
 	WindowUsage     *APIKeyWindowUsageDetail `json:"window_usage,omitempty"`
 	Status          string                   `json:"status"`
+	LastUsedAt      *string                  `json:"last_used_at,omitempty"`
 	CreatedAt       string                   `json:"created_at"`
 }
 
@@ -262,6 +274,8 @@ type runtimeUsageLogResponse struct {
 	FlushIntervalSeconds int    `json:"flush_interval_seconds"`
 	BufferLength         int    `json:"buffer_length"`
 	BufferCapacity       int    `json:"buffer_capacity"`
+	BufferLimit          int    `json:"buffer_limit"`
+	DroppedTotal         int64  `json:"dropped_total"`
 }
 
 type runtimeProbesResponse struct {

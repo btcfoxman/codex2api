@@ -150,10 +150,11 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "free", AccountID: "acc"}
 
 	now := time.Now()
+	subscriptionExpiresAt := now.Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
 	reset5h := now.Add(3 * time.Hour).Unix()
 	reset7d := now.Add(5 * 24 * time.Hour).Unix()
 	usage := &WhamUsage{PlanType: "plus"}
-	usage.SubscriptionExpiresAtRaw = whamTimeRaw("2026-07-17T09:30:23Z")
+	usage.SubscriptionExpiresAtRaw = whamTimeRaw(subscriptionExpiresAt.Format(time.RFC3339))
 	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 83, LimitWindowSeconds: 18000, ResetAt: reset5h}
 	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 30, LimitWindowSeconds: 604800, ResetAt: reset7d}
 
@@ -179,7 +180,7 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	if got := row.GetCredential("plan_type"); got != "plus" {
 		t.Errorf("persisted plan_type = %q, want plus", got)
 	}
-	wantSubscriptionExpiresAt := time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC)
+	wantSubscriptionExpiresAt := subscriptionExpiresAt
 	if !account.SubscriptionExpiresAt.Equal(wantSubscriptionExpiresAt) {
 		t.Errorf("account SubscriptionExpiresAt = %s, want %s", account.SubscriptionExpiresAt.Format(time.RFC3339), wantSubscriptionExpiresAt.Format(time.RFC3339))
 	}
@@ -247,7 +248,7 @@ func TestApplyWhamUsage_PersistsSubscriptionExpiresAtWhenMemoryAlreadyMatches(t 
 	}
 
 	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
-	expiresAt := time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC)
+	expiresAt := time.Now().Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
 	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc", SubscriptionExpiresAt: expiresAt}
 	usage := &WhamUsage{PlanType: "plus"}
 	usage.SubscriptionExpiresAtRaw = whamTimeRaw(expiresAt.Format(time.RFC3339))
@@ -260,6 +261,84 @@ func TestApplyWhamUsage_PersistsSubscriptionExpiresAtWhenMemoryAlreadyMatches(t 
 	}
 	if got := row.GetCredential("subscription_expires_at"); got != expiresAt.Format(time.RFC3339) {
 		t.Fatalf("persisted subscription_expires_at = %q, want %q", got, expiresAt.Format(time.RFC3339))
+	}
+}
+
+// TestApplyWhamUsage_ClearsStaleSubscriptionExpiry 验证：wham 权威返回付费 plan_type
+// 而账号存储的订阅到期时间已过去（续费后 JWT 里的旧值）时，内存与 DB 的陈旧值被清理，
+// 不再显示「已过期」。(issue #360)
+func TestApplyWhamUsage_ClearsStaleSubscriptionExpiry(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	stale := time.Now().Add(-96 * time.Hour).UTC().Truncate(time.Second)
+	id, err := db.InsertAccountWithCredentials(ctx, "wham-stale-subscription", map[string]interface{}{
+		"plan_type":               "plus",
+		"subscription_expires_at": stale.Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc", SubscriptionExpiresAt: stale}
+	// 实测 wham/usage 不返回任何订阅到期字段，这里保持缺省以贴近真实响应。
+	usage := &WhamUsage{PlanType: "plus"}
+
+	ApplyWhamUsage(store, account, usage)
+
+	if !account.SubscriptionExpiresAt.IsZero() {
+		t.Fatalf("account.SubscriptionExpiresAt = %v, want zero after stale clear", account.SubscriptionExpiresAt)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("subscription_expires_at"); got != "" {
+		t.Fatalf("persisted subscription_expires_at = %q, want cleared", got)
+	}
+}
+
+// TestApplyWhamUsage_KeepsExpiredSubscriptionForFreePlan 验证：套餐真到期（wham 返回
+// free）时，已过去的订阅到期时间是准确信息，保留不清理。
+func TestApplyWhamUsage_KeepsExpiredSubscriptionForFreePlan(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	expired := time.Now().Add(-96 * time.Hour).UTC().Truncate(time.Second)
+	id, err := db.InsertAccountWithCredentials(ctx, "wham-real-expired", map[string]interface{}{
+		"plan_type":               "plus",
+		"subscription_expires_at": expired.Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc", SubscriptionExpiresAt: expired}
+	usage := &WhamUsage{PlanType: "free"}
+
+	ApplyWhamUsage(store, account, usage)
+
+	if !account.SubscriptionExpiresAt.Equal(expired) {
+		t.Fatalf("account.SubscriptionExpiresAt = %v, want unchanged %v", account.SubscriptionExpiresAt, expired)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("subscription_expires_at"); got != expired.Format(time.RFC3339) {
+		t.Fatalf("persisted subscription_expires_at = %q, want %q", got, expired.Format(time.RFC3339))
 	}
 }
 
@@ -391,6 +470,130 @@ func TestApplyWhamUsage_FreeAccountPrimaryIs7d(t *testing.T) {
 	}
 }
 
+// issue #382：上游 WHAM 不再返回 5h 时，必须清除本地陈旧 5h 快照与 premium 5h 限流。
+func TestApplyWhamUsage_ClearsStale5hWhenUpstreamOmitsWindow(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "wham-no-5h", map[string]interface{}{
+		"plan_type":                 "plus",
+		"codex_5h_used_percent":     80,
+		"codex_5h_reset_at":         time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+		"codex_5h_usage_updated_at": time.Now().Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc"}
+	account.SetUsageSnapshot5h(80, time.Now().Add(2*time.Hour))
+
+	reset7d := time.Now().Add(7 * 24 * time.Hour).Unix()
+	usage := &WhamUsage{PlanType: "plus"}
+	// 仅 weekly：模拟 OpenAI 临时取消 5h 窗口后的 WHAM 响应
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 22, LimitWindowSeconds: 604800, ResetAfterSeconds: 604800, ResetAt: reset7d}
+	usage.RateLimit.SecondaryWindow = nil
+
+	result := ApplyWhamUsage(store, account, usage)
+
+	if result.HasUsage5h || result.Used5hHeaders {
+		t.Fatalf("result = %+v, want no 5h window", result)
+	}
+	if !result.Cleared5h {
+		t.Fatal("Cleared5h = false, want true when stale 5h was present")
+	}
+	if !result.HasUsage7d || result.UsagePct7d != 22 {
+		t.Fatalf("7d result = %+v, want UsagePct7d=22", result)
+	}
+	if _, ok := account.GetUsagePercent5h(); ok {
+		t.Fatal("in-memory 5h snapshot should be cleared")
+	}
+	if account.IsPremium5hRateLimited() {
+		t.Fatal("account should not remain premium 5h rate limited")
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("codex_5h_used_percent"); got != "" {
+		t.Errorf("persisted codex_5h_used_percent = %q, want empty/cleared", got)
+	}
+	if got := row.GetCredential("codex_7d_used_percent"); got != "22" {
+		t.Errorf("persisted codex_7d_used_percent = %q, want 22", got)
+	}
+}
+
+func TestApplyWhamUsage_ClearsPremium5hCooldownWhenWindowGone(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 42, AccessToken: "at", PlanType: "plus", Status: auth.StatusReady}
+	resetAt := time.Now().Add(3 * time.Hour)
+	store.MarkPremium5hRateLimited(account, resetAt)
+	if !account.IsPremium5hRateLimited() {
+		t.Fatal("precondition: account should be premium 5h rate limited")
+	}
+
+	usage := &WhamUsage{PlanType: "plus"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{
+		UsedPercent:        10,
+		LimitWindowSeconds: 604800,
+		ResetAfterSeconds:  604800,
+		ResetAt:            time.Now().Add(7 * 24 * time.Hour).Unix(),
+	}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if !result.Cleared5h {
+		t.Fatal("Cleared5h = false, want true")
+	}
+	if account.IsPremium5hRateLimited() {
+		t.Fatal("premium 5h limit should be cleared when upstream omits 5h")
+	}
+	if got := account.RuntimeStatus(); got == "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want not rate_limited after clearing absent 5h", got)
+	}
+}
+
+func TestApplyWhamUsage_EmptyWindowPayloadPreserves5h(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 43, AccessToken: "at", PlanType: "plus", Status: auth.StatusReady}
+	resetAt := time.Now().Add(3 * time.Hour)
+	account.SetUsageSnapshot5h(88, resetAt)
+
+	usage := &WhamUsage{PlanType: "plus"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if result.Cleared5h || result.HasUsage5h || result.HasUsage7d {
+		t.Fatalf("result = %+v, want malformed payload to be non-authoritative", result)
+	}
+	if pct, gotReset, ok := account.GetUsageSnapshot5h(); !ok || pct != 88 || !gotReset.Equal(resetAt) {
+		t.Fatalf("5h snapshot = (%v, %v, %v), want preserved 88%% and reset %v", pct, gotReset, ok, resetAt)
+	}
+}
+
+func TestApplyWhamUsage_UsedPercentOnlyPayloadPreserves5h(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 44, AccessToken: "at", PlanType: "plus", Status: auth.StatusReady}
+	account.SetUsageSnapshot5h(77, time.Now().Add(2*time.Hour))
+
+	usage := &WhamUsage{PlanType: "plus"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 12}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if result.Cleared5h || result.HasUsage5h || result.HasUsage7d {
+		t.Fatalf("result = %+v, want used-percent-only payload to be non-authoritative", result)
+	}
+	if _, _, ok := account.GetUsageSnapshot5h(); !ok {
+		t.Fatal("5h snapshot should remain valid for a used-percent-only payload")
+	}
+}
+
 // 防御性测试：即使后端把 5h/7d 字段顺序对调，分类也必须按 limit_window_seconds 走。
 func TestApplyWhamUsage_ClassifiesByWindowSeconds(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
@@ -412,8 +615,7 @@ func TestApplyWhamUsage_ClassifiesByWindowSeconds(t *testing.T) {
 	}
 }
 
-// 当 limit_window_seconds 缺失或为未知值时，按字段位置兜底分类
-// （与 CPA-Manager pickClassifiedWindows 的 allowOrderFallback 行为一致）。
+// 当 limit_window_seconds 缺失或为未知值时，按字段位置兜底分类。
 func TestPickClassifiedWhamWindows_FallsBackToPositionForUnknownSeconds(t *testing.T) {
 	primary := &WhamUsageWindow{UsedPercent: 50, LimitWindowSeconds: 0} // 未知/缺失
 	secondary := &WhamUsageWindow{UsedPercent: 20, LimitWindowSeconds: 0}
@@ -490,6 +692,33 @@ func TestApplyWhamUsage_CapturesMonthlyWindowLength(t *testing.T) {
 
 	ApplyWhamUsage(store, account, usage)
 
+	if got := account.GetWindow7dSeconds(); got != 2_592_000 {
+		t.Fatalf("Window7dSeconds=%d, want 2592000", got)
+	}
+	if kind := account.Window7dKind(); kind != "monthly" {
+		t.Fatalf("Window7dKind=%q, want monthly", kind)
+	}
+}
+
+// TestApplyWhamUsage_FreePlanMonthlyWindow 验证 free plan 的唯一限流窗口(月窗)
+// 也被识别为 monthly：free 只有 primary=2592000s、无 secondary (issue #324，
+// 前端据 usage_window_7d_kind 把标签显示为 30d 而非 7d)。
+func TestApplyWhamUsage_FreePlanMonthlyWindow(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 1, AccessToken: "at", PlanType: "free"}
+
+	now := time.Now()
+	usage := &WhamUsage{PlanType: "free"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 63, LimitWindowSeconds: 2_592_000, ResetAt: now.Add(18 * 24 * time.Hour).Unix()}
+
+	result := ApplyWhamUsage(store, account, usage)
+
+	if !result.HasUsage7d {
+		t.Fatal("expected free monthly window to land in the 7d slot")
+	}
+	if result.HasUsage5h {
+		t.Fatal("free monthly window must not be classified as 5h")
+	}
 	if got := account.GetWindow7dSeconds(); got != 2_592_000 {
 		t.Fatalf("Window7dSeconds=%d, want 2592000", got)
 	}
@@ -591,6 +820,39 @@ func TestApplyWhamUsage_CreditAccountSkips7dWindowLimit(t *testing.T) {
 	}
 }
 
+func TestApplyWhamUsage_IgnoredUsageStatusRemainsMetadataOnly(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &auth.Account{DBID: 2, AccessToken: "at", PlanType: "team", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy}
+	store.AddAccount(account)
+
+	now := time.Now()
+	usage := &WhamUsage{PlanType: "team"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 18000, ResetAt: now.Add(2 * time.Hour).Unix()}
+	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 604800, ResetAt: now.Add(5 * 24 * time.Hour).Unix()}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if !result.UsageWindowLimitsIgnored {
+		t.Fatal("UsageWindowLimitsIgnored = false, want true")
+	}
+	if result.Premium5hRateLimited || result.Usage7dRateLimited {
+		t.Fatalf("WHAM metadata created a cooldown: %+v", result)
+	}
+	if !account.IsAvailable() {
+		t.Fatal("WHAM 100% metadata must not remove an account from scheduling")
+	}
+	if pct5h, _, ok := account.GetUsageSnapshot5h(); !ok || pct5h != 100 {
+		t.Fatalf("5h snapshot = (%v, %v), want 100 and valid", pct5h, ok)
+	}
+	if pct7d, ok := account.GetUsagePercent7d(); !ok || pct7d != 100 {
+		t.Fatalf("7d snapshot = (%v, %v), want 100 and valid", pct7d, ok)
+	}
+}
+
 func TestWhamUsageJSON_RoundTrip(t *testing.T) {
 	in := WhamUsage{PlanType: "plus"}
 	in.RateLimit.Allowed = true
@@ -640,6 +902,79 @@ func TestQueryWhamUsage_ParsesRateLimitResetCredits(t *testing.T) {
 	ApplyWhamUsage(nil, account, usage)
 	if count, ok := account.GetRateLimitResetCredits(); !ok || count != 4 {
 		t.Fatalf("account reset credits = (%d,%v), want (4,true)", count, ok)
+	}
+}
+
+// TestQueryWhamResetCredits_ParsesAndFilters 验证重置券列表端点的解析与过滤
+// (issue #322)：只保留 reset_type=codex_rate_limits 且 status=available 且带
+// expires_at 的券，请求形态与 wham 查询一致（Bearer + chatgpt-account-id）。
+func TestQueryWhamResetCredits_ParsesAndFilters(t *testing.T) {
+	body := `{
+		"available_count": 3,
+		"credits": [
+			{"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": "2026-07-19T00:42:09Z"},
+			{"id": "c2", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-07-01T00:00:00Z", "expires_at": "2026-07-21T08:00:00Z"},
+			{"id": "c6", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-07-02T00:00:00Z", "consumable_until": "2026-07-22T08:00:00Z"},
+			{"id": "c3", "reset_type": "codex_rate_limits", "status": "redeemed", "granted_at": "2026-06-20T00:00:00Z", "expires_at": "2026-07-10T00:00:00Z"},
+			{"id": "c4", "reset_type": "other_type", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": "2026-07-19T00:00:00Z"},
+			{"id": "c5", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": ""}
+		]
+	}`
+
+	var gotMethod, gotAuth, gotAccountID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		gotAccountID = r.Header.Get("chatgpt-account-id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	oldURL := whamResetCreditsURLForTest
+	whamResetCreditsURLForTest = server.URL
+	defer func() { whamResetCreditsURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	list, _, err := QueryWhamResetCredits(context.Background(), account, "")
+	if err != nil {
+		t.Fatalf("QueryWhamResetCredits error: %v", err)
+	}
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
+	if !strings.HasPrefix(gotAuth, "Bearer ") {
+		t.Errorf("Authorization = %q, want Bearer prefix", gotAuth)
+	}
+	if gotAccountID != "acc-1" {
+		t.Errorf("chatgpt-account-id = %q, want acc-1", gotAccountID)
+	}
+	if list.AvailableCount != 3 {
+		t.Errorf("AvailableCount = %d, want 3", list.AvailableCount)
+	}
+
+	credits := list.AvailableCodexCredits()
+	if len(credits) != 3 {
+		t.Fatalf("AvailableCodexCredits len = %d, want 3 (accept consumable_until; filter redeemed/other_type/no-expiry)", len(credits))
+	}
+	if credits[0].ID != "c1" || credits[1].ID != "c2" || credits[2].ID != "c6" {
+		t.Errorf("credits ids = %s,%s,%s, want c1,c2,c6", credits[0].ID, credits[1].ID, credits[2].ID)
+	}
+	if credits[0].ExpiresAt != "2026-07-19T00:42:09Z" {
+		t.Errorf("credits[0].ExpiresAt = %q", credits[0].ExpiresAt)
+	}
+	if credits[2].EffectiveConsumableUntil() != "2026-07-22T08:00:00Z" {
+		t.Errorf("credits[2].EffectiveConsumableUntil = %q", credits[2].EffectiveConsumableUntil())
+	}
+}
+
+func TestWhamResetCreditItemEffectiveConsumableUntilPrefersCanonicalField(t *testing.T) {
+	credit := WhamResetCreditItem{
+		ExpiresAt:       "2026-07-20T00:00:00Z",
+		ConsumableUntil: "2026-07-19T00:00:00Z",
+	}
+	if got := credit.EffectiveConsumableUntil(); got != "2026-07-19T00:00:00Z" {
+		t.Fatalf("EffectiveConsumableUntil() = %q, want consumable_until", got)
 	}
 }
 
@@ -849,5 +1184,89 @@ func TestConsumeResetCreditParsed_NonOKReturnsRespForCaller(t *testing.T) {
 	_ = resp.Body.Close()
 	if len(body) == 0 {
 		t.Error("expected error body to remain readable for caller")
+	}
+}
+
+// Resin 启用时，wham 用量查询必须经 Resin 反代并携带 X-Resin-Account，
+// 而不是直连 chatgpt.com（issue #372：账号维护请求漏接 Resin，
+// 大量账号会共享本机出口 IP）。
+func TestQueryWhamUsageRoutesThroughResin(t *testing.T) {
+	var gotPath, gotResinAccount string
+	fakeResin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotResinAccount = r.Header.Get("X-Resin-Account")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"plus"}`))
+	}))
+	defer fakeResin.Close()
+
+	SetResinConfig(&ResinConfig{BaseURL: fakeResin.URL, PlatformName: "test"})
+	t.Cleanup(func() { SetResinConfig(nil) })
+
+	account := &auth.Account{DBID: 7, AccessToken: "at-7"}
+	usage, _, err := QueryWhamUsage(context.Background(), account, "")
+	if err != nil {
+		t.Fatalf("QueryWhamUsage error: %v", err)
+	}
+	if usage == nil || usage.PlanType != "plus" {
+		t.Fatalf("unexpected usage result: %+v", usage)
+	}
+	if want := "/test/https/chatgpt.com/backend-api/wham/usage"; gotPath != want {
+		t.Fatalf("resin path = %q, want %q", gotPath, want)
+	}
+	if gotResinAccount != "7" {
+		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "7")
+	}
+}
+
+// 重置券列表/消费与 wham 查询同一套请求形态，同样必须走 Resin。
+func TestConsumeResetCreditRoutesThroughResin(t *testing.T) {
+	var gotPath, gotResinAccount string
+	fakeResin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotResinAccount = r.Header.Get("X-Resin-Account")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer fakeResin.Close()
+
+	SetResinConfig(&ResinConfig{BaseURL: fakeResin.URL, PlatformName: "test"})
+	t.Cleanup(func() { SetResinConfig(nil) })
+
+	account := &auth.Account{DBID: 9, AccessToken: "at-9"}
+	if _, _, err := ConsumeResetCreditParsed(context.Background(), account, "", "req-1"); err != nil {
+		t.Fatalf("ConsumeResetCreditParsed error: %v", err)
+	}
+	if want := "/test/https/chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"; gotPath != want {
+		t.Fatalf("resin path = %q, want %q", gotPath, want)
+	}
+	if gotResinAccount != "9" {
+		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "9")
+	}
+}
+
+// 重置券列表端点同样必须走 Resin（与用量查询/消费保持三端点全覆盖）。
+func TestQueryWhamResetCreditsRoutesThroughResin(t *testing.T) {
+	var gotPath, gotResinAccount string
+	fakeResin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotResinAccount = r.Header.Get("X-Resin-Account")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credits":[]}`))
+	}))
+	defer fakeResin.Close()
+
+	SetResinConfig(&ResinConfig{BaseURL: fakeResin.URL, PlatformName: "test"})
+	t.Cleanup(func() { SetResinConfig(nil) })
+
+	account := &auth.Account{DBID: 13, AccessToken: "at-13"}
+	if _, _, err := QueryWhamResetCredits(context.Background(), account, ""); err != nil {
+		t.Fatalf("QueryWhamResetCredits error: %v", err)
+	}
+	if want := "/test/https/chatgpt.com/backend-api/wham/rate-limit-reset-credits"; gotPath != want {
+		t.Fatalf("resin path = %q, want %q", gotPath, want)
+	}
+	if gotResinAccount != "13" {
+		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "13")
 	}
 }

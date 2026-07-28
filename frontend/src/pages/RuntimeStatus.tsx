@@ -72,7 +72,7 @@ export default function RuntimeStatus() {
 
         {status ? (
           <>
-            <div className="mb-6 grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4">
+            <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4 sm:gap-4">
               <SummaryPill label={t('runtime.overall')} value={t(`runtime.status.${normalStatus(status.status)}`)} tone={normalStatus(status.status)} />
               <SummaryPill label={t('runtime.uptime')} value={formatUptime(status.service.uptime_seconds, t)} />
               <SummaryPill label={t('runtime.databaseCache')} value={`${status.database.label || status.database.driver} / ${status.cache.label || status.cache.driver}`} />
@@ -135,7 +135,8 @@ export default function RuntimeStatus() {
                   [t('runtime.enabled'), status.usage_log.enabled ? t('common.enabled') : t('common.disabled')],
                   [t('runtime.batchSize'), formatNumber(status.usage_log.batch_size)],
                   [t('runtime.flushInterval'), t('runtime.seconds', { count: status.usage_log.flush_interval_seconds })],
-                  [t('runtime.buffer'), `${status.usage_log.buffer_length} / ${status.usage_log.buffer_capacity || '-'}`],
+                  [t('runtime.buffer'), `${status.usage_log.buffer_length} / ${status.usage_log.buffer_limit || status.usage_log.buffer_capacity || '-'}`],
+                  [t('runtime.usageLogDropped'), formatNumber(status.usage_log.dropped_total ?? 0)],
                 ]}
               />
 

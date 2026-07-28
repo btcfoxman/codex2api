@@ -55,6 +55,22 @@ func APIKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
 	return apiKeyRowFromContext(c)
 }
 
+// payloadRuleIdentity 从鉴权 context 构造 payload 规则身份（供 api_key_*/group_* 匹配门与
+// service_tier 记账重算共用）。无鉴权身份时返回 nil（带身份门的规则将 fail-closed 不命中）。
+func (h *Handler) payloadRuleIdentity(c *gin.Context) *PayloadRuleIdentity {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return nil
+	}
+	id := &PayloadRuleIdentity{APIKeyID: row.ID, APIKeyName: strings.TrimSpace(row.Name)}
+	if h != nil && h.store != nil {
+		// 用 store 侧的允许组（组删除后会刷新，是权威源），再解析组名。
+		id.GroupIDs = h.store.GetAPIKeyAllowedGroups(row.ID)
+		id.GroupNames = h.store.ResolveGroupNames(id.GroupIDs)
+	}
+	return id
+}
+
 // EnforceAPIKeyLimits checks API key scoped model and rate/cost limits.
 func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
 	return h.enforceAPIKeyLimits(c, model)
@@ -82,6 +98,14 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	// 1. 模型白/黑名单 (O(1) 本机校验,无 I/O)
 	if model != "" {
 		if msg := checkAPIKeyModel(model, limits); msg != "" {
+			return http.StatusForbidden, msg
+		}
+	}
+
+	// 1b. 生图 block 策略 (本机校验:模型/端点/请求体意图,无 I/O)。
+	// strip 策略不在此短路——它在转发前改写请求体（见 stripResponsesImageGenerationCapabilities）。
+	if limits.ResolveImageGenerationPolicy() == database.ImageGenerationPolicyBlock {
+		if msg := checkAPIKeyImageGeneration(c, model); msg != "" {
 			return http.StatusForbidden, msg
 		}
 	}
@@ -154,7 +178,40 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
+	// 5. 分组 / 账号维度预算 (issue #439)。reject 类超额在此短路;skip 类挂到
+	// gin context 上，由各 handler 的账号过滤链剔除对应候选。
+	if len(limits.ScopeLimits) > 0 {
+		gate, rejectMsg := h.evaluateAPIKeyScopeBudgets(ctx, row)
+		if rejectMsg != "" {
+			return http.StatusTooManyRequests, rejectMsg
+		}
+		if gate != nil {
+			c.Set(contextScopeBudgetGate, gate)
+		}
+	}
+
 	return 0, ""
+}
+
+// apiKeyImageGenerationPolicy 返回当前请求所属 API Key 的图片工具策略。
+// 无鉴权身份（内部路径）时返回 allow，不改写请求。
+func apiKeyImageGenerationPolicy(c *gin.Context) string {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return database.ImageGenerationPolicyAllow
+	}
+	return row.Limits.ResolveImageGenerationPolicy()
+}
+
+// applyImageGenerationStripPolicy 在 strip 策略下剥离请求体里的图片工具能力声明，
+// 把请求当作普通文本请求继续转发（issue #411）。应在请求体准备完成（含网关自动注入
+// 图片工具/桥接 instructions）之后调用，从而一并清理网关注入的能力声明。非 strip 策略
+// 原样返回。
+func applyImageGenerationStripPolicy(c *gin.Context, body []byte) []byte {
+	if apiKeyImageGenerationPolicy(c) != database.ImageGenerationPolicyStrip {
+		return body
+	}
+	return stripResponsesImageGenerationCapabilities(body)
 }
 
 // SendAPIKeyLimitError writes a standard /v1 API key limit error response.
@@ -195,6 +252,32 @@ func checkAPIKeyModel(model string, limits database.APIKeyLimits) string {
 	for _, m := range limits.ModelDeny {
 		if strings.ToLower(strings.TrimSpace(m)) == model {
 			return fmt.Sprintf("Model %q is denied for this API key", model)
+		}
+	}
+	return ""
+}
+
+// checkAPIKeyImageGeneration 在该 Key 禁用生图时，判断本次请求是否触及生图能力。
+// 命中(生图模型 / /v1/images 端点 / 请求体带 image_generation 工具或生图意图)返回错误文案，
+// 否则返回 ""。纯本机校验：模型名 + 端点路径 + 客户端原始请求体（自动注入的图片工具在此之后才发生，
+// 不会误伤普通文本请求）。
+func checkAPIKeyImageGeneration(c *gin.Context, model string) string {
+	const msg = "Image generation is disabled for this API key (gpt-image models and the image_generation tool are not permitted)."
+
+	if isImageOnlyModel(strings.TrimSpace(model)) {
+		return msg
+	}
+
+	if c != nil && c.Request != nil && c.Request.URL != nil {
+		path := c.Request.URL.Path
+		if strings.Contains(path, "/images/generations") || strings.Contains(path, "/images/edits") {
+			return msg
+		}
+	}
+
+	if body, ok := rawRequestBodyFromContext(c); ok && len(body) > 0 {
+		if responsesBodyHasImageGenerationTool(body) || responsesBodyRequestsImageGeneration(body) {
+			return msg
 		}
 	}
 	return ""

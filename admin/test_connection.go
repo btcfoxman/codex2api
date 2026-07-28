@@ -57,8 +57,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		isTransient = true
 	}
 
-	isOpenAIResponsesAccount := account.IsOpenAIResponsesAPI()
-	if !isOpenAIResponsesAccount && account.GetAccessToken() == "" {
+	isOpenAIResponsesAccount := account.IsRelayStyle()
+	// Agent Identity 无 AT，凭私钥动态签名，跳过 AT 预检（请求走 Codex 执行器动态签名）。
+	if !isOpenAIResponsesAccount && !account.IsCodexAgentIdentity() && account.GetAccessToken() == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账号没有可用的 Access Token，请先刷新"})
 		return
 	}
@@ -96,7 +97,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	var resp *http.Response
 	var reqErr error
 	if isOpenAIResponsesAccount {
-		resp, reqErr = proxy.ExecuteOpenAIResponsesRequest(c.Request.Context(), account, payload, h.store.ResolveProxyForAccount(account), nil)
+		resp, reqErr = proxy.ExecuteRelayStyleRequest(c.Request.Context(), account, payload, h.store.ResolveProxyForAccount(account), nil)
 	} else {
 		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	}
@@ -116,8 +117,14 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
 				h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
+			case http.StatusForbidden:
+				if proxy.IsAgentRuntimeDeletedError(errBody) {
+					h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errMsg)
+				}
 			case http.StatusTooManyRequests:
-				if isOpenAIResponsesAccount {
+				// Grok 虽是 relay 风格，但有自己的免费额度语义（free-usage-exhausted → 24h），
+				// 不能并入"relay 一律 1 分钟 rate_limited"，否则耗尽会被标成短冷却、1 分钟即恢复。
+				if isOpenAIResponsesAccount && !account.IsGrokAPI() {
 					h.store.MarkCooldown(account, time.Minute, "rate_limited")
 				} else {
 					proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
@@ -216,7 +223,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			}
 			// 测试成功即重置失败/冷却状态，用量限制由调度器自行判断；
 			// 临时账号（回收站）不回写任何调度状态。
-			if !isTransient && (isOpenAIResponsesAccount || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100))) {
+			if !isTransient && (isOpenAIResponsesAccount || usageState.UsageWindowLimitsIgnored || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100))) {
 				h.store.RecordManualTestSuccess(account, time.Since(start))
 			}
 			if isTransient {
@@ -229,10 +236,6 @@ func (h *Handler) TestConnection(c *gin.Context) {
 						sendTestEvent(c, testEvent{Type: "content", Text: "\n\n--- 自动恢复失败: " + restoreErr.Error() + " ---"})
 					}
 				}
-			}
-			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
-			if !isOpenAIResponsesAccount && !usageState.HasUsage7d && !usageState.HasUsage5h {
-				account.ClearUsageCache()
 			}
 			duration := time.Since(start).Milliseconds()
 			sendTestEvent(c, testEvent{
@@ -276,7 +279,9 @@ func buildConnectionTestPayload(store *auth.Store, model string) []byte {
 	if store != nil {
 		content = store.GetTestContent()
 	}
-	return buildTestPayloadWithContent(model, content)
+	// 多行内容按行随机抽取 + 变量展开（issue #320），减少批量账号
+	// 共用同一句测活内容的指纹特征。单行配置行为不变。
+	return buildTestPayloadWithContent(model, auth.RenderTestContent(content))
 }
 
 // buildTestPayload 构建默认最小测试请求体
@@ -307,6 +312,9 @@ func buildTestPayloadWithContent(model string, content string) []byte {
 }
 
 func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool) {
+	if state.UsageWindowLimitsIgnored {
+		return "", false
+	}
 	if state.Premium5hRateLimited {
 		remaining := time.Until(state.Reset5hAt).Round(time.Second)
 		if remaining < 0 {
@@ -322,6 +330,9 @@ func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool
 
 func applyUsageLimitedAccountState(store *auth.Store, account *auth.Account, state proxy.CodexUsageSyncResult) bool {
 	if store == nil || account == nil {
+		return false
+	}
+	if state.UsageWindowLimitsIgnored {
 		return false
 	}
 	if state.Premium5hRateLimited || state.Usage7dRateLimited {
@@ -495,9 +506,15 @@ func (h *Handler) connectionTestModel(ctx context.Context) string {
 	return "gpt-5.4"
 }
 
+// defaultGrokConnectionTestModels：账号未声明 models 时的 Grok 连通性测试回落列表
+// （与 /v1/models 的默认 Grok 模型集共用同一真相，仅文本模型）。
+func defaultGrokConnectionTestModels() []string {
+	return proxy.DefaultGrokModelIDs()
+}
+
 func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *auth.Account, requested string) (string, error) {
 	requested = strings.TrimSpace(requested)
-	if account == nil || !account.IsOpenAIResponsesAPI() {
+	if account == nil || !account.IsRelayStyle() {
 		if requested == "" {
 			return h.connectionTestModel(ctx), nil
 		}
@@ -514,10 +531,21 @@ func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *au
 			textModels = append(textModels, strings.TrimSpace(model))
 		}
 	}
+	// Grok 账号常不预声明 models（依赖上游 /v1/models），回落到常见文本模型。
+	if len(textModels) == 0 && account.IsGrokAPI() {
+		textModels = append(textModels, defaultGrokConnectionTestModels()...)
+	}
 	if len(textModels) == 0 {
 		return "", fmt.Errorf("该 Responses API 账号没有可用于测试的文本模型")
 	}
 	if requested != "" {
+		if mappedModel, ok := proxy.ResolveAccountModelMapping(account, requested); ok && mappedModel != "" {
+			for _, model := range textModels {
+				if strings.EqualFold(model, mappedModel) {
+					return mappedModel, nil
+				}
+			}
+		}
 		for _, model := range textModels {
 			if strings.EqualFold(model, requested) {
 				return model, nil
@@ -871,7 +899,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 	testCtx, cancel := context.WithTimeout(ctx, batchTestAccountTimeout)
 	defer cancel()
 
-	if !acc.IsOpenAIResponsesAPI() && acc.GetAccessToken() == "" {
+	if !acc.IsRelayStyle() && !acc.IsCodexAgentIdentity() && acc.GetAccessToken() == "" {
 		acc.Mu().RLock()
 		hasRefreshToken := acc.RefreshToken != ""
 		acc.Mu().RUnlock()
@@ -898,8 +926,8 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 
 	var resp *http.Response
 	var err error
-	if acc.IsOpenAIResponsesAPI() {
-		resp, err = proxy.ExecuteOpenAIResponsesRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
+	if acc.IsRelayStyle() {
+		resp, err = proxy.ExecuteRelayStyleRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
 	} else {
 		resp, err = proxy.ExecuteRequest(testCtx, acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 	}
@@ -917,7 +945,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		if !acc.IsOpenAIResponsesAPI() {
+		if !acc.IsRelayStyle() {
 			usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
 			applyUsageLimitedTestState(h.store, acc, usageState)
 			if msg, limited := formatUsageLimitedTestError(usageState); limited {
@@ -928,13 +956,6 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if status != "success" {
 			return status, msg
 		}
-		if !acc.IsOpenAIResponsesAPI() {
-			if _, hasUsage7d := acc.GetUsagePercent7d(); !hasUsage7d {
-				if _, _, hasUsage5h := acc.GetUsageSnapshot5h(); !hasUsage5h {
-					acc.ClearUsageCache()
-				}
-			}
-		}
 		// 测试成功即重置失败/冷却状态，用量限制由调度器自行判断
 		h.store.RecordManualTestSuccess(acc, time.Since(start))
 		return "success", msg
@@ -943,7 +964,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if readErr != nil {
 			return h.handleBatchTestReadError(testCtx, acc, readErr)
 		}
-		if !acc.IsOpenAIResponsesAPI() {
+		if !acc.IsRelayStyle() {
 			proxy.SyncCodexUsageState(h.store, acc, resp)
 		}
 		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
@@ -953,10 +974,14 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if readErr != nil {
 			return h.handleBatchTestReadError(testCtx, acc, readErr)
 		}
-		if acc.IsOpenAIResponsesAPI() {
+		// Grok 走 relay 但有 free-usage-exhausted 语义，须交给 Apply429Cooldown 识别耗尽
+		// （→ 24h usage_limited + 落权威用量快照），不能并入 relay 的 1 分钟 rate_limited。
+		if acc.IsRelayStyle() && !acc.IsGrokAPI() {
 			h.store.MarkCooldown(acc, time.Minute, "rate_limited")
 		} else {
-			proxy.SyncCodexUsageState(h.store, acc, resp)
+			if !acc.IsRelayStyle() {
+				proxy.SyncCodexUsageState(h.store, acc, resp)
+			}
 			proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
 		}
 		return "rate_limited", "账号触发 429 限流"
@@ -966,6 +991,10 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			return h.handleBatchTestReadError(testCtx, acc, readErr)
 		}
 		msg := fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+		if resp.StatusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body) {
+			h.store.MarkCooldownWithErrorExactDuration(acc, 24*time.Hour, "unauthorized", msg)
+			return "banned", msg
+		}
 		if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
 			h.store.MarkError(acc, "批量测试"+msg)
 		}
@@ -980,7 +1009,7 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 	testCtx, cancel := context.WithTimeout(ctx, batchTestAccountTimeout)
 	defer cancel()
 
-	if !acc.IsOpenAIResponsesAPI() && acc.GetAccessToken() == "" {
+	if !acc.IsRelayStyle() && !acc.IsCodexAgentIdentity() && acc.GetAccessToken() == "" {
 		return "failed", "账号缺少可用的 Access Token"
 	}
 
@@ -995,8 +1024,8 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 
 	var resp *http.Response
 	var err error
-	if acc.IsOpenAIResponsesAPI() {
-		resp, err = proxy.ExecuteOpenAIResponsesRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
+	if acc.IsRelayStyle() {
+		resp, err = proxy.ExecuteRelayStyleRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
 	} else {
 		resp, err = proxy.ExecuteRequest(testCtx, acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 	}
@@ -1010,7 +1039,7 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		if !acc.IsOpenAIResponsesAPI() {
+		if !acc.IsRelayStyle() {
 			// store 传 nil：只解析用量头用于结果展示，不持久化、不改限流状态。
 			usageState := proxy.SyncCodexUsageState(nil, acc, resp)
 			if msg, limited := formatUsageLimitedTestError(usageState); limited {
@@ -1118,7 +1147,7 @@ func readRecycleBinTestStream(ctx context.Context, resp *http.Response) (string,
 }
 
 func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account) (string, string, bool) {
-	if h == nil || h.store == nil || acc == nil || acc.IsOpenAIResponsesAPI() || acc.GetAccessToken() == "" {
+	if h == nil || h.store == nil || acc == nil || acc.IsRelayStyle() || acc.GetAccessToken() == "" {
 		return "", "", false
 	}
 
@@ -1147,6 +1176,8 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 	}
 
 	usageState := proxy.ApplyWhamUsage(h.store, acc, usage)
+	// wham 不含订阅到期字段，按需从网页端 /subscriptions 补权威到期时间。(issue #360)
+	proxy.MaybeSyncSubscriptionExpiry(ctx, h.store, acc, h.store.ResolveProxyForAccount(acc))
 	applyUsageLimitedTestState(h.store, acc, usageState)
 	if msg, limited := formatUsageLimitedTestError(usageState); limited {
 		return "rate_limited", msg, true

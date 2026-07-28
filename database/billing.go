@@ -18,6 +18,11 @@ type ModelPricing struct {
 	LongOutputPricePerMTokenPriority    float64
 	LongCacheReadPricePerMToken         float64
 	LongCacheReadPricePerMTokenPriority float64
+
+	// LongContextThresholdTokens 是该模型进入长上下文档位的输入 token 阈值。
+	// 留空用全局 longContextThreshold（OpenAI 的 272K）；xAI Grok 的分档线是 200K，
+	// 需在规则里单独声明，否则 200K~272K 区间会按短档少算。
+	LongContextThresholdTokens int
 }
 
 type modelPricingRule struct {
@@ -65,6 +70,41 @@ var (
 			LongInputPricePerMTokenPriority:  150.0,
 			LongOutputPricePerMToken:         270.0,
 			LongOutputPricePerMTokenPriority: 675.0,
+		}},
+		// gpt-5.6-sol: standard 同 gpt-5.5，但 priority 为 2× standard（$10/$60），
+		// 低于 gpt-5.5 的 2.5×，故不复用 gpt-5.5 条目。priority 留空由 fast 档兜底 2×。
+		{model: "gpt-5.6-sol", pricing: ModelPricing{
+			InputPricePerMToken:         5.0,
+			OutputPricePerMToken:        30.0,
+			CacheReadPricePerMToken:     0.5,
+			LongInputPricePerMToken:     10.0,
+			LongOutputPricePerMToken:    45.0,
+			LongCacheReadPricePerMToken: 1.0,
+		}},
+		// gpt-5.6-terra: 官方 standard 同 gpt-5.4（$2.5/$15），priority 2×；
+		// 独立规范键，便于定价页单独覆盖，不与 gpt-5.4 互相污染。
+		{model: "gpt-5.6-terra", pricing: ModelPricing{
+			InputPricePerMToken:                 2.5,
+			InputPricePerMTokenPriority:         5.0,
+			OutputPricePerMToken:                15.0,
+			OutputPricePerMTokenPriority:        30.0,
+			CacheReadPricePerMToken:             0.25,
+			CacheReadPricePerMTokenPriority:     0.5,
+			LongInputPricePerMToken:             5.0,
+			LongInputPricePerMTokenPriority:     10.0,
+			LongOutputPricePerMToken:            22.5,
+			LongOutputPricePerMTokenPriority:    45.0,
+			LongCacheReadPricePerMToken:         0.5,
+			LongCacheReadPricePerMTokenPriority: 1.0,
+		}},
+		// gpt-5.6-luna: 全新最低档。priority 均为 2× standard，由 fast 档兜底自动得出。
+		{model: "gpt-5.6-luna", pricing: ModelPricing{
+			InputPricePerMToken:         1.0,
+			OutputPricePerMToken:        6.0,
+			CacheReadPricePerMToken:     0.1,
+			LongInputPricePerMToken:     2.0,
+			LongOutputPricePerMToken:    9.0,
+			LongCacheReadPricePerMToken: 0.2,
 		}},
 		{model: "gpt-5.4-mini", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 4.5, CacheReadPricePerMToken: 0.075}},
 		{model: "gpt-5.4-nano", pricing: ModelPricing{InputPricePerMToken: 0.2, OutputPricePerMToken: 1.25, CacheReadPricePerMToken: 0.02}},
@@ -116,6 +156,46 @@ var (
 			CacheReadPricePerMToken:         0.175,
 			CacheReadPricePerMTokenPriority: 0.35,
 		}},
+		// ===== xAI Grok（USD / 1M token）=====
+		// 价目取自 models.dev 的 xai provider 条目；models.dev 未收录的老型号
+		// （grok-3-fast / grok-2）按 xAI 官方公开价填，缓存价未公开的留空
+		// （留空 = 缓存 token 按输入价计）。任何一条都可在定价页覆盖。
+		// Grok 的长上下文分档线是 200K，与 OpenAI 的 272K 不同，逐条声明。
+		{model: "grok-4.5", pricing: ModelPricing{
+			InputPricePerMToken:         2.0,
+			OutputPricePerMToken:        6.0,
+			CacheReadPricePerMToken:     0.3,
+			LongInputPricePerMToken:     4.0,
+			LongOutputPricePerMToken:    12.0,
+			LongCacheReadPricePerMToken: 1.0,
+			LongContextThresholdTokens:  200000,
+		}},
+		{model: "grok-4.3", pricing: ModelPricing{
+			InputPricePerMToken:         1.25,
+			OutputPricePerMToken:        2.5,
+			CacheReadPricePerMToken:     0.2,
+			LongInputPricePerMToken:     2.5,
+			LongOutputPricePerMToken:    5.0,
+			LongCacheReadPricePerMToken: 0.4,
+			LongContextThresholdTokens:  200000,
+		}},
+		{model: "grok-4.20", pricing: ModelPricing{
+			InputPricePerMToken:         1.25,
+			OutputPricePerMToken:        2.5,
+			CacheReadPricePerMToken:     0.2,
+			LongInputPricePerMToken:     2.5,
+			LongOutputPricePerMToken:    5.0,
+			LongCacheReadPricePerMToken: 0.4,
+			LongContextThresholdTokens:  200000,
+		}},
+		{model: "grok-4-fast", pricing: ModelPricing{InputPricePerMToken: 0.2, OutputPricePerMToken: 0.5, CacheReadPricePerMToken: 0.05}},
+		{model: "grok-4", pricing: ModelPricing{InputPricePerMToken: 3.0, OutputPricePerMToken: 15.0, CacheReadPricePerMToken: 0.75}},
+		{model: "grok-code-fast-1", pricing: ModelPricing{InputPricePerMToken: 0.2, OutputPricePerMToken: 1.5, CacheReadPricePerMToken: 0.02}},
+		{model: "grok-3-mini", pricing: ModelPricing{InputPricePerMToken: 0.3, OutputPricePerMToken: 0.5, CacheReadPricePerMToken: 0.075}},
+		{model: "grok-3-fast", pricing: ModelPricing{InputPricePerMToken: 5.0, OutputPricePerMToken: 25.0}},
+		{model: "grok-3", pricing: ModelPricing{InputPricePerMToken: 3.0, OutputPricePerMToken: 15.0, CacheReadPricePerMToken: 0.75}},
+		{model: "grok-2", pricing: ModelPricing{InputPricePerMToken: 2.0, OutputPricePerMToken: 10.0}},
+
 		{model: "gpt-4o-mini", pricing: ModelPricing{InputPricePerMToken: 0.15, OutputPricePerMToken: 0.6}},
 		{model: "gpt-4o", pricing: ModelPricing{InputPricePerMToken: 2.5, OutputPricePerMToken: 10.0}},
 		{model: "gpt-4-turbo", pricing: ModelPricing{InputPricePerMToken: 10.0, OutputPricePerMToken: 30.0}},
@@ -126,16 +206,32 @@ var (
 
 func GetModelPricing(model string) *ModelPricing {
 	normalized := normalizeBillingModelName(model)
+	canonical := normalized
+	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
+		canonical = codexModel
+	}
+	base := baseModelPricing(normalized, canonical)
+
+	// custom / synced 覆盖：以代码默认为底，合并非 0 字段（部分覆盖）。
+	// 覆盖表拷贝到本地副本再改，绝不改动共享的默认 pricing 指针。
+	if ov, ok := lookupModelPricingOverride(canonical); ok {
+		merged := *base
+		ov.applyNonZero(&merged)
+		return &merged
+	}
+	return base
+}
+
+// baseModelPricing 返回代码内置的模型定价（不含覆盖）。normalized 为归一化后的模型名，
+// canonical 为 codex 归一后的规范名（用于规则表查找）。
+func baseModelPricing(normalized, canonical string) *ModelPricing {
 	if pricing := claudeFamilyPricing(normalized); pricing != nil {
 		return pricing
 	}
 	if pricing := geminiFamilyPricing(normalized); pricing != nil {
 		return pricing
 	}
-	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
-		normalized = codexModel
-	}
-	if pricing := modelRulePricing(normalized); pricing != nil {
+	if pricing := modelRulePricing(canonical); pricing != nil {
 		return pricing
 	}
 	return defaultModelPricing
@@ -145,9 +241,43 @@ func CalculateCost(inputTokens, outputTokens, cachedTokens int, model string, se
 	return CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens, model, serviceTier).TotalCost
 }
 
+// usageLogBillingServiceTier 解析一条待写入用量事件的计费 service tier:
+// 显式 BillingServiceTier 优先,其次上游实际 tier,最后请求 tier。
+func usageLogBillingServiceTier(log *UsageLogInput) string {
+	if log == nil {
+		return ""
+	}
+	if tier := log.BillingServiceTier; tier != "" {
+		return tier
+	}
+	if tier := log.ActualServiceTier; tier != "" {
+		return tier
+	}
+	return log.ServiceTier
+}
+
+// UsageLogBilledCost 返回一条待写入用量事件的计费金额(美元),与 InsertUsageLog 落库时
+// 写进 account_billed / user_billed 的口径完全一致。热路径上需要在日志落库前就拿到
+// 这笔消耗时(如 scope 维度限额的本地增量修正)调用它,避免两处计费逻辑漂移。
+func UsageLogBilledCost(log *UsageLogInput) float64 {
+	if log == nil {
+		return 0
+	}
+	// 使用 EffectiveModel 作为计费模型（如果有映射则使用映射后的模型）
+	billingModel := log.EffectiveModel
+	if billingModel == "" {
+		billingModel = log.Model
+	}
+	return calculateCost(log.InputTokens, log.OutputTokens, log.CachedTokens, billingModel, usageLogBillingServiceTier(log))
+}
+
 func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) CostBreakdown {
 	pricing := GetModelPricing(model)
-	isLong := inputTokens > longContextThreshold
+	threshold := longContextThreshold
+	if pricing.LongContextThresholdTokens > 0 {
+		threshold = pricing.LongContextThresholdTokens
+	}
+	isLong := inputTokens > threshold
 	longContextApplied := false
 
 	inputPrice := pricing.InputPricePerMToken
@@ -209,7 +339,7 @@ func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model s
 		CacheReadPricePerMToken:   cacheReadPrice * tierMultiplier,
 		ServiceTierCostMultiplier: tierMultiplier,
 		LongContext:               longContextApplied,
-		LongContextThreshold:      longContextThreshold,
+		LongContextThreshold:      threshold,
 	}
 }
 
@@ -236,6 +366,20 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 		return "gpt-5.5-pro", true
 	case strings.Contains(compact, "gpt-5.5") || strings.Contains(compact, "gpt5-5") || strings.Contains(compact, "gpt5.5"):
 		return "gpt-5.5", true
+	// GPT-5.6 三个变体官方定价各不相同（developers.openai.com/api/docs/pricing）：
+	//   sol   $5/$30（standard，priority 2× = $10/$60）——同 gpt-5.5 standard 但 priority 更低
+	//   terra $2.5/$15 —— 与 gpt-5.4 同价，但独立规范键，定价页可单独配置
+	//   luna  $1/$6 —— 全新档位
+	// priority 均为 standard 的 2×，由 serviceTierCostMultiplier 兜底自动得出，无需显式配置。
+	case strings.Contains(compact, "gpt-5.6-sol") || strings.Contains(compact, "gpt5-6-sol") || strings.Contains(compact, "gpt5.6-sol"):
+		return "gpt-5.6-sol", true
+	case strings.Contains(compact, "gpt-5.6-terra") || strings.Contains(compact, "gpt5-6-terra") || strings.Contains(compact, "gpt5.6-terra"):
+		return "gpt-5.6-terra", true
+	case strings.Contains(compact, "gpt-5.6-luna") || strings.Contains(compact, "gpt5-6-luna") || strings.Contains(compact, "gpt5.6-luna"):
+		return "gpt-5.6-luna", true
+	case strings.Contains(compact, "gpt-5.6") || strings.Contains(compact, "gpt5-6") || strings.Contains(compact, "gpt5.6"):
+		// 未知 gpt-5.6 变体：按最贵的 sol 兜底，避免低估计费。
+		return "gpt-5.6-sol", true
 	case strings.Contains(compact, "gpt-5.4-mini") || strings.Contains(compact, "gpt5-4-mini") || strings.Contains(compact, "gpt5.4-mini"):
 		return "gpt-5.4-mini", true
 	case strings.Contains(compact, "gpt-5.4-nano") || strings.Contains(compact, "gpt5-4-nano") || strings.Contains(compact, "gpt5.4-nano"):

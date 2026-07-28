@@ -1,16 +1,35 @@
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
-import { useCallback, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import APIKeyTokenUsagePanel from "../components/APIKeyTokenUsagePanel";
 import ChipInput from "../components/ChipInput";
 import Modal from "../components/Modal";
+import ChannelLogo from "../components/ChannelLogo";
 import PageHeader from "../components/PageHeader";
 import StateShell from "../components/StateShell";
+import StatCard from "../components/StatCard";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { useDataLoader } from "../hooks/useDataLoader";
 import { useToast } from "../hooks/useToast";
-import type { AccountGroup, APIKeyLimits, APIKeyRow, APIKeyWindowUsage, SystemSettings } from "../types";
+import type {
+  AccountGroup,
+  APIKeyLimits,
+  APIKeyScopeLimit,
+  APIKeyScopeUsageItem,
+  APIKeyScopeUsageWindow,
+  APIKeyScopeCumulativeUsage,
+  APIKeyScopeSummaryItem,
+  APIKeyRow,
+  APIKeyWindowUsage,
+  SystemSettings,
+} from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
 import { Badge } from "@/components/ui/badge";
@@ -26,25 +45,41 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { cn } from "@/lib/utils";
 import {
+  Check,
   Copy,
   CalendarClock,
   CircleDollarSign,
+  ChevronDown,
   Eye,
   EyeOff,
   ExternalLink,
-  Fingerprint,
+  ArrowUpDown,
+  Gauge,
   KeyRound,
+  Loader2,
   LockKeyhole,
   Pencil,
   Plus,
   RotateCcw,
+  Search,
+  ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
+  Waypoints,
   Trash2,
+  XCircle,
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
 type TokenLimitUnit = "token" | "k" | "m" | "b";
+type StatusFilter = "all" | "active" | "expired" | "quota_exhausted" | "expiring_soon";
+type APIKeyStatus = "active" | "expired" | "quota_exhausted";
+type SortMode = "created_desc" | "last_used_desc" | "quota_usage_desc" | "name_asc";
+
+const KEY_REVEAL_MS = 30_000;
+const EXPIRING_SOON_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface CreateKeyFormState {
   name: string;
@@ -55,7 +90,6 @@ interface CreateKeyFormState {
   allowedGroupIds: number[];
   limits: LimitsFormState;
 }
-
 interface EditKeyFormState {
   name: string;
   quotaLimit: string;
@@ -69,6 +103,7 @@ interface LimitsFormState {
   modelAllow: string[];
   modelDeny: string[];
   planAllow: string[];
+  noAffinityGroupIds: number[];
   rpm: string;
   rpd: string;
   maxConcurrency: string;
@@ -81,7 +116,62 @@ interface LimitsFormState {
   tokenLimit7dUnit: TokenLimitUnit;
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
+  imageGenerationPolicy: ImageGenerationPolicy;
+  upstreamChannel: UpstreamChannel;
+  scopeLimits: ScopeLimitFormState[];
 }
+
+type ImageGenerationPolicy = "allow" | "strip" | "block";
+type UpstreamChannel = "auto" | "codex" | "grok";
+
+// ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
+// 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
+interface ScopeLimitFormState {
+  scopeType: "group" | "account";
+  scopeId: string;
+  onExhausted: "skip" | "reject";
+  cost5h: string;
+  cost1d: string;
+  cost7d: string;
+  cost30d: string;
+  token5h: string;
+  token1d: string;
+  token7d: string;
+  token30d: string;
+  requests1d: string;
+  maxConcurrency: string;
+  quotaCost: string;
+  quotaTokens: string;
+  quotaRequests: string;
+}
+
+const emptyScopeLimitRow: ScopeLimitFormState = {
+  scopeType: "group",
+  scopeId: "",
+  onExhausted: "skip",
+  cost5h: "",
+  cost1d: "",
+  cost7d: "",
+  cost30d: "",
+  token5h: "",
+  token1d: "",
+  token7d: "",
+  token30d: "",
+  requests1d: "",
+  maxConcurrency: "",
+  quotaCost: "",
+  quotaTokens: "",
+  quotaRequests: "",
+};
+
+// Grok 账号都未声明模型时的下拉兜底(与 Grok 账号页测试模型列表一致)。
+const DEFAULT_GROK_MODEL_OPTIONS = [
+  "grok-4.5",
+  "grok-4",
+  "grok-3-fast",
+  "grok-3",
+  "grok-2",
+];
 
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
   token: 1,
@@ -96,6 +186,7 @@ const emptyLimitsForm: LimitsFormState = {
   modelAllow: [],
   modelDeny: [],
   planAllow: [],
+  noAffinityGroupIds: [],
   rpm: "",
   rpd: "",
   maxConcurrency: "",
@@ -108,6 +199,9 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
+  imageGenerationPolicy: "allow",
+  upstreamChannel: "auto",
+  scopeLimits: [],
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -135,17 +229,47 @@ export default function APIKeys() {
   const [createForm, setCreateForm] =
     useState<CreateKeyFormState>(initialCreateForm);
   const [createdKeyId, setCreatedKeyId] = useState<number | null>(null);
+  const [createdReveal, setCreatedReveal] = useState<{
+    id: number;
+    name: string;
+    key: string;
+  } | null>(null);
+  const [createdRevealAck, setCreatedRevealAck] = useState(false);
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set());
+  const revealTimers = useRef<Map<number, number>>(new Map());
   const [activeTab, setActiveTab] = useState<"keys" | "token-usage">("keys");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sortMode, setSortMode] = useState<SortMode>("created_desc");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
+  // 编辑抽屉里展示 scope 预算的当前用量（issue #439）；打开时按需拉一次。
+  const [scopeUsage, setScopeUsage] = useState<APIKeyScopeUsageItem[]>([]);
+  // 列表页的 scope 预算概览：按 Key ID 索引，仅在存在配了预算的 Key 时才有内容。
+  const [scopeSummary, setScopeSummary] = useState<
+    Record<string, APIKeyScopeSummaryItem[]>
+  >({});
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [editTab, setEditTab] = useState<"basic" | "limits">("basic");
+  const [editDirty, setEditDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savingPublicUsagePage, setSavingPublicUsagePage] = useState(false);
-  const { toast, showToast } = useToast();
+  const [savingPublicImageStudioPage, setSavingPublicImageStudioPage] =
+    useState(false);
+  const [savingPublicAccountPortalPage, setSavingPublicAccountPortalPage] =
+    useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const { showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
+
+  useEffect(() => {
+    return () => {
+      revealTimers.current.forEach((timer) => window.clearTimeout(timer));
+      revealTimers.current.clear();
+    };
+  }, []);
 
   const loadKeys = useCallback(async () => {
     const [keysResponse, groupsResponse, modelsResponse, settingsResponse] = await Promise.all([
@@ -155,6 +279,7 @@ export default function APIKeys() {
         .getModels()
         .catch(() => ({ models: [] as string[] })) as Promise<{
         models?: string[];
+        grok_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
     ]);
@@ -162,38 +287,205 @@ export default function APIKeys() {
       keys: keysResponse.keys ?? [],
       groups: groupsResponse.groups ?? [],
       modelOptions: modelsResponse.models ?? [],
+      grokModelOptions: modelsResponse.grok_models ?? [],
       settings: settingsResponse,
     };
   }, []);
 
-  const { data, loading, error, reload } = useDataLoader<{
+  const { data, setData, loading, error, reload, reloadSilently } = useDataLoader<{
     keys: APIKeyRow[];
     groups: AccountGroup[];
     modelOptions: string[];
+    grokModelOptions: string[];
     settings: SystemSettings | null;
   }>({
-    initialData: { keys: [], groups: [], modelOptions: [], settings: null },
+    initialData: {
+      keys: [],
+      groups: [],
+      modelOptions: [],
+      grokModelOptions: [],
+      settings: null,
+    },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+
+  // scope 预算概览单独拉：它需要跨 Key 的用量聚合，不该拖慢 Key 列表本身。
+  const anyScopeBudget = keys.some(
+    (keyRow) => (keyRow.limits?.scope_limits?.length ?? 0) > 0,
+  );
+  useEffect(() => {
+    if (!anyScopeBudget) {
+      setScopeSummary({});
+      return;
+    }
+    let cancelled = false;
+    void api
+      .getAPIKeysScopeSummary()
+      .then((res) => {
+        if (!cancelled) setScopeSummary(res.summary ?? {});
+      })
+      .catch(() => {
+        if (!cancelled) setScopeSummary({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [anyScopeBudget, keys.length]);
+  // 模型下拉跟随渠道选择:grok 只列 Grok 模型(账号未声明时用常见兜底),
+  // codex 只列 Codex 目录,auto 合并两者。
+  const grokModelOptions =
+    data.grokModelOptions.length > 0
+      ? data.grokModelOptions
+      : DEFAULT_GROK_MODEL_OPTIONS;
+  const modelOptionsForChannel = useCallback(
+    (channel: UpstreamChannel): string[] => {
+      if (channel === "grok") return grokModelOptions;
+      if (channel === "codex") return modelOptions;
+      const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
+      return [
+        ...modelOptions,
+        ...grokModelOptions.filter((m) => !seen.has(m.toLowerCase())),
+      ];
+    },
+    [modelOptions, grokModelOptions],
+  );
   const publicUsagePageEnabled = data.settings?.public_key_usage_page_enabled ?? true;
+  const publicImageStudioPageEnabled =
+    data.settings?.public_image_studio_page_enabled ?? true;
+  const publicAccountPortalPageEnabled =
+    data.settings?.public_account_portal_page_enabled ?? false;
+  const showInitialSkeleton = loading && keys.length === 0;
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await reloadSilently();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [reloadSilently]);
 
   const keyUsageUrl = useMemo(() => {
     if (typeof window === "undefined") return "/key-usage";
     return `${window.location.origin}/key-usage`;
   }, []);
 
-  const latestKey = useMemo(() => {
-    return keys
-      .slice()
-      .sort(
-        (a, b) =>
-          new Date(b.created_at || 0).getTime() -
-          new Date(a.created_at || 0).getTime(),
-      )[0];
+  const imageStudioUrl = useMemo(() => {
+    if (typeof window === "undefined") return "/image-studio";
+    return `${window.location.origin}/image-studio`;
+  }, []);
+
+  const accountPortalUrl = useMemo(() => {
+    if (typeof window === "undefined") return "/account-portal";
+    return `${window.location.origin}/account-portal`;
+  }, []);
+
+  const statusCounts = useMemo(() => {
+    const counts = {
+      all: keys.length,
+      active: 0,
+      expired: 0,
+      quota_exhausted: 0,
+      expiring_soon: 0,
+    };
+    const now = Date.now();
+    for (const keyRow of keys) {
+      const status = getAPIKeyStatus(keyRow);
+      if (status === "active") counts.active += 1;
+      else if (status === "expired") counts.expired += 1;
+      else counts.quota_exhausted += 1;
+
+      if (
+        status === "active" &&
+        keyRow.expires_at &&
+        new Date(keyRow.expires_at).getTime() - now <= EXPIRING_SOON_MS &&
+        new Date(keyRow.expires_at).getTime() > now
+      ) {
+        counts.expiring_soon += 1;
+      }
+    }
+    return counts;
   }, [keys]);
+
+  const filteredKeys = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const now = Date.now();
+    const filtered = keys.filter((keyRow) => {
+      const status = getAPIKeyStatus(keyRow);
+      if (statusFilter === "active" && status !== "active") return false;
+      if (statusFilter === "expired" && status !== "expired") return false;
+      if (statusFilter === "quota_exhausted" && status !== "quota_exhausted")
+        return false;
+      if (statusFilter === "expiring_soon") {
+        if (status !== "active" || !keyRow.expires_at) return false;
+        const expiresAt = new Date(keyRow.expires_at).getTime();
+        if (!(expiresAt > now && expiresAt - now <= EXPIRING_SOON_MS))
+          return false;
+      }
+      if (!q) return true;
+      const haystack = [
+        keyRow.name,
+        keyRow.key,
+        keyRow.raw_key,
+        String(keyRow.id),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+
+    const sorted = filtered.slice();
+    sorted.sort((a, b) => {
+      switch (sortMode) {
+        case "name_asc":
+          return a.name.localeCompare(b.name, undefined, {
+            sensitivity: "base",
+          });
+        case "last_used_desc": {
+          const aTime = a.last_used_at
+            ? new Date(a.last_used_at).getTime()
+            : 0;
+          const bTime = b.last_used_at
+            ? new Date(b.last_used_at).getTime()
+            : 0;
+          if (bTime !== aTime) return bTime - aTime;
+          return (
+            new Date(b.created_at || 0).getTime() -
+            new Date(a.created_at || 0).getTime()
+          );
+        }
+        case "quota_usage_desc": {
+          const aRatio =
+            a.quota_limit > 0 ? a.quota_used / a.quota_limit : -1;
+          const bRatio =
+            b.quota_limit > 0 ? b.quota_used / b.quota_limit : -1;
+          if (bRatio !== aRatio) return bRatio - aRatio;
+          return b.total_used - a.total_used;
+        }
+        case "created_desc":
+        default:
+          return (
+            new Date(b.created_at || 0).getTime() -
+            new Date(a.created_at || 0).getTime()
+          );
+      }
+    });
+    return sorted;
+  }, [keys, searchQuery, sortMode, statusFilter]);
+
+  const sortOptions = useMemo(
+    () => [
+      { label: t("apiKeys.sortCreated"), value: "created_desc" },
+      { label: t("apiKeys.sortLastUsed"), value: "last_used_desc" },
+      { label: t("apiKeys.sortQuotaUsage"), value: "quota_usage_desc" },
+      { label: t("apiKeys.sortName"), value: "name_asc" },
+    ],
+    [t],
+  );
 
   const expireOptions = useMemo(
     () => [
@@ -226,11 +518,80 @@ export default function APIKeys() {
           : t("apiKeys.publicUsageDisabledToast"),
         "success",
       );
-      await reload();
+      setData((current) => ({
+        ...current,
+        settings: current.settings
+          ? {
+              ...current.settings,
+              public_key_usage_page_enabled: nextEnabled,
+            }
+          : current.settings,
+      }));
+      await reloadSilently();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
     } finally {
       setSavingPublicUsagePage(false);
+    }
+  };
+
+  const handleTogglePublicImageStudioPage = async () => {
+    const nextEnabled = !publicImageStudioPageEnabled;
+    setSavingPublicImageStudioPage(true);
+    try {
+      await api.updateSettings({
+        public_image_studio_page_enabled: nextEnabled,
+      });
+      showToast(
+        nextEnabled
+          ? t("apiKeys.publicImageStudioEnabledToast")
+          : t("apiKeys.publicImageStudioDisabledToast"),
+        "success",
+      );
+      setData((current) => ({
+        ...current,
+        settings: current.settings
+          ? {
+              ...current.settings,
+              public_image_studio_page_enabled: nextEnabled,
+            }
+          : current.settings,
+      }));
+      await reloadSilently();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setSavingPublicImageStudioPage(false);
+    }
+  };
+
+  const handleTogglePublicAccountPortalPage = async () => {
+    const nextEnabled = !publicAccountPortalPageEnabled;
+    setSavingPublicAccountPortalPage(true);
+    try {
+      await api.updateSettings({
+        public_account_portal_page_enabled: nextEnabled,
+      });
+      showToast(
+        nextEnabled
+          ? t("apiKeys.publicAccountPortalEnabledToast")
+          : t("apiKeys.publicAccountPortalDisabledToast"),
+        "success",
+      );
+      setData((current) => ({
+        ...current,
+        settings: current.settings
+          ? {
+              ...current.settings,
+              public_account_portal_page_enabled: nextEnabled,
+            }
+          : current.settings,
+      }));
+      await reloadSilently();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setSavingPublicAccountPortalPage(false);
     }
   };
 
@@ -263,11 +624,19 @@ export default function APIKeys() {
 
       const result = await api.createAPIKey(payload);
       setCreatedKeyId(result.id);
-      setVisibleKeys((prev) => new Set(prev).add(result.id));
+      setCreatedReveal({
+        id: result.id,
+        name: result.name,
+        key: result.key,
+      });
+      setCreatedRevealAck(false);
       setCreateForm(initialCreateForm);
       setCreateDialogOpen(false);
+      setStatusFilter("all");
+      setSearchQuery("");
+      setActiveTab("keys");
       showToast(t("apiKeys.keyCreateSuccess"));
-      void reload();
+      void reloadSilently();
     } catch (error) {
       showToast(
         `${t("apiKeys.createFailed")}: ${getErrorMessage(error)}`,
@@ -289,6 +658,11 @@ export default function APIKeys() {
     if (!confirmed) return;
 
     setDeletingIds((prev) => new Set(prev).add(id));
+    const previous = keys;
+    setData((current) => ({
+      ...current,
+      keys: current.keys.filter((item) => item.id !== id),
+    }));
     try {
       await api.deleteAPIKey(id);
       showToast(t("apiKeys.keyDeleted"));
@@ -298,8 +672,9 @@ export default function APIKeys() {
         next.delete(id);
         return next;
       });
-      void reload();
+      void reloadSilently();
     } catch (error) {
+      setData((current) => ({ ...current, keys: previous }));
       showToast(
         `${t("apiKeys.deleteFailed")}: ${getErrorMessage(error)}`,
         "error",
@@ -326,11 +701,26 @@ export default function APIKeys() {
     if (!confirmed) return;
 
     setResettingIds((prev) => new Set(prev).add(keyRow.id));
+    const previousUsed = keyRow.quota_used;
+    setData((current) => ({
+      ...current,
+      keys: current.keys.map((item) =>
+        item.id === keyRow.id ? { ...item, quota_used: 0 } : item,
+      ),
+    }));
     try {
       await api.updateAPIKey(keyRow.id, { reset_quota: true });
       showToast(t("apiKeys.resetQuotaSuccess"));
-      void reload();
+      void reloadSilently();
     } catch (error) {
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map((item) =>
+          item.id === keyRow.id
+            ? { ...item, quota_used: previousUsed }
+            : item,
+        ),
+      }));
       showToast(
         `${t("apiKeys.resetQuotaFailed")}: ${getErrorMessage(error)}`,
         "error",
@@ -371,17 +761,61 @@ export default function APIKeys() {
     }
   };
 
+  const hideKey = useCallback((id: number) => {
+    const existing = revealTimers.current.get(id);
+    if (existing) {
+      window.clearTimeout(existing);
+      revealTimers.current.delete(id);
+    }
+    setVisibleKeys((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
   const toggleVisible = (id: number) => {
     setVisibleKeys((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (next.has(id)) {
+        const existing = revealTimers.current.get(id);
+        if (existing) {
+          window.clearTimeout(existing);
+          revealTimers.current.delete(id);
+        }
+        next.delete(id);
+        return next;
+      }
+      next.add(id);
+      const existing = revealTimers.current.get(id);
+      if (existing) window.clearTimeout(existing);
+      const timer = window.setTimeout(() => {
+        hideKey(id);
+      }, KEY_REVEAL_MS);
+      revealTimers.current.set(id, timer);
       return next;
     });
   };
 
+  const closeCreatedReveal = () => {
+    if (!createdRevealAck) {
+      showToast(t("apiKeys.createdRevealAckRequired"), "error");
+      return;
+    }
+    setCreatedReveal(null);
+    setCreatedRevealAck(false);
+  };
+
   const startEditing = (keyRow: APIKeyRow) => {
     setEditingKey(keyRow);
+    setScopeUsage([]);
+    if ((keyRow.limits?.scope_limits?.length ?? 0) > 0) {
+      void api
+        .getAPIKeyScopeUsage(keyRow.id)
+        .then((res) => setScopeUsage(res.items ?? []))
+        .catch(() => setScopeUsage([]));
+    }
     setEditForm({
       name: keyRow.name,
       quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : "",
@@ -390,17 +824,57 @@ export default function APIKeys() {
       allowedGroupIds: keyRow.allowed_group_ids ?? [],
       limits: limitsFromAPIKey(keyRow.limits),
     });
+    setEditDirty(false);
+    setEditTab("basic");
   };
 
-  const closeEditDialog = () => {
+  // 重置某条 scope 的累计额度：累计额度不随时间回落，用完必须手动重置。
+  const resetScopeQuota = async (
+    scopeType: "group" | "account",
+    scopeId: number,
+  ) => {
+    if (!editingKey) return;
+    const confirmed = await confirm({
+      title: t("apiKeys.limits.scopeQuotaResetTitle"),
+      description: t("apiKeys.limits.scopeQuotaResetDesc"),
+      confirmText: t("apiKeys.limits.scopeQuotaReset"),
+      tone: "warning",
+    });
+    if (!confirmed) return;
+    try {
+      await api.resetAPIKeyScopeQuota(editingKey.id, {
+        scope_type: scopeType,
+        scope_id: scopeId,
+      });
+      showToast(t("apiKeys.limits.scopeQuotaResetDone"), "success");
+      const res = await api.getAPIKeyScopeUsage(editingKey.id);
+      setScopeUsage(res.items ?? []);
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    }
+  };
+
+  const closeEditDialog = async () => {
     if (saving) return;
+    if (editDirty) {
+      const confirmed = await confirm({
+        title: t("apiKeys.discardEditTitle"),
+        description: t("apiKeys.discardEditDesc"),
+        confirmText: t("apiKeys.discardEditConfirm"),
+        tone: "warning",
+      });
+      if (!confirmed) return;
+    }
     setEditingKey(null);
     setEditForm(initialEditForm);
     setEditTab("basic");
+    setEditDirty(false);
+    setScopeUsage([]);
   };
 
   const updateEditForm = (patch: Partial<EditKeyFormState>) => {
     setEditForm((current) => ({ ...current, ...patch }));
+    setEditDirty(true);
   };
 
   const handleSaveEdit = async (event?: FormEvent<HTMLFormElement>) => {
@@ -414,17 +888,54 @@ export default function APIKeys() {
     setSaving(true);
     try {
       const quotaLimit = parseQuotaLimit(editForm.quotaLimit, t);
+      const expirationPayload = buildExpirationPayload(editForm, t, {
+        clearNever: true,
+      });
+      const limitsPayload = limitsFormToPayload(editForm.limits);
       await api.updateAPIKey(editingKey.id, {
         name: trimmed,
         quota_limit: quotaLimit,
         allowed_group_ids: editForm.allowedGroupIds,
-        limits: limitsFormToPayload(editForm.limits),
-        ...buildExpirationPayload(editForm, t, { clearNever: true }),
+        limits: limitsPayload,
+        ...expirationPayload,
       });
+
+      // 乐观更新列表行，再静默同步
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map((item) => {
+          if (item.id !== editingKey.id) return item;
+          const nextExpires =
+            "expires_at" in expirationPayload
+              ? (expirationPayload.expires_at as string | null | undefined)
+              : "expires_in_days" in expirationPayload &&
+                  expirationPayload.expires_in_days
+                ? new Date(
+                    Date.now() +
+                      Number(expirationPayload.expires_in_days) *
+                        24 *
+                        60 *
+                        60 *
+                        1000,
+                  ).toISOString()
+                : item.expires_at;
+          return {
+            ...item,
+            name: trimmed,
+            quota_limit: quotaLimit,
+            allowed_group_ids: editForm.allowedGroupIds,
+            limits: limitsPayload,
+            expires_at: nextExpires ?? null,
+          };
+        }),
+      }));
+
       showToast(t("apiKeys.keyUpdated"));
       setEditingKey(null);
       setEditForm(initialEditForm);
-      void reload();
+      setEditTab("basic");
+      setEditDirty(false);
+      void reloadSilently();
     } catch (error) {
       showToast(
         `${t("apiKeys.updateFailed")}: ${getErrorMessage(error)}`,
@@ -435,11 +946,15 @@ export default function APIKeys() {
     }
   };
 
+  if (showInitialSkeleton) {
+    return <APIKeysSkeleton />;
+  }
+
   return (
     <StateShell
       variant="page"
-      loading={loading}
-      error={error}
+      loading={false}
+      error={error && keys.length === 0 ? error : null}
       onRetry={() => void reload()}
       loadingTitle={t("apiKeys.loadingTitle")}
       loadingDescription={t("apiKeys.loadingDesc")}
@@ -449,7 +964,23 @@ export default function APIKeys() {
         <PageHeader
           title={t("apiKeys.title")}
           description={t("apiKeys.description")}
-          onRefresh={() => void reload()}
+          onRefresh={() => void handleRefresh()}
+          refreshLabel={
+            refreshing ? t("common.loading") : t("common.refresh")
+          }
+          actionMeta={
+            <span className="inline-flex items-center gap-1.5">
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  keys.length > 0 ? "bg-[hsl(var(--success))]" : "bg-[hsl(var(--warning))]",
+                )}
+              />
+              {keys.length > 0
+                ? t("apiKeys.authEnabledDesc")
+                : t("apiKeys.authDisabledDesc")}
+            </span>
+          }
           actions={
             <Button
               onClick={() => setCreateDialogOpen(true)}
@@ -461,51 +992,104 @@ export default function APIKeys() {
           }
         />
 
-        <div className="mb-4 grid gap-3 md:grid-cols-3">
-          <KeySummaryCard
-            icon={<KeyRound className="size-5" />}
-            label={t("apiKeys.totalKeys")}
-            value={String(keys.length)}
-            sub={
-              keys.length > 0
-                ? t("apiKeys.totalKeysDesc")
-                : t("apiKeys.noKeysShort")
-            }
-            tone="info"
-          />
-          <KeySummaryCard
-            icon={<ShieldCheck className="size-5" />}
-            label={t("apiKeys.authMode")}
-            value={
-              keys.length > 0
-                ? t("apiKeys.authEnabled")
-                : t("apiKeys.authDisabled")
-            }
-            sub={
-              keys.length > 0
-                ? t("apiKeys.authEnabledDesc")
-                : t("apiKeys.authDisabledDesc")
-            }
-            tone={keys.length > 0 ? "success" : "warning"}
-          />
-          <KeySummaryCard
-            icon={<Fingerprint className="size-5" />}
-            label={t("apiKeys.newestKey")}
-            value={latestKey?.name || "-"}
-            sub={
-              latestKey
-                ? formatRelativeTime(latestKey.created_at, {
-                    variant: "compact",
-                  })
-                : t("apiKeys.noLatest")
-            }
-            tone="neutral"
-          />
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+          <button
+            type="button"
+            className="text-left"
+            onClick={() => {
+              setStatusFilter("all");
+              setActiveTab("keys");
+            }}
+          >
+            <StatCard
+              icon={<KeyRound className="size-[18px]" />}
+              iconClass="purple"
+              label={t("apiKeys.totalKeys")}
+              value={statusCounts.all}
+              sub={
+                keys.length > 0
+                  ? t("apiKeys.totalKeysDesc")
+                  : t("apiKeys.noKeysShort")
+              }
+              className={cn(
+                "h-full cursor-pointer",
+                statusFilter === "all" && "ring-2 ring-primary/30",
+              )}
+            />
+          </button>
+          <button
+            type="button"
+            className="text-left"
+            onClick={() => {
+              setStatusFilter("active");
+              setActiveTab("keys");
+            }}
+          >
+            <StatCard
+              icon={<ShieldCheck className="size-[18px]" />}
+              iconClass="green"
+              label={t("apiKeys.status.active")}
+              value={statusCounts.active}
+              sub={t("apiKeys.filterActiveDesc")}
+              className={cn(
+                "h-full cursor-pointer",
+                statusFilter === "active" && "ring-2 ring-primary/30",
+              )}
+            />
+          </button>
+          <button
+            type="button"
+            className="text-left"
+            onClick={() => {
+              setStatusFilter("expiring_soon");
+              setActiveTab("keys");
+            }}
+          >
+            <StatCard
+              icon={<CalendarClock className="size-[18px]" />}
+              iconClass="amber"
+              label={t("apiKeys.status.expiring_soon")}
+              value={statusCounts.expiring_soon}
+              sub={t("apiKeys.filterExpiringDesc")}
+              className={cn(
+                "h-full cursor-pointer",
+                statusFilter === "expiring_soon" && "ring-2 ring-primary/30",
+              )}
+            />
+          </button>
+          <button
+            type="button"
+            className="text-left"
+            onClick={() => {
+              setStatusFilter(
+                statusCounts.quota_exhausted > 0
+                  ? "quota_exhausted"
+                  : "expired",
+              );
+              setActiveTab("keys");
+            }}
+          >
+            <StatCard
+              icon={<XCircle className="size-[18px]" />}
+              iconClass="red"
+              label={t("apiKeys.filterIssues")}
+              value={statusCounts.expired + statusCounts.quota_exhausted}
+              sub={t("apiKeys.filterIssuesDesc", {
+                expired: statusCounts.expired,
+                exhausted: statusCounts.quota_exhausted,
+              })}
+              className={cn(
+                "h-full cursor-pointer",
+                (statusFilter === "expired" ||
+                  statusFilter === "quota_exhausted") &&
+                  "ring-2 ring-primary/30",
+              )}
+            />
+          </button>
         </div>
 
         <div className="space-y-4">
-          {/* Tab 切换：密钥列表 / Token 用量统计（issue #162）*/}
-          <div className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5">
+          <div className="inline-flex items-center gap-0.5 rounded-xl border border-border bg-muted/30 p-0.5">
             {(
               [
                 ["keys", t("apiKeys.tabKeys")],
@@ -516,11 +1100,12 @@ export default function APIKeys() {
                 key={key}
                 type="button"
                 onClick={() => setActiveTab(key)}
-                className={`rounded-md px-3 py-1.5 text-[13px] font-semibold transition-colors ${
+                className={cn(
+                  "rounded-lg px-3.5 py-1.5 text-[13px] font-semibold transition-colors",
                   activeTab === key
                     ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
+                    : "text-muted-foreground hover:text-foreground",
+                )}
               >
                 {label}
               </button>
@@ -528,20 +1113,85 @@ export default function APIKeys() {
           </div>
 
           {activeTab === "keys" && (
-          <Card>
-            <CardContent className="p-3 sm:p-4">
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-base font-semibold text-foreground">
-                    {t("apiKeys.tableTitle")}
-                  </h3>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {t("apiKeys.tableDesc")}
-                  </p>
+            <>
+              <div className="toolbar-surface flex flex-col gap-2.5">
+                <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                  <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
+                    {t("apiKeys.filter")}
+                  </span>
+                  {(
+                    [
+                      ["all", t("common.all"), statusCounts.all],
+                      [
+                        "active",
+                        t("apiKeys.status.active"),
+                        statusCounts.active,
+                      ],
+                      [
+                        "expiring_soon",
+                        t("apiKeys.status.expiring_soon"),
+                        statusCounts.expiring_soon,
+                      ],
+                      [
+                        "expired",
+                        t("apiKeys.status.expired"),
+                        statusCounts.expired,
+                      ],
+                      [
+                        "quota_exhausted",
+                        t("apiKeys.status.quota_exhausted"),
+                        statusCounts.quota_exhausted,
+                      ],
+                    ] as const
+                  ).map(([key, label, count]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setStatusFilter(key)}
+                      className={cn(
+                        "shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors",
+                        statusFilter === key
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted/50 text-muted-foreground hover:bg-muted",
+                      )}
+                    >
+                      {label} {count}
+                    </button>
+                  ))}
                 </div>
-                <Badge variant={keys.length > 0 ? "default" : "secondary"}>
-                  {t("apiKeys.keyCount", { count: keys.length })}
-                </Badge>
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative min-w-0 flex-1 sm:max-w-sm">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={searchQuery}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setSearchQuery(event.target.value)
+                      }
+                      placeholder={t("apiKeys.searchPlaceholder")}
+                      className="h-8 pl-8 text-[13px]"
+                    />
+                  </div>
+                  <div className="flex min-w-[10.5rem] items-center gap-1.5">
+                    <ArrowUpDown className="size-3.5 shrink-0 text-muted-foreground" />
+                    <Select
+                      value={sortMode}
+                      onValueChange={(value) =>
+                        setSortMode(value as SortMode)
+                      }
+                      options={sortOptions}
+                      compact
+                    />
+                  </div>
+                  <Badge variant="secondary" className="tabular-nums">
+                    {t("apiKeys.showingCount", {
+                      shown: filteredKeys.length,
+                      total: keys.length,
+                    })}
+                  </Badge>
+                  {refreshing ? (
+                    <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                  ) : null}
+                </div>
               </div>
 
               <StateShell
@@ -549,283 +1199,664 @@ export default function APIKeys() {
                 isEmpty={keys.length === 0}
                 emptyTitle={t("apiKeys.noKeys")}
                 emptyDescription={t("apiKeys.noKeysDesc")}
+                action={
+                  <Button onClick={() => setCreateDialogOpen(true)}>
+                    <Plus className="size-3.5" />
+                    {t("apiKeys.createKey")}
+                  </Button>
+                }
               >
-                <div className="data-table-shell">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>{t("common.name")}</TableHead>
-                        <TableHead>{t("apiKeys.keyColumn")}</TableHead>
-                        <TableHead>{t("apiKeys.allowedGroups")}</TableHead>
-                        <TableHead>{t("apiKeys.quotaColumn")}</TableHead>
-                        <TableHead>{t("apiKeys.expiresColumn")}</TableHead>
-                        <TableHead>{t("common.createdAt")}</TableHead>
-                        <TableHead className="text-right">
-                          {t("common.actions")}
-                        </TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {keys.map((keyRow) => {
+                {keys.length > 0 && filteredKeys.length === 0 ? (
+                  <div className="flex min-h-[220px] flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-border bg-card/60 px-6 py-10 text-center">
+                    <Search className="size-5 text-muted-foreground" />
+                    <div className="text-sm font-semibold text-foreground">
+                      {t("apiKeys.noFilterResults")}
+                    </div>
+                    <p className="max-w-sm text-sm text-muted-foreground">
+                      {t("apiKeys.noFilterResultsDesc")}
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setStatusFilter("all");
+                        setSearchQuery("");
+                      }}
+                    >
+                      {t("apiKeys.clearFilters")}
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    {/* Mobile cards */}
+                    <div className="grid gap-3 lg:hidden">
+                      {filteredKeys.map((keyRow) => {
                         const isVisible = visibleKeys.has(keyRow.id);
                         const isNew = createdKeyId === keyRow.id;
+                        const isBusy =
+                          deletingIds.has(keyRow.id) ||
+                          resettingIds.has(keyRow.id);
                         const displayKey = isVisible
                           ? keyRow.raw_key || keyRow.key
                           : keyRow.key;
                         const copyValue = keyRow.raw_key || keyRow.key;
-                        const status = getAPIKeyStatus(keyRow);
                         return (
-                          <TableRow
+                          <div
                             key={keyRow.id}
-                            className={
-                              isNew ? "bg-[hsl(var(--success-bg))]" : ""
-                            }
+                            className={cn(
+                              "rounded-2xl border border-border/80 bg-card p-3.5 shadow-sm transition-opacity",
+                              isNew &&
+                                "ring-1 ring-[hsl(var(--success))]/35 bg-[hsl(var(--success-bg))]",
+                              isBusy && "opacity-70",
+                            )}
                           >
-                            <TableCell className="font-medium text-foreground">
-                              <div className="flex items-center gap-2">
-                                <span>{keyRow.name}</span>
-                                {isNew ? (
-                                  <Badge
-                                    variant="outline"
-                                    className="border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]"
-                                  >
-                                    {t("apiKeys.newBadge")}
-                                  </Badge>
-                                ) : null}
-                                {status !== "active" ? (
-                                  <Badge
-                                    variant={
-                                      status === "expired"
-                                        ? "secondary"
-                                        : "destructive"
-                                    }
-                                  >
-                                    {t(`apiKeys.status.${status}`)}
-                                  </Badge>
-                                ) : null}
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="truncate text-sm font-semibold text-foreground">
+                                    {keyRow.name}
+                                  </span>
+                                  {isNew ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]"
+                                    >
+                                      {t("apiKeys.newBadge")}
+                                    </Badge>
+                                  ) : null}
+                                  <KeyStatusBadge
+                                    status={getAPIKeyStatus(keyRow)}
+                                    t={t}
+                                  />
+                                  <KeyChannelBadge keyRow={keyRow} t={t} />
+                                  <KeyScopeBudgetBadge
+                                    items={scopeSummary[String(keyRow.id)]}
+                                    t={t}
+                                  />
+                                  {isBusy ? (
+                                    <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                                  ) : null}
+                                </div>
+                                <div className="mt-1 text-[11px] text-muted-foreground">
+                                  {t("apiKeys.lastUsedLabel")}:{" "}
+                                  {formatLastUsed(keyRow, t)}
+                                  {" · "}
+                                  {formatExpiration(keyRow, t)}
+                                </div>
                               </div>
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex min-w-[260px] items-center gap-2">
-                                <code
-                                  className="min-w-0 max-w-[420px] truncate rounded-md bg-muted px-2 py-1 font-mono text-[13px] text-foreground"
-                                  title={displayKey}
-                                >
-                                  {displayKey}
-                                </code>
-                                <Button
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  disabled={!keyRow.raw_key}
-                                  onClick={() => toggleVisible(keyRow.id)}
-                                  title={
-                                    isVisible
-                                      ? t("apiKeys.hideKey")
-                                      : t("apiKeys.showKey")
-                                  }
-                                >
-                                  {isVisible ? (
-                                    <EyeOff className="size-3.5" />
-                                  ) : (
-                                    <Eye className="size-3.5" />
-                                  )}
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  onClick={() => void handleCopy(copyValue)}
-                                  title={t("common.copy")}
-                                >
-                                  <Copy className="size-3.5" />
-                                </Button>
+                            </div>
+
+                            <div className="mt-3 flex items-center gap-1.5">
+                              <code
+                                className="min-w-0 flex-1 truncate rounded-lg bg-muted/70 px-2.5 py-1.5 font-mono text-[12px] tabular-nums text-foreground"
+                                title={displayKey}
+                              >
+                                {displayKey}
+                              </code>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                disabled={!keyRow.raw_key}
+                                onClick={() => toggleVisible(keyRow.id)}
+                                title={
+                                  isVisible
+                                    ? t("apiKeys.hideKey")
+                                    : t("apiKeys.showKey")
+                                }
+                              >
+                                {isVisible ? (
+                                  <EyeOff className="size-3.5" />
+                                ) : (
+                                  <Eye className="size-3.5" />
+                                )}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                onClick={() => void handleCopy(copyValue)}
+                                title={t("common.copy")}
+                              >
+                                <Copy className="size-3.5" />
+                              </Button>
+                            </div>
+
+                            <div className="mt-3 space-y-2">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <AllowedGroupsDisplay
+                                  ids={keyRow.allowed_group_ids ?? []}
+                                  groups={groups}
+                                  t={t}
+                                />
                               </div>
-                            </TableCell>
-                            <TableCell className="min-w-[180px]">
-                              <AllowedGroupsDisplay
-                                ids={keyRow.allowed_group_ids ?? []}
-                                groups={groups}
-                                t={t}
-                              />
-                            </TableCell>
-                            <TableCell className="min-w-[150px] text-sm text-muted-foreground">
-                              <div className="space-y-1">
-                                <div className="font-medium text-foreground">
-                                  {formatQuotaLimit(keyRow, t)}
+                              <div className="rounded-xl border border-border/70 bg-muted/20 px-2.5 py-2">
+                                <div className="flex items-center justify-between gap-2 text-[11px]">
+                                  <span className="font-semibold text-muted-foreground">
+                                    {t("apiKeys.quotaColumn")}
+                                  </span>
+                                  <span className="font-medium text-foreground">
+                                    {formatQuotaLimit(keyRow, t)}
+                                  </span>
                                 </div>
                                 {keyRow.quota_limit > 0 ? (
-                                  <div className="h-1.5 w-28 overflow-hidden rounded-full bg-muted">
-                                    <div
-                                      className="h-full rounded-full bg-primary"
-                                      style={{
-                                        width: `${Math.min(100, Math.max(0, (keyRow.quota_used / keyRow.quota_limit) * 100))}%`,
-                                      }}
-                                    />
-                                  </div>
-                                ) : null}
-                                {keyRow.total_used > 0 ? (
-                                  <div className="text-[11px] text-muted-foreground">
-                                    {t("apiKeys.totalUsedLabel", { amount: formatUSD(keyRow.total_used) })}
-                                    {keyRow.reset_count > 0 ? (
-                                      <span className="ml-1.5">
-                                        ({t("apiKeys.resetCountLabel", { count: keyRow.reset_count })})
-                                      </span>
-                                    ) : null}
-                                  </div>
+                                  <UsageBar
+                                    used={keyRow.quota_used}
+                                    limit={keyRow.quota_limit}
+                                    className="mt-1.5"
+                                  />
                                 ) : null}
                                 {keyRow.window_usage && keyRow.limits ? (
-                                  <WindowCostBars limits={keyRow.limits} usage={keyRow.window_usage} />
+                                  <WindowCostBars
+                                    limits={keyRow.limits}
+                                    usage={keyRow.window_usage}
+                                  />
                                 ) : null}
                               </div>
-                            </TableCell>
-                            <TableCell className="text-muted-foreground">
-                              {formatExpiration(keyRow, t)}
-                            </TableCell>
-                            <TableCell className="text-muted-foreground">
-                              {formatRelativeTime(keyRow.created_at, {
-                                variant: "compact",
-                              })}
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex justify-end gap-1.5">
-                                {keyRow.quota_limit > 0 ? (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled={resettingIds.has(keyRow.id)}
-                                    onClick={() =>
-                                      void handleResetQuota(keyRow)
-                                    }
-                                    title={t("apiKeys.resetQuota")}
-                                  >
-                                    <RotateCcw className="size-3.5" />
-                                    {t("apiKeys.resetQuota")}
-                                  </Button>
-                                ) : null}
+                            </div>
+
+                            <div className="mt-3 flex flex-wrap gap-1.5">
+                              {keyRow.quota_limit > 0 ? (
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  onClick={() => startEditing(keyRow)}
+                                  disabled={resettingIds.has(keyRow.id)}
+                                  onClick={() => void handleResetQuota(keyRow)}
+                                  className="min-w-[7rem] flex-1"
                                 >
-                                  <Pencil className="size-3.5" />
-                                  {t("apiKeys.editKey")}
+                                  {resettingIds.has(keyRow.id) ? (
+                                    <Loader2 className="size-3.5 animate-spin" />
+                                  ) : (
+                                    <RotateCcw className="size-3.5" />
+                                  )}
+                                  {t("apiKeys.resetQuota")}
                                 </Button>
-                                <Button
-                                  variant="destructive"
-                                  size="sm"
-                                  disabled={deletingIds.has(keyRow.id)}
-                                  onClick={() =>
-                                    void handleDeleteKey(keyRow.id)
-                                  }
-                                >
+                              ) : null}
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={isBusy}
+                                onClick={() => startEditing(keyRow)}
+                                className="min-w-[6rem] flex-1"
+                              >
+                                <Pencil className="size-3.5" />
+                                {t("apiKeys.editKey")}
+                              </Button>
+                              <Button
+                                variant="destructive"
+                                size="sm"
+                                disabled={deletingIds.has(keyRow.id)}
+                                onClick={() => void handleDeleteKey(keyRow.id)}
+                                className="min-w-[6rem] flex-1"
+                              >
+                                {deletingIds.has(keyRow.id) ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
                                   <Trash2 className="size-3.5" />
-                                  {t("common.delete")}
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
+                                )}
+                                {t("common.delete")}
+                              </Button>
+                            </div>
+                          </div>
                         );
                       })}
-                    </TableBody>
-                  </Table>
-                </div>
+                    </div>
+
+                    {/* Desktop table */}
+                    <div className="data-table-shell hidden lg:block">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead>{t("common.name")}</TableHead>
+                            <TableHead>{t("apiKeys.keyColumn")}</TableHead>
+                            <TableHead>{t("apiKeys.allowedGroups")}</TableHead>
+                            <TableHead>{t("apiKeys.quotaColumn")}</TableHead>
+                            <TableHead>{t("apiKeys.lastUsedColumn")}</TableHead>
+                            <TableHead>{t("apiKeys.expiresColumn")}</TableHead>
+                            <TableHead className="text-right">
+                              {t("common.actions")}
+                            </TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {filteredKeys.map((keyRow) => {
+                            const isVisible = visibleKeys.has(keyRow.id);
+                            const isNew = createdKeyId === keyRow.id;
+                            const isBusy =
+                              deletingIds.has(keyRow.id) ||
+                              resettingIds.has(keyRow.id);
+                            const displayKey = isVisible
+                              ? keyRow.raw_key || keyRow.key
+                              : keyRow.key;
+                            const copyValue = keyRow.raw_key || keyRow.key;
+                            return (
+                              <TableRow
+                                key={keyRow.id}
+                                className={cn(
+                                  isNew && "bg-[hsl(var(--success-bg))]",
+                                  isBusy && "opacity-70",
+                                )}
+                              >
+                                <TableCell className="font-medium text-foreground">
+                                  <div className="flex min-w-[140px] flex-col gap-1.5">
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <span className="truncate">
+                                        {keyRow.name}
+                                      </span>
+                                      {isNew ? (
+                                        <Badge
+                                          variant="outline"
+                                          className="border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]"
+                                        >
+                                          {t("apiKeys.newBadge")}
+                                        </Badge>
+                                      ) : null}
+                                      {isBusy ? (
+                                        <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                                      ) : null}
+                                    </div>
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <KeyStatusBadge
+                                        status={getAPIKeyStatus(keyRow)}
+                                        t={t}
+                                      />
+                                      <KeyChannelBadge keyRow={keyRow} t={t} />
+                                      <KeyScopeBudgetBadge
+                                        items={scopeSummary[String(keyRow.id)]}
+                                        t={t}
+                                      />
+                                    </div>
+                                  </div>
+                                </TableCell>
+                                <TableCell>
+                                  <div className="flex min-w-[240px] items-center gap-1">
+                                    <code
+                                      className="min-w-0 max-w-[360px] truncate rounded-md bg-muted/70 px-2 py-1 font-mono text-[12px] tabular-nums text-foreground"
+                                      title={displayKey}
+                                    >
+                                      {displayKey}
+                                    </code>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-xs"
+                                      disabled={!keyRow.raw_key}
+                                      onClick={() => toggleVisible(keyRow.id)}
+                                      title={
+                                        isVisible
+                                          ? t("apiKeys.hideKey")
+                                          : t("apiKeys.showKey")
+                                      }
+                                    >
+                                      {isVisible ? (
+                                        <EyeOff className="size-3.5" />
+                                      ) : (
+                                        <Eye className="size-3.5" />
+                                      )}
+                                    </Button>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-xs"
+                                      onClick={() =>
+                                        void handleCopy(copyValue)
+                                      }
+                                      title={t("common.copy")}
+                                    >
+                                      <Copy className="size-3.5" />
+                                    </Button>
+                                  </div>
+                                </TableCell>
+                                <TableCell className="min-w-[160px]">
+                                  <AllowedGroupsDisplay
+                                    ids={keyRow.allowed_group_ids ?? []}
+                                    groups={groups}
+                                    t={t}
+                                  />
+                                </TableCell>
+                                <TableCell className="min-w-[160px] text-sm text-muted-foreground">
+                                  <div className="space-y-1">
+                                    <div className="font-medium text-foreground">
+                                      {formatQuotaLimit(keyRow, t)}
+                                    </div>
+                                    {keyRow.quota_limit > 0 ? (
+                                      <UsageBar
+                                        used={keyRow.quota_used}
+                                        limit={keyRow.quota_limit}
+                                        className="w-28"
+                                        showPercent
+                                      />
+                                    ) : null}
+                                    {keyRow.total_used > 0 ? (
+                                      <div className="text-[11px] text-muted-foreground">
+                                        {t("apiKeys.totalUsedLabel", {
+                                          amount: formatUSD(keyRow.total_used),
+                                        })}
+                                        {keyRow.reset_count > 0 ? (
+                                          <span className="ml-1.5">
+                                            (
+                                            {t("apiKeys.resetCountLabel", {
+                                              count: keyRow.reset_count,
+                                            })}
+                                            )
+                                          </span>
+                                        ) : null}
+                                      </div>
+                                    ) : null}
+                                    {keyRow.window_usage && keyRow.limits ? (
+                                      <WindowCostBars
+                                        limits={keyRow.limits}
+                                        usage={keyRow.window_usage}
+                                      />
+                                    ) : null}
+                                  </div>
+                                </TableCell>
+                                <TableCell className="whitespace-nowrap text-muted-foreground">
+                                  <div className="flex flex-col gap-0.5">
+                                    <span>{formatLastUsed(keyRow, t)}</span>
+                                    <span className="text-[11px] text-muted-foreground/80">
+                                      {t("apiKeys.createdLabel")}:{" "}
+                                      {formatRelativeTime(keyRow.created_at, {
+                                        variant: "compact",
+                                      })}
+                                    </span>
+                                  </div>
+                                </TableCell>
+                                <TableCell className="text-muted-foreground">
+                                  {formatExpiration(keyRow, t)}
+                                </TableCell>
+                                <TableCell>
+                                  <div className="flex flex-wrap items-center justify-end gap-1.5">
+                                    {keyRow.quota_limit > 0 ? (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        disabled={resettingIds.has(keyRow.id)}
+                                        onClick={() =>
+                                          void handleResetQuota(keyRow)
+                                        }
+                                        title={t("apiKeys.resetQuota")}
+                                      >
+                                        {resettingIds.has(keyRow.id) ? (
+                                          <Loader2 className="size-3.5 animate-spin" />
+                                        ) : (
+                                          <RotateCcw className="size-3.5" />
+                                        )}
+                                        {t("apiKeys.resetQuota")}
+                                      </Button>
+                                    ) : null}
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={isBusy}
+                                      onClick={() => startEditing(keyRow)}
+                                      title={t("apiKeys.editKey")}
+                                    >
+                                      <Pencil className="size-3.5" />
+                                      {t("apiKeys.editKey")}
+                                    </Button>
+                                    <Button
+                                      variant="destructive"
+                                      size="sm"
+                                      disabled={deletingIds.has(keyRow.id)}
+                                      onClick={() =>
+                                        void handleDeleteKey(keyRow.id)
+                                      }
+                                      title={t("common.delete")}
+                                    >
+                                      {deletingIds.has(keyRow.id) ? (
+                                        <Loader2 className="size-3.5 animate-spin" />
+                                      ) : (
+                                        <Trash2 className="size-3.5" />
+                                      )}
+                                      {t("common.delete")}
+                                    </Button>
+                                  </div>
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  </>
+                )}
               </StateShell>
-            </CardContent>
-          </Card>
+
+              <div className="overflow-hidden rounded-xl border border-border bg-card/85 shadow-sm">
+                <button
+                  type="button"
+                  onClick={() => setSettingsOpen((open) => !open)}
+                  className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/30"
+                >
+                  <div className="flex min-w-0 items-center gap-3">
+                    <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                      <LockKeyhole className="size-3.5" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-foreground">
+                        {t("apiKeys.securityTitle")}
+                      </div>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                        <span>
+                          {keys.length > 0
+                            ? t("apiKeys.authEnabled")
+                            : t("apiKeys.authDisabled")}
+                        </span>
+                        <span className="text-border">·</span>
+                        <Badge
+                          variant={
+                            publicUsagePageEnabled ? "secondary" : "outline"
+                          }
+                          className={
+                            publicUsagePageEnabled
+                              ? "text-[hsl(var(--success))]"
+                              : "text-muted-foreground"
+                          }
+                        >
+                          {publicUsagePageEnabled
+                            ? t("apiKeys.publicUsageEnabled")
+                            : t("apiKeys.publicUsageDisabled")}
+                        </Badge>
+                      </div>
+                    </div>
+                  </div>
+                  <ChevronDown
+                    className={cn(
+                      "size-4 shrink-0 text-muted-foreground transition-transform",
+                      settingsOpen && "rotate-180",
+                    )}
+                  />
+                </button>
+                {settingsOpen ? (
+                  <div className="space-y-3 border-t border-border px-4 py-3">
+                    <p className="text-sm leading-relaxed text-muted-foreground">
+                      {t("apiKeys.keyAuthNote")}
+                    </p>
+                    <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("apiKeys.publicUsageTitle")}
+                        </div>
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          {t("apiKeys.publicUsageDesc")}
+                        </p>
+                        {publicUsagePageEnabled ? (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <code
+                              className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
+                              title={keyUsageUrl}
+                            >
+                              {keyUsageUrl}
+                            </code>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              onClick={() => void handleCopy(keyUsageUrl)}
+                              title={t("apiKeys.publicUsageCopyUrl")}
+                            >
+                              <Copy className="size-3.5" />
+                            </Button>
+                            <a
+                              href={keyUsageUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                            >
+                              <ExternalLink className="size-3.5" />
+                              {t("apiKeys.publicUsageOpen")}
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+                      <Button
+                        variant={
+                          publicUsagePageEnabled ? "outline" : "default"
+                        }
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => void handleTogglePublicUsagePage()}
+                        disabled={savingPublicUsagePage}
+                      >
+                        {publicUsagePageEnabled ? (
+                          <EyeOff className="size-3.5" />
+                        ) : (
+                          <Eye className="size-3.5" />
+                        )}
+                        {savingPublicUsagePage
+                          ? t("common.saving")
+                          : publicUsagePageEnabled
+                            ? t("apiKeys.disablePublicUsage")
+                            : t("apiKeys.enablePublicUsage")}
+                      </Button>
+                    </div>
+                    <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("apiKeys.publicImageStudioTitle")}
+                        </div>
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          {t("apiKeys.publicImageStudioDesc")}
+                        </p>
+                        {publicImageStudioPageEnabled ? (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <code
+                              className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
+                              title={imageStudioUrl}
+                            >
+                              {imageStudioUrl}
+                            </code>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              onClick={() => void handleCopy(imageStudioUrl)}
+                              title={t("apiKeys.publicUsageCopyUrl")}
+                            >
+                              <Copy className="size-3.5" />
+                            </Button>
+                            <a
+                              href={imageStudioUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                            >
+                              <ExternalLink className="size-3.5" />
+                              {t("apiKeys.publicUsageOpen")}
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+                      <Button
+                        variant={
+                          publicImageStudioPageEnabled ? "outline" : "default"
+                        }
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => void handleTogglePublicImageStudioPage()}
+                        disabled={savingPublicImageStudioPage}
+                      >
+                        {publicImageStudioPageEnabled ? (
+                          <EyeOff className="size-3.5" />
+                        ) : (
+                          <Eye className="size-3.5" />
+                        )}
+                        {savingPublicImageStudioPage
+                          ? t("common.saving")
+                          : publicImageStudioPageEnabled
+                            ? t("apiKeys.disablePublicImageStudio")
+                            : t("apiKeys.enablePublicImageStudio")}
+                      </Button>
+                    </div>
+                    <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("apiKeys.publicAccountPortalTitle")}
+                        </div>
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          {t("apiKeys.publicAccountPortalDesc")}
+                        </p>
+                        {publicAccountPortalPageEnabled ? (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <code
+                              className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
+                              title={accountPortalUrl}
+                            >
+                              {accountPortalUrl}
+                            </code>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              onClick={() => void handleCopy(accountPortalUrl)}
+                              title={t("apiKeys.publicUsageCopyUrl")}
+                            >
+                              <Copy className="size-3.5" />
+                            </Button>
+                            <a
+                              href={accountPortalUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                            >
+                              <ExternalLink className="size-3.5" />
+                              {t("apiKeys.publicUsageOpen")}
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+                      <Button
+                        variant={
+                          publicAccountPortalPageEnabled ? "outline" : "default"
+                        }
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => void handleTogglePublicAccountPortalPage()}
+                        disabled={savingPublicAccountPortalPage}
+                      >
+                        {publicAccountPortalPageEnabled ? (
+                          <EyeOff className="size-3.5" />
+                        ) : (
+                          <Eye className="size-3.5" />
+                        )}
+                        {savingPublicAccountPortalPage
+                          ? t("common.saving")
+                          : publicAccountPortalPageEnabled
+                            ? t("apiKeys.disablePublicAccountPortal")
+                            : t("apiKeys.enablePublicAccountPortal")}
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </>
           )}
 
           {activeTab === "token-usage" && (
             <Card>
               <CardContent className="p-3 sm:p-4">
-                <APIKeyTokenUsagePanel />
+                <APIKeyTokenUsagePanel
+                  showFullUsageNumbers={
+                    data.settings?.show_full_usage_numbers ?? false
+                  }
+                />
               </CardContent>
             </Card>
           )}
-
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex min-w-0 items-start gap-3">
-                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                  <LockKeyhole className="size-4" />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-foreground">
-                    {t("apiKeys.securityTitle")}
-                  </div>
-                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                    {t("apiKeys.keyAuthNote")}
-                  </p>
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                    <Badge
-                      variant={publicUsagePageEnabled ? "secondary" : "outline"}
-                      className={publicUsagePageEnabled ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground"}
-                    >
-                      {publicUsagePageEnabled
-                        ? t("apiKeys.publicUsageEnabled")
-                        : t("apiKeys.publicUsageDisabled")}
-                    </Badge>
-                    <span className="text-xs text-muted-foreground">
-                      {t("apiKeys.publicUsageDesc")}
-                    </span>
-                  </div>
-                  {publicUsagePageEnabled ? (
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <span className="text-xs font-semibold text-muted-foreground">
-                        {t("apiKeys.publicUsageUrlLabel")}
-                      </span>
-                      <code
-                        className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
-                        title={keyUsageUrl}
-                      >
-                        {keyUsageUrl}
-                      </code>
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        onClick={() => void handleCopy(keyUsageUrl)}
-                        title={t("apiKeys.publicUsageCopyUrl")}
-                      >
-                        <Copy className="size-3.5" />
-                      </Button>
-                      <a
-                        href={keyUsageUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
-                      >
-                        <ExternalLink className="size-3.5" />
-                        {t("apiKeys.publicUsageOpen")}
-                      </a>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-              <div className="flex shrink-0 flex-wrap items-center gap-2">
-                <Button
-                  variant={publicUsagePageEnabled ? "outline" : "default"}
-                  onClick={() => void handleTogglePublicUsagePage()}
-                  disabled={savingPublicUsagePage}
-                >
-                  {publicUsagePageEnabled ? (
-                    <EyeOff className="size-3.5" />
-                  ) : (
-                    <Eye className="size-3.5" />
-                  )}
-                  {savingPublicUsagePage
-                    ? t("common.saving")
-                    : publicUsagePageEnabled
-                      ? t("apiKeys.disablePublicUsage")
-                      : t("apiKeys.enablePublicUsage")}
-                </Button>
-                <Button
-                  variant="outline"
-                  onClick={() => setCreateDialogOpen(true)}
-                >
-                  <Plus className="size-3.5" />
-                  {t("apiKeys.createKey")}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
         </div>
 
         <Modal
@@ -888,6 +1919,21 @@ export default function APIKeys() {
                 />
               </FormField>
             </div>
+
+            <FormField
+              label={t("apiKeys.limits.upstreamChannel")}
+              icon={<Waypoints className="size-3.5" />}
+              as="div"
+            >
+              <UpstreamChannelPicker
+                value={createForm.limits.upstreamChannel}
+                onChange={(upstreamChannel) =>
+                  updateCreateForm({
+                    limits: { ...createForm.limits, upstreamChannel },
+                  })
+                }
+              />
+            </FormField>
 
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
@@ -956,7 +2002,11 @@ export default function APIKeys() {
             <LimitsEditor
               value={createForm.limits}
               onChange={(limits) => updateCreateForm({ limits })}
-              modelOptions={modelOptions}
+              modelOptions={modelOptionsForChannel(
+                createForm.limits.upstreamChannel,
+              )}
+              groups={groups}
+              allowedGroupIds={createForm.allowedGroupIds}
             />
           </form>
         </Modal>
@@ -964,14 +2014,14 @@ export default function APIKeys() {
         <Modal
           show={Boolean(editingKey)}
           title={t("apiKeys.editTitle")}
-          onClose={closeEditDialog}
+          onClose={() => void closeEditDialog()}
           contentClassName="sm:max-w-[640px]"
           footer={
             <>
               <Button
                 type="button"
                 variant="outline"
-                onClick={closeEditDialog}
+                onClick={() => void closeEditDialog()}
                 disabled={saving}
               >
                 {t("common.cancel")}
@@ -979,8 +2029,11 @@ export default function APIKeys() {
               <Button
                 type="submit"
                 form="edit-api-key-form"
-                disabled={saving || !editForm.name.trim()}
+                disabled={saving || !editForm.name.trim() || !editDirty}
               >
+                {saving ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : null}
                 {saving ? t("common.saving") : t("common.save")}
               </Button>
             </>
@@ -1062,6 +2115,21 @@ export default function APIKeys() {
                     </FormField>
                   </div>
 
+                  <FormField
+                    label={t("apiKeys.limits.upstreamChannel")}
+                    icon={<Waypoints className="size-3.5" />}
+                    as="div"
+                  >
+                    <UpstreamChannelPicker
+                      value={editForm.limits.upstreamChannel}
+                      onChange={(upstreamChannel) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, upstreamChannel },
+                        })
+                      }
+                    />
+                  </FormField>
+
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField
                       label={t("apiKeys.expireModeLabel")}
@@ -1118,16 +2186,124 @@ export default function APIKeys() {
                       {t("apiKeys.allowedGroupsHint")}
                     </p>
                   </FormField>
+
+                  <FormField
+                    label={t("apiKeys.noAffinityGroupsLabel")}
+                    icon={<Waypoints className="size-3.5" />}
+                    as="div"
+                  >
+                    <GroupMultiSelect
+                      groups={groups}
+                      value={editForm.limits.noAffinityGroupIds}
+                      onChange={(noAffinityGroupIds) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, noAffinityGroupIds },
+                        })
+                      }
+                      allLabel={t("apiKeys.noAffinityGroupsDisabled")}
+                      placeholder={t("apiKeys.noAffinityGroupsPlaceholder")}
+                      emptyLabel={t("accounts.groupsNone")}
+                    />
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {t("apiKeys.noAffinityGroupsHint")}
+                    </p>
+                  </FormField>
                 </>
               ) : (
                 <LimitsEditor
                   value={editForm.limits}
                   onChange={(limits) => updateEditForm({ limits })}
-                  modelOptions={modelOptions}
+                  modelOptions={modelOptionsForChannel(
+                    editForm.limits.upstreamChannel,
+                  )}
+                  groups={groups}
+                  scopeUsage={scopeUsage}
+                  allowedGroupIds={editForm.allowedGroupIds}
+                  onResetQuota={resetScopeQuota}
                   expanded
                 />
               )}
             </form>
+          ) : null}
+        </Modal>
+
+        <Modal
+          show={Boolean(createdReveal)}
+          title={t("apiKeys.createdRevealTitle")}
+          onClose={closeCreatedReveal}
+          contentClassName="sm:max-w-[560px]"
+          footer={
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  if (createdReveal) void handleCopy(createdReveal.key);
+                }}
+              >
+                <Copy className="size-3.5" />
+                {t("common.copy")}
+              </Button>
+              <Button
+                type="button"
+                onClick={closeCreatedReveal}
+                disabled={!createdRevealAck}
+              >
+                <Check className="size-3.5" />
+                {t("apiKeys.createdRevealDone")}
+              </Button>
+            </>
+          }
+        >
+          {createdReveal ? (
+            <div className="space-y-4">
+              <div className="flex items-start gap-3 rounded-xl border border-[hsl(var(--warning))]/25 bg-[hsl(var(--warning-bg))] p-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-[hsl(var(--warning))]/15 text-[hsl(var(--warning))]">
+                  <ShieldAlert className="size-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-foreground">
+                    {t("apiKeys.createdRevealWarnTitle")}
+                  </div>
+                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                    {t("apiKeys.createdRevealWarnDesc")}
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="text-xs font-semibold text-muted-foreground">
+                  {createdReveal.name}
+                </div>
+                <div className="flex items-center gap-2">
+                  <code className="min-w-0 flex-1 break-all rounded-xl border border-border bg-muted/50 px-3 py-2.5 font-mono text-[13px] leading-relaxed text-foreground">
+                    {createdReveal.key}
+                  </code>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => void handleCopy(createdReveal.key)}
+                    title={t("common.copy")}
+                  >
+                    <Copy className="size-4" />
+                  </Button>
+                </div>
+              </div>
+
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-border bg-card px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 size-4 rounded border-border accent-primary"
+                  checked={createdRevealAck}
+                  onChange={(event) =>
+                    setCreatedRevealAck(event.target.checked)
+                  }
+                />
+                <span className="text-sm leading-relaxed text-foreground">
+                  {t("apiKeys.createdRevealAck")}
+                </span>
+              </label>
+            </div>
           ) : null}
         </Modal>
 
@@ -1181,6 +2357,9 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
     planAllow: Array.isArray(limits.plan_allow) ? limits.plan_allow : [],
+    noAffinityGroupIds: Array.isArray(limits.no_affinity_group_ids)
+      ? limits.no_affinity_group_ids
+      : [],
     rpm: limits.rpm && limits.rpm > 0 ? String(limits.rpm) : "",
     rpd: limits.rpd && limits.rpd > 0 ? String(limits.rpd) : "",
     maxConcurrency:
@@ -1205,7 +2384,136 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimit7dUnit: token7d.unit,
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
+    imageGenerationPolicy: resolveImageGenerationPolicy(limits),
+    upstreamChannel:
+      limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
+        ? limits.upstream_channel
+        : "auto",
+    scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
   };
+}
+
+// scopeLimitsFromAPIKey 把后端的 scope 限额数组转成表单行。0 值统一还原成空串,
+// 保证「保存后再打开」不会把未配置的项显示成 0。
+function scopeLimitsFromAPIKey(
+  scopes: APIKeyScopeLimit[] | undefined,
+): ScopeLimitFormState[] {
+  if (!Array.isArray(scopes)) return [];
+  const numToInput = (value?: number) =>
+    value && value > 0 ? String(value) : "";
+  return scopes.map((scope) => ({
+    scopeType: scope.scope_type === "account" ? "account" : "group",
+    scopeId: scope.scope_id > 0 ? String(scope.scope_id) : "",
+    onExhausted: scope.on_exhausted === "reject" ? "reject" : "skip",
+    cost5h: numToInput(scope.cost_5h),
+    cost1d: numToInput(scope.cost_1d),
+    cost7d: numToInput(scope.cost_7d),
+    cost30d: numToInput(scope.cost_30d),
+    token5h: numToInput(scope.token_5h),
+    token1d: numToInput(scope.token_1d),
+    token7d: numToInput(scope.token_7d),
+    token30d: numToInput(scope.token_30d),
+    requests1d: numToInput(scope.requests_1d),
+    maxConcurrency: numToInput(scope.max_concurrency),
+    quotaCost: numToInput(scope.quota_cost),
+    quotaTokens: numToInput(scope.quota_tokens),
+    quotaRequests: numToInput(scope.quota_requests),
+  }));
+}
+
+// scopeLimitRowHasLimit 判断一行是否配了至少一个上限。没配上限的行不会被提交,
+// 后端也会丢弃(避免白白多跑一次窗口聚合查询)。
+function scopeLimitRowHasLimit(row: ScopeLimitFormState): boolean {
+  return [
+    row.cost5h,
+    row.cost1d,
+    row.cost7d,
+    row.cost30d,
+    row.token5h,
+    row.token1d,
+    row.token7d,
+    row.token30d,
+    row.requests1d,
+    row.maxConcurrency,
+    row.quotaCost,
+    row.quotaTokens,
+    row.quotaRequests,
+  ].some((value) => Number(value.trim()) > 0);
+}
+
+// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
+// 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
+function UpstreamChannelPicker({
+  value,
+  onChange,
+}: {
+  value: UpstreamChannel;
+  onChange: (next: UpstreamChannel) => void;
+}) {
+  const { t } = useTranslation();
+  const options: Array<{
+    key: UpstreamChannel;
+    label: string;
+    icon: ReactNode;
+  }> = [
+    {
+      key: "auto",
+      label: t("apiKeys.limits.upstreamChannelAutoTab"),
+      icon: <Waypoints className="size-4 shrink-0" />,
+    },
+    {
+      key: "codex",
+      label: t("apiKeys.limits.upstreamChannelCodex"),
+      icon: <ChannelLogo channel="codex" size={18} />,
+    },
+    {
+      key: "grok",
+      label: t("apiKeys.limits.upstreamChannelGrok"),
+      icon: <ChannelLogo channel="grok" size={18} />,
+    },
+  ];
+  return (
+    <div>
+      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+        {options.map(({ key, label, icon }) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => onChange(key)}
+            aria-pressed={value === key}
+            className={cn(
+              "inline-flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold transition-all",
+              value === key
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground opacity-70 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
+            )}
+          >
+            {icon}
+            <span className="truncate">{label}</span>
+          </button>
+        ))}
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        {t(`apiKeys.limits.upstreamChannelHint.${value}`)}
+      </p>
+    </div>
+  );
+}
+
+// resolveImageGenerationPolicy 统一新旧两种后端配置：显式 image_generation_policy 优先，
+// 未设时旧的 disable_image_generation=true 视为 block，其余为 allow。
+function resolveImageGenerationPolicy(
+  limits: APIKeyLimits,
+): ImageGenerationPolicy {
+  switch (limits.image_generation_policy) {
+    case "strip":
+      return "strip";
+    case "block":
+      return "block";
+    case "allow":
+      return "allow";
+  }
+  return limits.disable_image_generation === true ? "block" : "allow";
 }
 
 function formatTokenLimitForForm(value?: number): {
@@ -1251,6 +2559,7 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
     plan_allow: form.planAllow.map((p) => p.trim()).filter(Boolean),
+    no_affinity_group_ids: form.noAffinityGroupIds,
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
     max_concurrency: intNum(form.maxConcurrency),
@@ -1260,6 +2569,36 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
+    image_generation_policy:
+      form.imageGenerationPolicy === "allow"
+        ? undefined
+        : form.imageGenerationPolicy,
+    // 兼容旧字段：block 时同步置位，其余留空由后端按 policy 归一。
+    disable_image_generation:
+      form.imageGenerationPolicy === "block" || undefined,
+    upstream_channel:
+      form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
+    scope_limits: form.scopeLimits
+      .filter((row) => Number(row.scopeId.trim()) > 0)
+      .filter(scopeLimitRowHasLimit)
+      .map((row) => ({
+        scope_type: row.scopeType,
+        scope_id: Number(row.scopeId.trim()),
+        on_exhausted: row.onExhausted,
+        cost_5h: num(row.cost5h),
+        cost_1d: num(row.cost1d),
+        cost_7d: num(row.cost7d),
+        cost_30d: num(row.cost30d),
+        token_5h: intNum(row.token5h),
+        token_1d: intNum(row.token1d),
+        token_7d: intNum(row.token7d),
+        token_30d: intNum(row.token30d),
+        requests_1d: intNum(row.requests1d),
+        max_concurrency: intNum(row.maxConcurrency),
+        quota_cost: num(row.quotaCost),
+        quota_tokens: intNum(row.quotaTokens),
+        quota_requests: intNum(row.quotaRequests),
+      })),
   };
 }
 
@@ -1271,9 +2610,7 @@ function toDateTimeLocalValue(value?: string | null) {
   return local.toISOString().slice(0, 16);
 }
 
-function getAPIKeyStatus(
-  keyRow: APIKeyRow,
-): "active" | "expired" | "quota_exhausted" {
+function getAPIKeyStatus(keyRow: APIKeyRow): APIKeyStatus {
   if (keyRow.status === "expired" || keyRow.status === "quota_exhausted") {
     return keyRow.status;
   }
@@ -1287,6 +2624,165 @@ function getAPIKeyStatus(
     return "quota_exhausted";
   }
   return "active";
+}
+
+function usageToneClass(pct: number) {
+  if (pct >= 90) return "bg-destructive";
+  if (pct >= 70) return "bg-[hsl(var(--warning))]";
+  return "bg-[hsl(var(--success))]";
+}
+
+function UsageBar({
+  used,
+  limit,
+  className,
+  showPercent = false,
+}: {
+  used: number;
+  limit: number;
+  className?: string;
+  showPercent?: boolean;
+}) {
+  if (!limit || limit <= 0) return null;
+  const pct = Math.min(100, Math.max(0, (used / limit) * 100));
+  return (
+    <div className={cn("space-y-1", className)}>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+        <div
+          className={cn("h-full rounded-full transition-all", usageToneClass(pct))}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      {showPercent ? (
+        <div className="text-[10px] font-medium tabular-nums text-muted-foreground">
+          {pct.toFixed(0)}%
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function KeyStatusBadge({
+  status,
+  t,
+}: {
+  status: APIKeyStatus;
+  t: Translator;
+}) {
+  const config = {
+    active: {
+      dot: "bg-[hsl(var(--success))]",
+      className:
+        "border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]",
+    },
+    expired: {
+      dot: "bg-muted-foreground",
+      className: "border-transparent bg-muted text-muted-foreground",
+    },
+    quota_exhausted: {
+      dot: "bg-destructive",
+      className: "border-transparent bg-destructive/10 text-destructive",
+    },
+  }[status];
+
+  return (
+    <Badge
+      variant="outline"
+      className={cn("gap-1.5 px-1.5 py-0 text-[11px] font-semibold", config.className)}
+    >
+      <span className={cn("size-1.5 rounded-full", config.dot)} />
+      {t(`apiKeys.status.${status}`)}
+    </Badge>
+  );
+}
+
+// KeyScopeBudgetBadge 在列表里展示该 Key 的分组/账号预算状态：有耗尽的就标红并给数量，
+// 否则显示最紧那条的占比。详情（每个窗口、累计额度、命中次数）留在编辑抽屉里。
+function KeyScopeBudgetBadge({
+  items,
+  t,
+}: {
+  items?: APIKeyScopeSummaryItem[];
+  t: Translator;
+}) {
+  if (!items || items.length === 0) return null;
+  const exhausted = items.filter((item) => item.exhausted);
+  if (exhausted.length > 0) {
+    return (
+      <Badge
+        variant="outline"
+        className="gap-1 border-destructive/40 text-[10px] text-destructive"
+        title={exhausted
+          .map((item) => item.scope_name || `#${item.scope_id}`)
+          .join(", ")}
+      >
+        <ShieldAlert className="size-3" />
+        {t("apiKeys.limits.scopeBadgeExhausted", {
+          count: exhausted.length,
+          total: items.length,
+        })}
+      </Badge>
+    );
+  }
+  const tightest = items.reduce(
+    (best, item) => (item.ratio > best.ratio ? item : best),
+    items[0],
+  );
+  return (
+    <Badge variant="outline" className="gap-1 text-[10px] text-muted-foreground">
+      <ShieldCheck className="size-3" />
+      {t("apiKeys.limits.scopeBadgeActive", {
+        percent: Math.min(100, Math.round(tightest.ratio * 100)),
+        window: tightest.window || "-",
+      })}
+    </Badge>
+  );
+}
+
+// KeyChannelBadge 展示该 Key 的上游渠道限定（auto/codex/grok），一眼区分 Key 用途。
+function KeyChannelBadge({
+  keyRow,
+  t,
+}: {
+  keyRow: APIKeyRow;
+  t: Translator;
+}) {
+  const channel = keyRow.limits?.upstream_channel;
+  if (channel === "grok") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelGrok")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="grok" size={12} />
+        Grok
+      </Badge>
+    );
+  }
+  if (channel === "codex") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelCodex")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="codex" size={12} />
+        Codex
+      </Badge>
+    );
+  }
+  // auto：路由图标表示"不限渠道，按模型自动路由"
+  return (
+    <Badge
+      variant="outline"
+      title={t("apiKeys.limits.upstreamChannelHint.auto")}
+      className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-muted-foreground"
+    >
+      <Waypoints className="size-3" />
+      {t("apiKeys.limits.upstreamChannelAutoTab")}
+    </Badge>
+  );
 }
 
 function formatQuotaLimit(keyRow: APIKeyRow, t: Translator) {
@@ -1304,6 +2800,13 @@ function formatExpiration(keyRow: APIKeyRow, t: Translator) {
     return t("apiKeys.neverExpires");
   }
   return formatBeijingTime(keyRow.expires_at);
+}
+
+function formatLastUsed(keyRow: APIKeyRow, t: Translator) {
+  if (!keyRow.last_used_at) {
+    return t("apiKeys.neverUsed");
+  }
+  return formatRelativeTime(keyRow.last_used_at, { variant: "compact" });
 }
 
 function formatUSD(value: number) {
@@ -1328,14 +2831,17 @@ function WindowCostBars({
     bars.push({ label: "7d", used: usage.cost_7d, limit: limits.cost_limit_7d });
   }
   if (limits.cost_limit_30d && limits.cost_limit_30d > 0) {
-    bars.push({ label: "30d", used: usage.cost_30d, limit: limits.cost_limit_30d });
+    bars.push({
+      label: "30d",
+      used: usage.cost_30d,
+      limit: limits.cost_limit_30d,
+    });
   }
   if (bars.length === 0) return null;
   return (
     <div className="mt-1.5 space-y-1">
       {bars.map((bar) => {
         const pct = Math.min(100, Math.max(0, (bar.used / bar.limit) * 100));
-        const isOver = pct >= 100;
         return (
           <div key={bar.label} className="flex items-center gap-1.5">
             <span className="w-6 text-[10px] font-medium text-muted-foreground">
@@ -1343,11 +2849,14 @@ function WindowCostBars({
             </span>
             <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
               <div
-                className={`h-full rounded-full ${isOver ? "bg-destructive" : "bg-primary/70"}`}
+                className={cn(
+                  "h-full rounded-full transition-all",
+                  usageToneClass(pct),
+                )}
                 style={{ width: `${pct}%` }}
               />
             </div>
-            <span className="text-[10px] text-muted-foreground">
+            <span className="text-[10px] tabular-nums text-muted-foreground">
               {formatUSD(bar.used)}/{formatUSD(bar.limit)}
             </span>
           </div>
@@ -1473,17 +2982,28 @@ function GroupMultiSelect({
   );
 }
 
-// LimitsEditor 渲染 API Key 的"高级限制"配置:模型白/黑名单 + 滑动窗口配额。
+// LimitsEditor 渲染 API Key 的"高级限制"配置:模型策略 / 限流 / 成本 / Token 分区卡片。
 // 默认折叠,有任一字段非默认时展开。
 function LimitsEditor({
   value,
   onChange,
   modelOptions,
+  groups,
+  scopeUsage,
+  allowedGroupIds,
+  onResetQuota,
   expanded,
 }: {
   value: LimitsFormState;
   onChange: (next: LimitsFormState) => void;
   modelOptions: string[];
+  groups: AccountGroup[];
+  scopeUsage?: APIKeyScopeUsageItem[];
+  allowedGroupIds: number[];
+  onResetQuota?: (
+    scopeType: "group" | "account",
+    scopeId: number,
+  ) => void | Promise<void>;
   expanded?: boolean;
 }) {
   const { t } = useTranslation();
@@ -1499,7 +3019,9 @@ function LimitsEditor({
     value.costLimit30d !== "" ||
     value.tokenLimit5h !== "" ||
     value.tokenLimit7d !== "" ||
-    value.tokenLimit30d !== "";
+    value.tokenLimit30d !== "" ||
+    value.scopeLimits.length > 0 ||
+    value.imageGenerationPolicy !== "allow";
   const [open, setOpen] = useState(hasAny || !!expanded);
   const tokenUnitOptions = useMemo(
     () =>
@@ -1515,12 +3037,24 @@ function LimitsEditor({
     onChange({ ...value, ...next });
 
   const limitsContent = (
-    <div className={expanded ? "space-y-3" : "space-y-3 border-t border-border p-3"}>
-      <p className="text-[11px] text-muted-foreground">
+    <div
+      className={cn(
+        "space-y-3",
+        expanded ? "" : "border-t border-border p-3",
+      )}
+    >
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
         {t("apiKeys.limits.desc")}
       </p>
-          <div className="space-y-2">
-            <label className="text-xs font-medium">
+
+      <LimitSection
+        icon={<SlidersHorizontal className="size-3.5" />}
+        title={t("apiKeys.limits.sectionModels")}
+        description={t("apiKeys.limits.sectionModelsDesc")}
+      >
+        <div className="space-y-3">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-foreground">
               {t("apiKeys.limits.modelAllow")}
             </label>
             <ChipInput
@@ -1533,8 +3067,8 @@ function LimitsEditor({
               {t("apiKeys.limits.modelAllowHint")}
             </p>
           </div>
-          <div className="space-y-2">
-            <label className="text-xs font-medium">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-foreground">
               {t("apiKeys.limits.modelDeny")}
             </label>
             <ChipInput
@@ -1547,8 +3081,8 @@ function LimitsEditor({
               {t("apiKeys.limits.modelDenyHint")}
             </p>
           </div>
-          <div className="space-y-2">
-            <label className="text-xs font-medium">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-foreground">
               {t("apiKeys.limits.planAllow")}
             </label>
             <PlanMultiSelect
@@ -1560,58 +3094,156 @@ function LimitsEditor({
               {t("apiKeys.limits.planAllowHint")}
             </p>
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <LimitNumberField
-              label={t("apiKeys.limits.rpm")}
-              value={value.rpm}
-              onChange={(rpm) => patch({ rpm })}
-              suffix={t("apiKeys.limits.rpmSuffix")}
+          <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
+            <label className="text-xs font-medium text-foreground">
+              {t("apiKeys.limits.imageGenerationPolicy")}
+            </label>
+            <Select
+              value={value.imageGenerationPolicy}
+              onValueChange={(policy) =>
+                patch({
+                  imageGenerationPolicy: policy as ImageGenerationPolicy,
+                })
+              }
+              options={[
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyAllow"),
+                  value: "allow",
+                },
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyStrip"),
+                  value: "strip",
+                },
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyBlock"),
+                  value: "block",
+                },
+              ]}
             />
-            <LimitNumberField
-              label={t("apiKeys.limits.rpd")}
-              value={value.rpd}
-              onChange={(rpd) => patch({ rpd })}
-              suffix={t("apiKeys.limits.rpdSuffix")}
-            />
-            <LimitNumberField
-              label={t("apiKeys.limits.maxConcurrency")}
-              value={value.maxConcurrency}
-              onChange={(maxConcurrency) => patch({ maxConcurrency })}
-              suffix={t("apiKeys.limits.concurrencySuffix")}
-            />
-            <LimitNumberField
-              label={t("apiKeys.limits.cost5h")}
-              value={value.costLimit5h}
-              onChange={(costLimit5h) => patch({ costLimit5h })}
-              suffix="$"
-              step="0.01"
-            />
-            <LimitNumberField
-              label={t("apiKeys.limits.cost7d")}
-              value={value.costLimit7d}
-              onChange={(costLimit7d) => patch({ costLimit7d })}
-              suffix="$"
-              step="0.01"
-            />
-            <LimitNumberField
-              label={t("apiKeys.limits.cost30d")}
-              value={value.costLimit30d}
-              onChange={(costLimit30d) => patch({ costLimit30d })}
-              suffix="$"
-              step="0.01"
-            />
+            <p className="text-[10px] text-muted-foreground">
+              {t(
+                `apiKeys.limits.imageGenerationPolicyHint.${value.imageGenerationPolicy}`,
+              )}
+            </p>
           </div>
         </div>
-    );
+      </LimitSection>
+
+      <LimitSection
+        icon={<Gauge className="size-3.5" />}
+        title={t("apiKeys.limits.sectionRate")}
+        description={t("apiKeys.limits.sectionRateDesc")}
+      >
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <LimitNumberField
+            label={t("apiKeys.limits.rpm")}
+            value={value.rpm}
+            onChange={(rpm) => patch({ rpm })}
+            suffix={t("apiKeys.limits.rpmSuffix")}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.rpd")}
+            value={value.rpd}
+            onChange={(rpd) => patch({ rpd })}
+            suffix={t("apiKeys.limits.rpdSuffix")}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.maxConcurrency")}
+            value={value.maxConcurrency}
+            onChange={(maxConcurrency) => patch({ maxConcurrency })}
+            suffix={t("apiKeys.limits.concurrencySuffix")}
+          />
+        </div>
+      </LimitSection>
+
+      <LimitSection
+        icon={<CircleDollarSign className="size-3.5" />}
+        title={t("apiKeys.limits.sectionCost")}
+        description={t("apiKeys.limits.sectionCostDesc")}
+      >
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <LimitNumberField
+            label={t("apiKeys.limits.cost5h")}
+            value={value.costLimit5h}
+            onChange={(costLimit5h) => patch({ costLimit5h })}
+            suffix="$"
+            step="0.01"
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.cost7d")}
+            value={value.costLimit7d}
+            onChange={(costLimit7d) => patch({ costLimit7d })}
+            suffix="$"
+            step="0.01"
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.cost30d")}
+            value={value.costLimit30d}
+            onChange={(costLimit30d) => patch({ costLimit30d })}
+            suffix="$"
+            step="0.01"
+          />
+        </div>
+      </LimitSection>
+
+      <LimitSection
+        icon={<KeyRound className="size-3.5" />}
+        title={t("apiKeys.limits.sectionTokens")}
+        description={t("apiKeys.limits.sectionTokensDesc")}
+      >
+        <div className="grid grid-cols-1 gap-3">
+          <TokenLimitField
+            label={t("apiKeys.limits.tokens5h")}
+            value={value.tokenLimit5h}
+            unit={value.tokenLimit5hUnit}
+            unitOptions={tokenUnitOptions}
+            onValueChange={(tokenLimit5h) => patch({ tokenLimit5h })}
+            onUnitChange={(tokenLimit5hUnit) => patch({ tokenLimit5hUnit })}
+          />
+          <TokenLimitField
+            label={t("apiKeys.limits.tokens7d")}
+            value={value.tokenLimit7d}
+            unit={value.tokenLimit7dUnit}
+            unitOptions={tokenUnitOptions}
+            onValueChange={(tokenLimit7d) => patch({ tokenLimit7d })}
+            onUnitChange={(tokenLimit7dUnit) => patch({ tokenLimit7dUnit })}
+          />
+          <TokenLimitField
+            label={t("apiKeys.limits.tokens30d")}
+            value={value.tokenLimit30d}
+            unit={value.tokenLimit30dUnit}
+            unitOptions={tokenUnitOptions}
+            onValueChange={(tokenLimit30d) => patch({ tokenLimit30d })}
+            onUnitChange={(tokenLimit30dUnit) => patch({ tokenLimit30dUnit })}
+          />
+        </div>
+      </LimitSection>
+
+      <LimitSection
+        icon={<ShieldCheck className="size-3.5" />}
+        title={t("apiKeys.limits.sectionScope")}
+        description={t("apiKeys.limits.sectionScopeDesc")}
+      >
+        <ScopeLimitsEditor
+          value={value.scopeLimits}
+          onChange={(scopeLimits) => patch({ scopeLimits })}
+          groups={groups}
+          scopeUsage={scopeUsage}
+          allowedGroupIds={allowedGroupIds}
+          onResetQuota={onResetQuota}
+        />
+      </LimitSection>
+    </div>
+  );
 
   if (expanded) return limitsContent;
 
   return (
-    <div className="rounded-lg border border-border">
+    <div className="overflow-hidden rounded-xl border border-border">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between px-3 py-2.5 text-left text-sm font-medium hover:bg-muted/30 transition-colors"
+        className="flex w-full items-center justify-between px-3 py-2.5 text-left text-sm font-medium transition-colors hover:bg-muted/30"
       >
         <span className="flex items-center gap-2">
           <span>{t("apiKeys.limits.title")}</span>
@@ -1626,6 +3258,105 @@ function LimitsEditor({
         </span>
       </button>
       {open && limitsContent}
+    </div>
+  );
+}
+
+function LimitSection({
+  icon,
+  title,
+  description,
+  children,
+}: {
+  icon: ReactNode;
+  title: string;
+  description: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="rounded-xl border border-border/80 bg-muted/15 p-3">
+      <div className="mb-3 flex items-start gap-2.5">
+        <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-background text-primary shadow-sm ring-1 ring-border/70">
+          {icon}
+        </div>
+        <div className="min-w-0">
+          <div className="text-xs font-semibold uppercase tracking-wide text-foreground">
+            {title}
+          </div>
+          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+            {description}
+          </p>
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function APIKeysSkeleton() {
+  return (
+    <div className="space-y-4" aria-busy="true" aria-live="polite">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div className="space-y-2">
+          <div className="h-8 w-40 animate-pulse rounded-lg bg-muted" />
+          <div className="h-4 w-72 max-w-full animate-pulse rounded-md bg-muted/70" />
+        </div>
+        <div className="flex gap-2">
+          <div className="h-8 w-20 animate-pulse rounded-lg bg-muted" />
+          <div className="h-8 w-28 animate-pulse rounded-lg bg-muted" />
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+        {[0, 1, 2, 3].map((i) => (
+          <Card key={i} className="py-0">
+            <CardContent className="space-y-3 p-4">
+              <div className="h-3 w-16 animate-pulse rounded bg-muted" />
+              <div className="h-7 w-12 animate-pulse rounded bg-muted" />
+              <div className="h-3 w-24 animate-pulse rounded bg-muted/70" />
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+      <div className="h-9 w-52 animate-pulse rounded-xl bg-muted/60" />
+      <div className="toolbar-surface space-y-2.5">
+        <div className="flex gap-2">
+          {[0, 1, 2, 3, 4].map((i) => (
+            <div
+              key={i}
+              className="h-7 w-16 animate-pulse rounded-lg bg-muted"
+            />
+          ))}
+        </div>
+        <div className="h-8 w-full max-w-sm animate-pulse rounded-lg bg-muted/70" />
+      </div>
+      <div className="data-table-shell hidden overflow-hidden lg:block">
+        <div className="space-y-0">
+          {[0, 1, 2, 3, 4, 5].map((i) => (
+            <div
+              key={i}
+              className="flex items-center gap-4 border-b border-border/70 px-4 py-3.5 last:border-b-0"
+            >
+              <div className="h-4 w-28 animate-pulse rounded bg-muted" />
+              <div className="h-4 w-40 animate-pulse rounded bg-muted/70" />
+              <div className="h-4 w-20 animate-pulse rounded bg-muted/60" />
+              <div className="h-4 w-24 animate-pulse rounded bg-muted/50" />
+              <div className="ml-auto h-4 w-16 animate-pulse rounded bg-muted/40" />
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="grid gap-3 lg:hidden">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="space-y-3 rounded-2xl border border-border/80 bg-card p-3.5"
+          >
+            <div className="h-4 w-32 animate-pulse rounded bg-muted" />
+            <div className="h-8 w-full animate-pulse rounded-lg bg-muted/70" />
+            <div className="h-12 w-full animate-pulse rounded-xl bg-muted/50" />
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1735,6 +3466,413 @@ function TokenLimitField({
   );
 }
 
+// ScopeLimitsEditor 编辑「该 Key × 某分组/账号」的用量预算（issue #439）。
+// 每张卡片一个 scope：先选分组（或填账号 ID），再填窗口上限；成本上限常用，
+// Token / 请求数上限收进「更多口径」里，避免默认铺满 9 个输入框。
+function ScopeLimitsEditor({
+  value,
+  onChange,
+  groups,
+  scopeUsage,
+  allowedGroupIds,
+  onResetQuota,
+}: {
+  value: ScopeLimitFormState[];
+  onChange: (next: ScopeLimitFormState[]) => void;
+  groups: AccountGroup[];
+  scopeUsage?: APIKeyScopeUsageItem[];
+  allowedGroupIds: number[];
+  onResetQuota?: (
+    scopeType: "group" | "account",
+    scopeId: number,
+  ) => void | Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const scopeTypeOptions: SelectOption[] = [
+    { label: t("apiKeys.limits.scopeTypeGroup"), value: "group" },
+    { label: t("apiKeys.limits.scopeTypeAccount"), value: "account" },
+  ];
+  const onExhaustedOptions: SelectOption[] = [
+    { label: t("apiKeys.limits.scopeOnExhaustedSkip"), value: "skip" },
+    { label: t("apiKeys.limits.scopeOnExhaustedReject"), value: "reject" },
+  ];
+  const groupOptions: SelectOption[] = [
+    { label: t("apiKeys.limits.scopeGroupPlaceholder"), value: "" },
+    ...groups.map((group) => ({
+      label: group.name,
+      value: String(group.id),
+    })),
+  ];
+
+  const patchRow = (index: number, next: Partial<ScopeLimitFormState>) =>
+    onChange(
+      value.map((row, i) => (i === index ? { ...row, ...next } : row)),
+    );
+
+  return (
+    <div className="space-y-3">
+      {value.length === 0 && (
+        <p className="text-[11px] text-muted-foreground">
+          {t("apiKeys.limits.scopeEmpty")}
+        </p>
+      )}
+
+      {value.map((row, index) => (
+        <ScopeLimitCard
+          key={index}
+          row={row}
+          groups={groups}
+          groupOptions={groupOptions}
+          scopeTypeOptions={scopeTypeOptions}
+          onExhaustedOptions={onExhaustedOptions}
+          usage={findScopeUsage(scopeUsage, row)}
+          allowedGroupIds={allowedGroupIds}
+          onResetQuota={
+            onResetQuota && Number(row.scopeId) > 0
+              ? () => onResetQuota(row.scopeType, Number(row.scopeId))
+              : undefined
+          }
+          onPatch={(next) => patchRow(index, next)}
+          onRemove={() => onChange(value.filter((_, i) => i !== index))}
+        />
+      ))}
+
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => onChange([...value, { ...emptyScopeLimitRow }])}
+        className="w-full text-xs"
+      >
+        <Plus className="mr-1 size-3.5" />
+        {t("apiKeys.limits.scopeAdd")}
+      </Button>
+    </div>
+  );
+}
+
+// formatScopeUsageWindow 把一个窗口的用量压成一行紧凑文本，优先展示配了上限的口径。
+function formatScopeUsageWindow(window: APIKeyScopeUsageWindow): string {
+  if (window.cost_limit && window.cost_limit > 0) {
+    return `${window.window} $${window.user_billed.toFixed(2)} / $${window.cost_limit.toFixed(2)}`;
+  }
+  if (window.token_limit && window.token_limit > 0) {
+    return `${window.window} ${window.tokens} / ${window.token_limit} tok`;
+  }
+  if (window.request_limit && window.request_limit > 0) {
+    return `${window.window} ${window.requests} / ${window.request_limit} req`;
+  }
+  return `${window.window} $${window.user_billed.toFixed(2)}`;
+}
+
+// formatScopeCumulative 把累计额度状态压成一行：优先展示配了上限的那个口径。
+function formatScopeCumulative(
+  cumulative: APIKeyScopeCumulativeUsage,
+  t: (key: string) => string,
+): string {
+  const prefix = t("apiKeys.limits.scopeQuotaLabel");
+  if (cumulative.quota_cost && cumulative.quota_cost > 0) {
+    return `${prefix} $${cumulative.used_cost.toFixed(2)} / $${cumulative.quota_cost.toFixed(2)}`;
+  }
+  if (cumulative.quota_tokens && cumulative.quota_tokens > 0) {
+    return `${prefix} ${cumulative.used_tokens} / ${cumulative.quota_tokens} tok`;
+  }
+  if (cumulative.quota_requests && cumulative.quota_requests > 0) {
+    return `${prefix} ${cumulative.used_requests} / ${cumulative.quota_requests} req`;
+  }
+  return `${prefix} $${cumulative.used_cost.toFixed(2)}`;
+}
+
+// findScopeUsage 用 (维度, 目标 ID) 把后端返回的用量对上表单行。
+function findScopeUsage(
+  scopeUsage: APIKeyScopeUsageItem[] | undefined,
+  row: ScopeLimitFormState,
+): APIKeyScopeUsageItem | undefined {
+  if (!scopeUsage || row.scopeId === "") return undefined;
+  const scopeId = Number(row.scopeId);
+  return scopeUsage.find(
+    (item) => item.scope_type === row.scopeType && item.scope_id === scopeId,
+  );
+}
+
+function ScopeLimitCard({
+  row,
+  groups,
+  groupOptions,
+  scopeTypeOptions,
+  onExhaustedOptions,
+  usage,
+  allowedGroupIds,
+  onResetQuota,
+  onPatch,
+  onRemove,
+}: {
+  row: ScopeLimitFormState;
+  groups: AccountGroup[];
+  groupOptions: SelectOption[];
+  scopeTypeOptions: SelectOption[];
+  onExhaustedOptions: SelectOption[];
+  usage?: APIKeyScopeUsageItem;
+  allowedGroupIds: number[];
+  onResetQuota?: () => void | Promise<void>;
+  onPatch: (next: Partial<ScopeLimitFormState>) => void;
+  onRemove: () => void;
+}) {
+  const { t } = useTranslation();
+  const hasOtherMetrics =
+    row.token5h !== "" ||
+    row.token1d !== "" ||
+    row.token7d !== "" ||
+    row.token30d !== "" ||
+    row.requests1d !== "";
+  const [showOther, setShowOther] = useState(hasOtherMetrics);
+  const groupMissing =
+    row.scopeType === "group" &&
+    row.scopeId !== "" &&
+    !groups.some((group) => String(group.id) === row.scopeId);
+  // 唯一允许的分组又配了 skip 预算：预算耗尽后没有别的组可落，等价于整把 Key 停用。
+  const selfLockWarning =
+    row.scopeType === "group" &&
+    row.onExhausted === "skip" &&
+    allowedGroupIds.length === 1 &&
+    String(allowedGroupIds[0]) === row.scopeId;
+
+  return (
+    <div className="space-y-3 rounded-lg border border-border/80 bg-background p-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+        <div className="w-full space-y-1 sm:w-32">
+          <label className="text-[11px] font-medium text-muted-foreground">
+            {t("apiKeys.limits.scopeType")}
+          </label>
+          <Select
+            value={row.scopeType}
+            options={scopeTypeOptions}
+            onValueChange={(next) =>
+              onPatch({
+                scopeType: next === "account" ? "account" : "group",
+                scopeId: "",
+              })
+            }
+            className="text-xs"
+          />
+        </div>
+        <div className="w-full min-w-0 flex-1 space-y-1">
+          <label className="text-[11px] font-medium text-muted-foreground">
+            {t("apiKeys.limits.scopeTarget")}
+          </label>
+          {row.scopeType === "group" ? (
+            <Select
+              value={row.scopeId}
+              options={groupOptions}
+              onValueChange={(scopeId) => onPatch({ scopeId })}
+              className="text-xs"
+            />
+          ) : (
+            <Input
+              type="number"
+              min="1"
+              value={row.scopeId}
+              onChange={(e) => onPatch({ scopeId: e.target.value })}
+              placeholder={t("apiKeys.limits.scopeAccountPlaceholder")}
+              className="text-xs"
+            />
+          )}
+        </div>
+        <div className="w-full space-y-1 sm:w-44">
+          <label className="text-[11px] font-medium text-muted-foreground">
+            {t("apiKeys.limits.scopeOnExhausted")}
+          </label>
+          <Select
+            value={row.onExhausted}
+            options={onExhaustedOptions}
+            onValueChange={(next) =>
+              onPatch({ onExhausted: next === "reject" ? "reject" : "skip" })
+            }
+            className="text-xs"
+          />
+        </div>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={onRemove}
+          aria-label={t("apiKeys.limits.scopeRemove")}
+          className="shrink-0 self-end text-muted-foreground hover:text-destructive"
+        >
+          <Trash2 className="size-4" />
+        </Button>
+      </div>
+
+      {groupMissing && (
+        <p className="text-[11px] text-destructive">
+          {t("apiKeys.limits.scopeGroupMissing")}
+        </p>
+      )}
+
+      {usage?.cumulative && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md bg-muted/40 px-2 py-1.5">
+          <span
+            className={cn(
+              "text-[10px] tabular-nums",
+              usage.cumulative.exhausted
+                ? "font-semibold text-destructive"
+                : "text-muted-foreground",
+            )}
+          >
+            {formatScopeCumulative(usage.cumulative, t)}
+          </span>
+          {usage.cumulative.reset_count > 0 && (
+            <span className="text-[10px] text-muted-foreground">
+              {t("apiKeys.limits.scopeQuotaResetCount", {
+                count: usage.cumulative.reset_count,
+              })}
+            </span>
+          )}
+          {onResetQuota && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-[10px]"
+              onClick={() => void onResetQuota()}
+            >
+              <RotateCcw className="mr-1 size-3" />
+              {t("apiKeys.limits.scopeQuotaReset")}
+            </Button>
+          )}
+        </div>
+      )}
+
+      {usage?.skips && (
+        <p className="text-[10px] text-muted-foreground">
+          {t("apiKeys.limits.scopeSkipStat", {
+            count: usage.skips.requests,
+            time: formatRelativeTime(usage.skips.last_at),
+          })}
+        </p>
+      )}
+
+      {selfLockWarning && (
+        <p className="text-[11px] text-[hsl(var(--warning))]">
+          {t("apiKeys.limits.scopeSelfLockWarning")}
+        </p>
+      )}
+
+      {usage && usage.windows.length > 0 && (
+        <div className="flex flex-wrap gap-x-3 gap-y-1 rounded-md bg-muted/40 px-2 py-1.5">
+          {usage.windows.map((window) => (
+            <span
+              key={window.window}
+              className={cn(
+                "text-[10px] tabular-nums",
+                window.exhausted
+                  ? "font-semibold text-destructive"
+                  : "text-muted-foreground",
+              )}
+            >
+              {formatScopeUsageWindow(window)}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost5h")}
+          value={row.cost5h}
+          onChange={(cost5h) => onPatch({ cost5h })}
+          suffix="$"
+          step="0.01"
+        />
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost1d")}
+          value={row.cost1d}
+          onChange={(cost1d) => onPatch({ cost1d })}
+          suffix="$"
+          step="0.01"
+        />
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost7d")}
+          value={row.cost7d}
+          onChange={(cost7d) => onPatch({ cost7d })}
+          suffix="$"
+          step="0.01"
+        />
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost30d")}
+          value={row.cost30d}
+          onChange={(cost30d) => onPatch({ cost30d })}
+          suffix="$"
+          step="0.01"
+        />
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setShowOther((v) => !v)}
+        className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+      >
+        {showOther
+          ? t("apiKeys.limits.scopeHideOther")
+          : t("apiKeys.limits.scopeShowOther")}
+      </button>
+
+      {showOther && (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeMaxConcurrency")}
+            value={row.maxConcurrency}
+            onChange={(maxConcurrency) => onPatch({ maxConcurrency })}
+            suffix={t("apiKeys.limits.concurrencySuffix")}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeQuotaCost")}
+            value={row.quotaCost}
+            onChange={(quotaCost) => onPatch({ quotaCost })}
+            suffix="$"
+            step="0.01"
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeQuotaTokens")}
+            value={row.quotaTokens}
+            onChange={(quotaTokens) => onPatch({ quotaTokens })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeQuotaRequests")}
+            value={row.quotaRequests}
+            onChange={(quotaRequests) => onPatch({ quotaRequests })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken5h")}
+            value={row.token5h}
+            onChange={(token5h) => onPatch({ token5h })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken1d")}
+            value={row.token1d}
+            onChange={(token1d) => onPatch({ token1d })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken7d")}
+            value={row.token7d}
+            onChange={(token7d) => onPatch({ token7d })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken30d")}
+            value={row.token30d}
+            onChange={(token30d) => onPatch({ token30d })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeRequests1d")}
+            value={row.requests1d}
+            onChange={(requests1d) => onPatch({ requests1d })}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LimitNumberField({
   label,
   value,
@@ -1793,49 +3931,5 @@ function FormField({
       </span>
       {children}
     </Component>
-  );
-}
-
-function KeySummaryCard({
-  icon,
-  label,
-  value,
-  sub,
-  tone,
-}: {
-  icon: ReactNode;
-  label: string;
-  value: string;
-  sub: string;
-  tone: "neutral" | "info" | "success" | "warning";
-}) {
-  const toneClassName = {
-    neutral: "bg-muted text-muted-foreground",
-    info: "bg-primary/10 text-primary",
-    success: "bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]",
-    warning: "bg-[hsl(var(--warning-bg))] text-[hsl(var(--warning))]",
-  }[tone];
-
-  return (
-    <Card className="py-0">
-      <CardContent className="flex items-center justify-between gap-3 p-4">
-        <div className="min-w-0">
-          <div className="text-[11px] font-bold uppercase text-muted-foreground">
-            {label}
-          </div>
-          <div className="mt-2 truncate text-[24px] font-bold leading-none text-foreground">
-            {value}
-          </div>
-          <div className="mt-2 truncate text-xs text-muted-foreground">
-            {sub}
-          </div>
-        </div>
-        <div
-          className={`flex size-10 shrink-0 items-center justify-center rounded-lg ${toneClassName}`}
-        >
-          {icon}
-        </div>
-      </CardContent>
-    </Card>
   );
 }

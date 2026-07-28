@@ -2,7 +2,10 @@ package admin
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,6 +15,74 @@ import (
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
+
+const promptFilterAuditContextMaxRunes = 2000
+
+type promptFilterSecretRequest struct {
+	Secret string `json:"secret"`
+}
+
+func maskPromptFilterSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	if len(secret) < 12 {
+		return "********"
+	}
+	return secret[:6] + "…" + secret[len(secret)-6:]
+}
+
+func (h *Handler) promptFilterSecretStatus(c *gin.Context, reveal string) {
+	dbSecret, _ := h.db.GetPromptFilterNewAPISecret(c.Request.Context())
+	envSecret := strings.TrimSpace(os.Getenv("PROMPT_FILTER_NEWAPI_SECRET"))
+	effective, source := dbSecret, "database"
+	if envSecret != "" {
+		effective, source = envSecret, "environment"
+	}
+	if effective == "" {
+		source = "none"
+	}
+	c.JSON(http.StatusOK, gin.H{"configured": effective != "", "source": source, "masked": maskPromptFilterSecret(effective), "secret": reveal})
+}
+
+func (h *Handler) GetPromptFilterNewAPISecretStatus(c *gin.Context) {
+	h.promptFilterSecretStatus(c, "")
+}
+
+func (h *Handler) GeneratePromptFilterNewAPISecret(c *gin.Context) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		writeError(c, http.StatusInternalServerError, "生成随机密钥失败")
+		return
+	}
+	h.savePromptFilterNewAPISecret(c, hex.EncodeToString(buf))
+}
+
+func (h *Handler) ReplacePromptFilterNewAPISecret(c *gin.Context) {
+	var req promptFilterSecretRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式无效")
+		return
+	}
+	h.savePromptFilterNewAPISecret(c, strings.TrimSpace(req.Secret))
+}
+
+func (h *Handler) savePromptFilterNewAPISecret(c *gin.Context, secret string) {
+	if len(secret) < 32 {
+		writeError(c, http.StatusBadRequest, "共享密钥至少需要 32 个字符")
+		return
+	}
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
+	if err := h.db.SetPromptFilterNewAPISecret(c.Request.Context(), secret); err != nil {
+		writeError(c, http.StatusInternalServerError, "保存共享密钥失败")
+		return
+	}
+	cfg := h.store.GetPromptFilterConfig()
+	cfg.Advanced.NewAPI.Secret = secret
+	h.store.SetPromptFilterConfig(cfg)
+	h.promptFilterSecretStatus(c, secret)
+}
 
 type promptFilterLogsResponse struct {
 	Logs     []*database.PromptFilterLog `json:"logs"`
@@ -90,6 +161,7 @@ func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model st
 		Threshold:       verdict.Threshold,
 		MatchedPatterns: promptfilter.MatchesJSON(verdict.Matched),
 		TextPreview:     textPreview,
+		MatchContext:    promptfilter.RedactedPreview(verdict.MatchContext, promptFilterAuditContextMaxRunes),
 		APIKeyID:        keyID,
 		APIKeyName:      keyName,
 		APIKeyMasked:    keyMasked,
@@ -110,9 +182,11 @@ func (h *Handler) recordPromptFilterLog(c *gin.Context, input *database.PromptFi
 	if h == nil || h.db == nil || input == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = h.db.InsertPromptFilterLog(ctx, input)
+	priority := database.PromptFilterLogPriorityLow
+	if input.Action == promptfilter.ActionWarn || input.Action == promptfilter.ActionBlock {
+		priority = database.PromptFilterLogPriorityHigh
+	}
+	_ = h.db.EnqueuePromptFilterLog(input, priority)
 }
 
 func (h *Handler) ListPromptFilterLogs(c *gin.Context) {

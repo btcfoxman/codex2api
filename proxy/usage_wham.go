@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -22,11 +23,26 @@ const WhamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 // WhamResetCreditsConsumeURL 是「消耗 1 次主动重置次数、立即重置额度」的端点。
 const WhamResetCreditsConsumeURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 
+// WhamResetCreditsURL 列出账号所有「主动重置次数」凭据（含各自的发放/过期时间）。
+// 与 wham/usage 一样不消耗任何额度（issue #322：展示每张重置券的有效期明细）。
+const WhamResetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+
 // whamURLForTest 允许测试替换默认 URL。生产代码不要赋值。
 var whamURLForTest = ""
 
+// SetWhamUsageURLForTest 供其他包的测试替换 wham 用量端点 URL，返回恢复函数。
+// 生产代码不要调用。
+func SetWhamUsageURLForTest(url string) (restore func()) {
+	old := whamURLForTest
+	whamURLForTest = url
+	return func() { whamURLForTest = old }
+}
+
 // whamConsumeURLForTest 允许测试替换重置端点 URL。生产代码不要赋值。
 var whamConsumeURLForTest = ""
+
+// whamResetCreditsURLForTest 允许测试替换重置券列表端点 URL。生产代码不要赋值。
+var whamResetCreditsURLForTest = ""
 
 // WhamUsage 是 /backend-api/wham/usage 的响应结构。
 type WhamUsage struct {
@@ -64,8 +80,11 @@ type WhamUsage struct {
 
 	// RateLimitResetCredits 是账号在 OpenAI 官方那边剩余的「主动重置次数」。
 	// available_count > 0 时可调用 wham/rate-limit-reset-credits/consume 立即重置额度。
+	// applicable_available_count 是当下「可应用」的张数：未触限时上游返回 0
+	// （券在有效期内但此刻不生效），触限后才 > 0。
 	RateLimitResetCredits *struct {
-		AvailableCount int `json:"available_count"`
+		AvailableCount           int `json:"available_count"`
+		ApplicableAvailableCount int `json:"applicable_available_count"`
 	} `json:"rate_limit_reset_credits,omitempty"`
 }
 
@@ -145,6 +164,21 @@ func QueryWhamUsage(ctx context.Context, account *auth.Account, proxyURL string)
 	return queryWhamUsageWithURL(ctx, account, proxyURL, url)
 }
 
+// whamHTTPClient 是 wham 三个端点共用的 Resin/直连选择：viaResin 时设置
+// X-Resin-Account 并复用按账号隔离的 Resin 连接池；否则回退网关同款
+// transport（支持 uTLS Chrome 指纹），让 wham 请求与 /responses 走一致的
+// TLS 指纹，降低被 Cloudflare 拦截的概率。
+//
+// 直连分支必须用池化 Client：wham 探针是后台周期任务，每次新建一次性
+// uTLS transport 会持续泄漏 HTTP/2 连接与 goroutine（issue #446）。
+func whamHTTPClient(req *http.Request, account *auth.Account, resinClient *http.Client, viaResin bool, proxyURL string) *http.Client {
+	if viaResin {
+		req.Header.Set("X-Resin-Account", ResinAccountID(account))
+		return resinClient
+	}
+	return getCodexMaintenanceClient(account, proxyURL)
+}
+
 func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL, url string) (*WhamUsage, *http.Response, error) {
 	if account == nil {
 		return nil, nil, fmt.Errorf("account is nil")
@@ -154,7 +188,8 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 		return nil, nil, fmt.Errorf("account has no access token")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	finalURL, resinClient, viaResin := resinMaintenanceTarget(account, url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build wham request: %w", err)
 	}
@@ -167,10 +202,7 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
 	}
-
-	// 复用网关同款 transport（支持 uTLS Chrome 指纹），而非裸标准 transport，
-	// 让 wham 查询与 /responses 走一致的 TLS 指纹，降低被 Cloudflare 拦截的概率。
-	client := &http.Client{Transport: newCodexTransport(proxyURL)}
+	client := whamHTTPClient(req, account, resinClient, viaResin, proxyURL)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -200,6 +232,110 @@ type WhamResetCredit struct {
 	ResetType  string `json:"reset_type,omitempty"`
 	Status     string `json:"status,omitempty"`
 	RedeemedAt string `json:"redeemed_at,omitempty"`
+}
+
+// WhamResetCreditItem 是 /wham/rate-limit-reset-credits 列表里的单张重置券。
+// reset_type=codex_rate_limits 且 status=available 的即「当前可用」的券。
+type WhamResetCreditItem struct {
+	ID              string `json:"id"`
+	ResetType       string `json:"reset_type"`
+	Status          string `json:"status"`
+	GrantedAt       string `json:"granted_at"`
+	ExpiresAt       string `json:"expires_at"`
+	ConsumableUntil string `json:"consumable_until"`
+}
+
+// EffectiveConsumableUntil 返回上游声明的实际可消费截止时间。
+// 新版接口使用 consumable_until；旧版/兼容响应仍可能只带 expires_at。
+func (c WhamResetCreditItem) EffectiveConsumableUntil() string {
+	if value := strings.TrimSpace(c.ConsumableUntil); value != "" {
+		return value
+	}
+	return strings.TrimSpace(c.ExpiresAt)
+}
+
+// WhamResetCreditsList 是 /wham/rate-limit-reset-credits 的响应结构。
+type WhamResetCreditsList struct {
+	AvailableCount int                   `json:"available_count"`
+	Credits        []WhamResetCreditItem `json:"credits"`
+}
+
+// AvailableCodexCredits 返回列表中可用的 codex 限流重置券（reset_type=codex_rate_limits
+// 且 status=available 且带过期时间），其余状态（已消耗/已过期/非 codex 类型）一律过滤。
+func (l *WhamResetCreditsList) AvailableCodexCredits() []WhamResetCreditItem {
+	if l == nil {
+		return nil
+	}
+	out := make([]WhamResetCreditItem, 0, len(l.Credits))
+	for _, c := range l.Credits {
+		if c.ResetType != "codex_rate_limits" {
+			continue
+		}
+		if c.Status != "available" {
+			continue
+		}
+		if c.EffectiveConsumableUntil() == "" {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// QueryWhamResetCredits 调用 /backend-api/wham/rate-limit-reset-credits 获取账号
+// 重置券明细（每张的发放/过期时间）。零额度成本，与 QueryWhamUsage 同款请求形态。
+// 非 200 时返回 resp（body 未读）供调用方处理。
+func QueryWhamResetCredits(ctx context.Context, account *auth.Account, proxyURL string) (*WhamResetCreditsList, *http.Response, error) {
+	url := WhamResetCreditsURL
+	if whamResetCreditsURLForTest != "" {
+		url = whamResetCreditsURLForTest
+	}
+	return queryWhamResetCreditsWithURL(ctx, account, proxyURL, url)
+}
+
+func queryWhamResetCreditsWithURL(ctx context.Context, account *auth.Account, proxyURL, url string) (*WhamResetCreditsList, *http.Response, error) {
+	if account == nil {
+		return nil, nil, fmt.Errorf("account is nil")
+	}
+	accessToken := account.GetAccessToken()
+	if accessToken == "" {
+		return nil, nil, fmt.Errorf("account has no access token")
+	}
+
+	finalURL, resinClient, viaResin := resinMaintenanceTarget(account, url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build reset-credits list request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("Originator", Originator)
+	// 与 wham 查询一致,重置券按自定义头覆盖后的空间查询。
+	if accountID := account.EffectiveAccountID(); accountID != "" {
+		req.Header.Set("chatgpt-account-id", accountID)
+	}
+	client := whamHTTPClient(req, account, resinClient, viaResin, proxyURL)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reset-credits list request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp, fmt.Errorf("reset-credits list returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, resp, fmt.Errorf("read reset-credits list response: %w", err)
+	}
+
+	var list WhamResetCreditsList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, resp, fmt.Errorf("parse reset-credits list response: %w", err)
+	}
+	return &list, resp, nil
 }
 
 // WhamResetResult 是 /wham/rate-limit-reset-credits/consume 成功响应的投影。
@@ -252,7 +388,8 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	}
 	payload, _ := json.Marshal(map[string]string{"redeem_request_id": redeemRequestID})
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	finalURL, resinClient, viaResin := resinMaintenanceTarget(account, url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, finalURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, nil, fmt.Errorf("build reset-credit request: %w", err)
 	}
@@ -265,9 +402,7 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
 	}
-
-	// 与 wham 查询、/responses 一致的 transport（支持 uTLS Chrome 指纹）。
-	client := &http.Client{Transport: newCodexTransport(proxyURL)}
+	client := whamHTTPClient(req, account, resinClient, viaResin, proxyURL)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -300,6 +435,8 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	if account == nil || usage == nil {
 		return result
 	}
+	observedAt := time.Now()
+	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
 	if store != nil && usage.PlanType != "" {
 		store.UpdateAccountPlanType(account, usage.PlanType)
@@ -316,65 +453,99 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		}
 		store.UpdateAccountIdentity(account, usage.Email, identityAccountID)
 		store.UpdateAccountSubscriptionExpiresAt(account, usage.SubscriptionExpiresAt())
+		// wham 响应实测不含订阅到期字段（上面的同步基本拿不到值），续费后的新日期
+		// 无处可查；但服务端权威返回付费 plan_type 即证明订阅有效，把已过去的旧
+		// 到期时间清掉，避免长期误报「已过期」。(issue #360)
+		if usage.PlanType != "" {
+			store.ClearStaleSubscriptionExpiresAt(account)
+		}
 	}
 
 	// 记录「主动重置次数」（OpenAI 官方剩余的手动重置额度次数）。
 	if usage.RateLimitResetCredits != nil {
 		account.SetRateLimitResetCredits(usage.RateLimitResetCredits.AvailableCount)
+		account.SetApplicableResetCredits(usage.RateLimitResetCredits.ApplicableAvailableCount)
 	}
 
-	now := time.Now()
-
-	// 记录本次成功的 wham 探针时间。「主动重置次数」只能由 wham 刷新，
-	// 用它独立判断重置次数是否过期（见 auth.Account.NeedsUsageProbe）。
-	account.MarkResetCreditsProbed(now)
-
-	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, now)
-
-	if w5h != nil {
-		resetAt := whamWindowResetAt(w5h, now)
-		account.SetUsageSnapshot5hAt(w5h.UsedPercent, resetAt, now)
-		result.UsagePct5h = w5h.UsedPercent
-		result.Reset5hAt = resetAt
-		result.HasUsage5h = true
-		result.Used5hHeaders = true
-		if store != nil {
-			// 5h 窗口重置时刻武装「到点即探」，窗口翻新即刷新进度条。
-			store.WakeBoundaryProbe(resetAt)
-		}
+	// 记录 credits 积分余额快照（wham 的 credits 对象，零额度成本）。
+	if usage.Credits != nil {
+		account.SetCreditBalance(
+			usage.Credits.Balance,
+			usage.Credits.HasCredits,
+			usage.Credits.Unlimited,
+			usage.Credits.OverageLimitReached,
+		)
 	}
 
-	if w7d != nil {
-		resetAt := whamWindowResetAt(w7d, now)
-		account.SetReset7dAt(resetAt)
-		account.SetWindow7dSeconds(w7d.LimitWindowSeconds)
-		result.UsagePct7d = w7d.UsedPercent
-		result.HasUsage7d = true
-		if store != nil {
-			store.WakeBoundaryProbe(resetAt)
-			store.PersistUsageSnapshot(account, w7d.UsedPercent)
-			if result.UsagePct7d >= 100 {
-				result.Usage7dRateLimited = store.MarkUsage7dRateLimited(account)
+	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, observedAt)
+	// A present-but-empty window object is not evidence that the upstream
+	// removed a window. Normalize those placeholders away so malformed/partial
+	// payloads preserve the last known 5h snapshot.
+	if !usableWhamWindow(w5h) {
+		w5h = nil
+	}
+	if !usableWhamWindow(w7d) {
+		w7d = nil
+	}
+	hasAuthoritativeWindow := w5h != nil || w7d != nil
+	if hasAuthoritativeWindow {
+		// Only a structurally valid window response is a successful usage probe;
+		// malformed/empty payloads must not suppress the next retry.
+		account.MarkResetCreditsProbed(observedAt)
+	}
+	usageApplied := false
+	if hasAuthoritativeWindow {
+		usageApplied = account.ApplyUsageObservation(observedAt, func() {
+			if w5h != nil {
+				resetAt := whamWindowResetAt(w5h, observedAt)
+				account.SetUsageSnapshot5hAt(w5h.UsedPercent, resetAt, observedAt)
+				result.UsagePct5h = w5h.UsedPercent
+				result.Reset5hAt = resetAt
+				result.HasUsage5h = true
+				result.Used5hHeaders = true
+				if store != nil {
+					// 5h 窗口重置时刻武装「到点即探」，窗口翻新即刷新进度条。
+					store.WakeBoundaryProbe(resetAt)
+				}
+			} else if hasAuthoritativeWindow {
+				// WHAM 是完整权威探测：payload 无 5h 窗口则清除本地陈旧 5h 快照（issue #382）。
+				result.Cleared5h = store.ClearAbsentUsageSnapshot5hAt(account, observedAt)
 			}
-		}
-	} else if result.Used5hHeaders && store != nil {
-		// 只有 5h 数据时，单独持久化 5h 快照
-		store.PersistUsageSnapshot5hOnly(account)
-		result.Persisted5hOnly = true
+
+			if w7d != nil {
+				resetAt := whamWindowResetAt(w7d, observedAt)
+				account.SetReset7dAt(resetAt)
+				account.SetWindow7dSeconds(w7d.LimitWindowSeconds)
+				result.UsagePct7d = w7d.UsedPercent
+				result.HasUsage7d = true
+				if store != nil {
+					store.WakeBoundaryProbe(resetAt)
+					store.PersistUsageSnapshot(account, w7d.UsedPercent)
+					if result.UsagePct7d >= 100 {
+						result.Usage7dRateLimited = store.MarkUsage7dRateLimited(account)
+					}
+				}
+			} else if result.Used5hHeaders && store != nil {
+				// 只有 5h 数据时，单独持久化 5h 快照
+				store.PersistUsageSnapshot5hOnly(account)
+				result.Persisted5hOnly = true
+			}
+		})
 	}
 
 	// premium 5h 限流标记
-	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
+	if usageApplied && result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
 		if store != nil {
-			store.MarkPremium5hRateLimited(account, result.Reset5hAt)
+			result.Premium5hRateLimited = store.MarkPremium5hRateLimitedAt(account, result.Reset5hAt, observedAt)
+		} else {
+			result.Premium5hRateLimited = true
 		}
-		result.Premium5hRateLimited = true
 	}
 
 	return result
 }
 
-// 已知窗口长度（秒）。和 CPA-Manager src/utils/quota/codexQuota.ts 保持一致。
+// 已知窗口长度（秒），与上游 wham 返回的 limit_window_seconds 取值对应。
 const (
 	whamWindow5hSeconds int64 = 18_000
 	whamWindow7dSeconds int64 = 604_800
@@ -382,7 +553,7 @@ const (
 
 // pickClassifiedWhamWindows 把 primary/secondary 两个窗口归类到 5h/7d 槽位。
 //
-// 策略对齐 CPA-Manager 的 pickClassifiedWindows：
+// 分类策略：
 //  1. 第一遍：按 limit_window_seconds 精确匹配（18000→5h，604800→7d）
 //  2. 第二遍：把 free plan 或 reset 明显超过 5h 的未知窗口归到 7d
 //  3. 最后按字段位置兜底（primary→5h、secondary→7d），只填补空槽位
@@ -427,6 +598,22 @@ func pickClassifiedWhamWindows(primary, secondary *WhamUsageWindow, planType str
 		}
 	}
 	return w5h, w7d
+}
+
+// usableWhamWindow reports whether a decoded window contains enough positive
+// information to be authoritative. JSON may contain an empty placeholder for
+// an omitted optional window; treating that as a real 5h window would erase a
+// valid snapshot on the next probe.
+func usableWhamWindow(w *WhamUsageWindow) bool {
+	if w == nil || math.IsNaN(w.UsedPercent) || math.IsInf(w.UsedPercent, 0) || w.UsedPercent < 0 || w.UsedPercent > 100 {
+		return false
+	}
+	if w.LimitWindowSeconds > 0 || w.ResetAfterSeconds > 0 || w.ResetAt > 0 {
+		return true
+	}
+	// used_percent without a window duration/reset is a partial payload, not
+	// authoritative evidence about which optional window is present.
+	return false
 }
 
 func shouldTreatUnknownWhamWindowAs7d(w *WhamUsageWindow, planType string, now time.Time) bool {

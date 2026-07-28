@@ -9,21 +9,22 @@ import (
 )
 
 type AccountGroup struct {
-	ID                   int64
-	Name                 string
-	Description          string
-	Color                string
-	SortOrder            int64
-	MemberCount          int64
-	AutoPause5hThreshold float64
-	AutoPause7dThreshold float64
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	ID                      int64
+	Name                    string
+	Description             string
+	Color                   string
+	SortOrder               int64
+	BaseConcurrencyOverride sql.NullInt64
+	MemberCount             int64
+	AutoPause5hThreshold    float64
+	AutoPause7dThreshold    float64
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT g.id, g.name, g.description, g.color, g.sort_order,
+		SELECT g.id, g.name, g.description, g.color, g.sort_order, g.base_concurrency_override,
 			COALESCE(COUNT(a.id), 0),
 			COALESCE(g.auto_pause_5h_threshold, 0), COALESCE(g.auto_pause_7d_threshold, 0),
 			g.created_at, g.updated_at
@@ -32,7 +33,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 		LEFT JOIN accounts a ON a.id = m.account_id
 			AND a.status <> 'deleted'
 			AND COALESCE(a.error_message, '') <> 'deleted'
-		GROUP BY g.id, g.name, g.description, g.color, g.sort_order,
+		GROUP BY g.id, g.name, g.description, g.color, g.sort_order, g.base_concurrency_override,
 			g.auto_pause_5h_threshold, g.auto_pause_7d_threshold, g.created_at, g.updated_at
 		ORDER BY g.sort_order, g.name`)
 	if err != nil {
@@ -43,7 +44,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 	for rows.Next() {
 		var g AccountGroup
 		var createdRaw, updatedRaw interface{}
-		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &createdRaw, &updatedRaw); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.BaseConcurrencyOverride, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &createdRaw, &updatedRaw); err != nil {
 			return nil, err
 		}
 		var parseErr error
@@ -60,7 +61,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 	return groups, rows.Err()
 }
 
-func (db *DB) CreateAccountGroup(ctx context.Context, name, description, color string, autoPause5h, autoPause7d float64, sortOrder ...int64) (int64, error) {
+func (db *DB) CreateAccountGroup(ctx context.Context, name, description, color string, autoPause5h, autoPause7d float64, baseConcurrencyOverride sql.NullInt64, sortOrder ...int64) (int64, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return 0, fmt.Errorf("group name is required")
@@ -70,7 +71,7 @@ func (db *DB) CreateAccountGroup(ctx context.Context, name, description, color s
 		order = sortOrder[0]
 	}
 	if db.isSQLite() {
-		res, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name, description, color, sort_order, auto_pause_5h_threshold, auto_pause_7d_threshold) VALUES (?, ?, ?, ?, ?, ?)`, name, description, color, order, autoPause5h, autoPause7d)
+		res, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name, description, color, sort_order, auto_pause_5h_threshold, auto_pause_7d_threshold, base_concurrency_override) VALUES (?, ?, ?, ?, ?, ?, ?)`, name, description, color, order, autoPause5h, autoPause7d, nullableInt64Value(baseConcurrencyOverride))
 		if err != nil {
 			if isUniqueViolation(err) {
 				return 0, ErrDuplicateAccountGroupName
@@ -80,7 +81,7 @@ func (db *DB) CreateAccountGroup(ctx context.Context, name, description, color s
 		return res.LastInsertId()
 	}
 	var id int64
-	err := db.conn.QueryRowContext(ctx, `INSERT INTO account_groups (name, description, color, sort_order, auto_pause_5h_threshold, auto_pause_7d_threshold) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, name, description, color, order, autoPause5h, autoPause7d).Scan(&id)
+	err := db.conn.QueryRowContext(ctx, `INSERT INTO account_groups (name, description, color, sort_order, auto_pause_5h_threshold, auto_pause_7d_threshold, base_concurrency_override) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, name, description, color, order, autoPause5h, autoPause7d, nullableInt64Value(baseConcurrencyOverride)).Scan(&id)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return 0, ErrDuplicateAccountGroupName
@@ -91,8 +92,9 @@ func (db *DB) CreateAccountGroup(ctx context.Context, name, description, color s
 }
 
 type UpdateAccountGroupOpts struct {
-	AutoPause5hThreshold *float64
-	AutoPause7dThreshold *float64
+	AutoPause5hThreshold    *float64
+	AutoPause7dThreshold    *float64
+	BaseConcurrencyOverride OptionalNullInt64
 }
 
 func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, description, color *string, opts *UpdateAccountGroupOpts, sortOrder ...*int64) error {
@@ -128,6 +130,9 @@ func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, descriptio
 		}
 		if opts.AutoPause7dThreshold != nil {
 			add("auto_pause_7d_threshold", *opts.AutoPause7dThreshold)
+		}
+		if opts.BaseConcurrencyOverride.Set {
+			add("base_concurrency_override", nullableInt64Value(opts.BaseConcurrencyOverride.Value))
 		}
 	}
 	if len(sets) == 0 {
@@ -183,6 +188,9 @@ func (db *DB) DeleteAccountGroup(ctx context.Context, id int64, force ...bool) e
 		return err
 	}
 	if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), id); err != nil {
+		return err
+	}
+	if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), APIKeyScopeTypeGroup, id); err != nil {
 		return err
 	}
 	res, err := tx.ExecContext(ctx, "DELETE FROM account_groups WHERE id = "+ph, id)
@@ -245,6 +253,57 @@ func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite b
 	return nil
 }
 
+// pruneDeletedScopeFromAPIKeyLimits 清理指向已删除分组 / 账号的 scope 维度限额
+// (api_keys.limits.scope_limits)。与 allowed_group_ids 的处理不同,这里即使清空也无副作用:
+// 少一条限额只会让该 Key 恢复不限,不会把它变成能访问更多账号。
+func pruneDeletedScopeFromAPIKeyLimits(ctx context.Context, tx *sql.Tx, sqlite bool, scopeType string, scopeID int64) error {
+	if scopeID <= 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(limits, '{}') FROM api_keys`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type update struct {
+		id     int64
+		limits APIKeyLimits
+	}
+	updates := make([]update, 0)
+	for rows.Next() {
+		var id int64
+		var raw interface{}
+		if err := rows.Scan(&id, &raw); err != nil {
+			return err
+		}
+		limits := decodeAPIKeyLimits(raw)
+		if len(limits.ScopeLimits) == 0 {
+			continue
+		}
+		pruned, changed := PruneAPIKeyScopeLimitsForScope(limits.ScopeLimits, scopeType, scopeID)
+		if !changed {
+			continue
+		}
+		limits.ScopeLimits = pruned
+		updates = append(updates, update{id: id, limits: limits})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	query := `UPDATE api_keys SET limits = $1::jsonb WHERE id = $2`
+	if sqlite {
+		query = `UPDATE api_keys SET limits = ? WHERE id = ?`
+	}
+	for _, item := range updates {
+		if _, err := tx.ExecContext(ctx, query, encodeAPIKeyLimits(item.limits), item.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func removeInt64(slice []int64, target int64) []int64 {
 	out := make([]int64, 0, len(slice))
 	for _, v := range slice {
@@ -291,6 +350,27 @@ func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []
 		if _, err := tx.ExecContext(ctx, insertQ, accountID, gid); err != nil {
 			return err
 		}
+	}
+	return tx.Commit()
+}
+
+// BatchSetAccountGroups 在单个事务里把一批账号的分组归属整体替换成 groupIDs。
+// 导入时给「本次新建的账号」统一绑定分组用它，比逐个 SetAccountGroups 少 N 次事务。
+// accountIDs 或 groupIDs 为空时直接返回（空分组表示"不绑"，不是"清空"，
+// 因为导入路径不该顺手抹掉别处刚设好的归属）。
+func (db *DB) BatchSetAccountGroups(ctx context.Context, accountIDs []int64, groupIDs []int64) error {
+	accountIDs = normalizeIDSlice(accountIDs)
+	groupIDs = normalizeIDSlice(groupIDs)
+	if len(accountIDs) == 0 || len(groupIDs) == 0 {
+		return nil
+	}
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := db.batchReplaceAccountGroups(ctx, tx, accountIDs, groupIDs); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

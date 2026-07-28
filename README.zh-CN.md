@@ -75,6 +75,20 @@
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://www.fastaitoken.com/register"><img src="assets/fastaitoken-logo.jpg" width="90" alt="FastAIToken"></a></td>
+<td valign="middle"><b><a href="https://www.fastaitoken.com/register">FastAIToken</a></b> 是面向开发者的 AI API 聚合平台，支持 OpenAI、Claude、Gemini 等主流大模型，兼容 OpenAI API 协议，可无缝接入 Claude Code、Codex、Gemini CLI、Cherry Studio、Cline、Continue 等开发工具。采用充值 1:1（1 元 = 1 美元 API 额度），分组覆盖 0.02× OpenAI 福利（限时）到 1.2× Claude Max，并提供公开状态页与 7×24 小时真人技术支持。支持企业开票，提供 99% SLA 企业级稳定号池。</td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
+<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> 提供高性价比 AI 模型 API 接入服务，支持 OpenAI、Claude、Gemini 等主流模型。充值比例仅 0.2 元 = 1 美元额度，调用成本低至官方价格 1 折以内。套餐 ¥25/28 天起，其中尊享套餐 ¥129/28 天，包含约 $4752 模型额度（套餐仅支持 OpenAI 模型），支持高并发请求及 95%+ SLA 稳定保障。</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex/Claude Code，价格大约是官方的 1 折不到！通过链接注册，使用优惠码 <code>CODEX2API</code> 即可获得 3$ 测试额度。</td>
 </tr>
@@ -105,6 +119,7 @@
 - [核心能力](#核心能力)
 - [目录结构](#目录结构)
 - [常见注意事项](#常见注意事项)
+- [交流群](#交流群)
 - [免责声明](#免责声明与开源协议)
 - [Star History](#star-history)
 - [友情链接](#友情链接)
@@ -446,6 +461,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | API 密钥 | `/admin/api-keys` | API Key 创建、查看、删除与调用凭据管理 |
 | 代理管理 | `/admin/proxies` | 代理池维护、账号代理分配与连通性管理 |
 | 生图工作台 | `/admin/images/studio` | 文生图、图生图、提示词模板、任务历史和服务器图库 |
+| 生图门户（非管理） | `/image-studio` | 用 API Key 登录的独立生图页，不进入管理后台；可在 API 密钥页开关 |
 | Prompt 检查 | `/admin/prompt-filter/overview` | Prompt 规则、触发日志、测试和处理模式配置 |
 | 使用统计 | `/admin/usage` | 请求日志、统计卡片、图表、日志清空 |
 | 运维概览 | `/admin/ops` | 运行态监控与系统概览 |
@@ -475,7 +491,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 
 ### 调度系统
 
-调度核心位于 `auth.Store`，将账号可用性、健康度、动态并发、历史错误和近期用量综合纳入选择。
+调度核心位于 `auth.Store`，将账号可用性、调度优先级、健康度、动态并发、历史错误和近期用量综合纳入选择。
 
 **运行时状态模型：**
 
@@ -483,14 +499,17 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 - `HealthTier`：`healthy` / `warm` / `risky` / `banned`
 - `SchedulerScore`：以 100 为基线的实时调度分
 - `DynamicConcurrencyLimit`：按健康层级动态收缩的并发上限
+- `SchedulerPriority`：严格的账号优先级；先比较优先级，再比较健康层级、调度分和当前负载
 
 **账号选择策略：**
 
 1. 过滤不可用账号（error / banned / 冷却中 / 无 AccessToken）
 2. 重算健康层级、调度分和动态并发
 3. 排除已达并发上限的账号
-4. 按 `healthy > warm > risky > banned` 排序，同层级按调度分和并发数择优
+4. 先按 `SchedulerPriority` 从高到低分层，再按 `healthy > warm > risky > banned` 排序；同优先级、同层级内按调度分和并发数择优
 5. 15% 概率随机打散，降低热点与饥饿
+
+多个最终用户共享同一个下游 API Key 时，可传 `X-Codex2API-Affinity-Key` 作为稳定的用户或对话标识。Codex2API 只将其哈希后用于本地账号亲和，不会转发给上游。
 
 **动态并发规则：**
 
@@ -500,6 +519,8 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | `warm` | 基础并发 ÷ 2（最少 1） |
 | `risky` | 固定 1 |
 | `banned` | 固定 0，不参与调度 |
+
+上游持久 WebSocket 连接池同样受账号当前 `DynamicConcurrencyLimit` 约束，连接复用不会突破账号的有效并发上限。
 
 **调度分惩罚/奖励：**
 
@@ -580,6 +601,15 @@ codex2api/
 - 本地手动构建 Go 二进制前需先执行 `frontend/` 的 `npm run build`
 - `.env` 只负责端口、数据库、Redis 等物理层配置；业务参数在管理台数据库里维护
 - API Key 以数据库为准，在管理台中配置
+
+---
+
+## 交流群
+
+- QQ 交流群：[点击链接加入群聊【codex2api】](https://qun.qq.com/universal-share/share?ac=1&authKey=6vwawW4MeqdACT7PajnHlf2lLkjfuNXEMSos67l9FBiAJ8t%2BKeaXJXB0dgsnhFa1&busi_data=eyJncm91cENvZGUiOiI4MTY3Mzk4NDIiLCJ0b2tlbiI6ImU1YW1KR3dNaXZoUXZDUWpYTWVncmdmMXhQV1RwQ21tbEhkdjB5VW45aWVPSjhFM2grMkRHNGdhWnhEU29oS08iLCJ1aW4iOiIxMTYzNDc2OTQ5In0%3D&data=adSomD6r40Al25rBr8PocFCKumQR5oxi1kq5jXjXxeJ49Z5cj4QLzbNf6vfIQKWMORrJntrZtcoyQuHg2ksUeA&svctype=4&tempid=h5_group_info)（群号：816739842）
+- Telegram 群组：[加入 Telegram 群组](https://t.me/+9hJAA3ZWQxxmMzE5)
+
+欢迎加群交流部署、使用与二次开发相关问题。
 
 ---
 

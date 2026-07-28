@@ -45,6 +45,27 @@ func TestBuildConnectionTestPayloadUsesStoreContent(t *testing.T) {
 	}
 }
 
+// TestBuildConnectionTestPayloadRandomizesMultiLineContent 验证多行测活内容
+// 按行随机抽取并展开变量（issue #320）。
+func TestBuildConnectionTestPayloadRandomizesMultiLineContent(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.SetTestContent("ping-a\nping-b\ncount {{rand:1-1}}")
+
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		payload := buildConnectionTestPayload(store, "gpt-5.5")
+		seen[gjson.GetBytes(payload, "input.0.content.0.text").String()] = true
+	}
+	for _, want := range []string{"ping-a", "ping-b", "count 1"} {
+		if !seen[want] {
+			t.Fatalf("candidate %q never sent in 200 draws; seen=%v", want, seen)
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("unexpected payload variants: %v", seen)
+	}
+}
+
 func TestFormatUsageLimitedTestErrorReportsSuccessfulProbeAsLimited(t *testing.T) {
 	msg, limited := formatUsageLimitedTestError(proxy.CodexUsageSyncResult{
 		Premium5hRateLimited: true,
@@ -59,6 +80,19 @@ func TestFormatUsageLimitedTestErrorReportsSuccessfulProbeAsLimited(t *testing.T
 		if !strings.Contains(msg, want) {
 			t.Fatalf("message %q does not contain %q", msg, want)
 		}
+	}
+}
+
+func TestFormatUsageLimitedTestErrorAcceptsSuccessfulProbeWhenIgnored(t *testing.T) {
+	msg, limited := formatUsageLimitedTestError(proxy.CodexUsageSyncResult{
+		Premium5hRateLimited:     false,
+		UsagePct5h:               100,
+		HasUsage5h:               true,
+		UsageWindowLimitsIgnored: true,
+	})
+
+	if limited || msg != "" {
+		t.Fatalf("formatUsageLimitedTestError() = (%q, %v), want empty successful result", msg, limited)
 	}
 }
 
@@ -105,6 +139,57 @@ func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "token_invalidated") {
 		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	}
+}
+
+// TestConnectionDeletedAgentRuntimeMarksBanned 验证连接测试会将 runtime 已删除的账号标记为封禁。
+func TestConnectionDeletedAgentRuntimeMarksBanned(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstreamBody := `{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	router := gin.New()
+	router.GET("/api/admin/accounts/:id/test", handler.TestConnection)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/accounts/42/test", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	cooldownReason, cooldownUntil := account.GetCooldownSnapshot()
+	if cooldownReason != "unauthorized" {
+		t.Fatalf("cooldown reason = %q, want unauthorized", cooldownReason)
+	}
+	if remaining := time.Until(cooldownUntil); remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
+		t.Fatalf("cooldown remaining = %s, want approximately 24h", remaining)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "Agent runtime has been deleted") {
+		t.Fatalf("ErrorMsg = %q, want deleted runtime message", errorMsg)
 	}
 }
 
