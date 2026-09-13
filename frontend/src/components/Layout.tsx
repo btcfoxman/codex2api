@@ -1,11 +1,12 @@
 import { type CSSProperties, type PropsWithChildren, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut, Download, Loader2, RefreshCw, Menu, X, CircleDollarSign, Braces } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut, Download, Loader2, RefreshCw, Menu, X, CircleDollarSign, Braces, FlaskConical } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState } from '../api'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
 import { useVersionCheck } from '../hooks/useVersionCheck'
+import { buildVersionLabel } from '../lib/buildVersion'
 import { useTheme } from '../hooks/useTheme'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
@@ -26,6 +27,7 @@ const navDefs: NavDef[] = [
   { to: '/api-keys', labelKey: 'nav.apiKeys', icon: <KeyRound className="size-[18px]" /> },
   { to: '/proxies', labelKey: 'nav.proxies', icon: <Globe className="size-[18px]" /> },
   { to: '/images/studio', labelKey: 'nav.images', icon: <ImageIcon className="size-[18px]" />, activePrefix: '/images' },
+  { to: '/quality-test', labelKey: 'nav.qualityTest', icon: <FlaskConical className="size-[18px]" /> },
   { to: '/prompt-filter/overview', labelKey: 'nav.promptFilter', icon: <ShieldAlert className="size-[18px]" />, activePrefix: '/prompt-filter' },
   { to: '/ops/overview', labelKey: 'nav.ops', icon: <Server className="size-[18px]" />, activePrefix: '/ops' },
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
@@ -287,6 +289,12 @@ export default function Layout({ children }: PropsWithChildren) {
     return location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
   }, [location.pathname])
 
+  // 表格重度页（账号管理 / 使用统计）在超宽屏上放开 96rem 限宽，减少横向滚动
+  const isFullWidthRoute =
+    location.pathname === '/usage' ||
+    location.pathname === '/accounts' ||
+    location.pathname.startsWith('/accounts/')
+
   const mobileMoreActive = useMemo(
     () => mobileMoreNav.some((item) => isNavActive(item)),
     [isNavActive],
@@ -374,7 +382,7 @@ export default function Layout({ children }: PropsWithChildren) {
                         tabIndex={sidebarCollapsed ? -1 : 0}
                         onClick={() => setShowVersionPopover((current) => !current)}
                       >
-                        {__APP_VERSION__}
+                        {buildVersionLabel(__APP_VERSION__)}
                         {hasUpdate && (
                           <span className="absolute -top-1.5 left-1/2 size-2.5 -translate-x-1/2 rounded-full bg-red-500 shadow-sm ring-2 ring-[hsl(var(--sidebar-background))] animate-pulse" />
                         )}
@@ -401,12 +409,12 @@ export default function Layout({ children }: PropsWithChildren) {
                             </div>
                           )}
                           {hasUpdate && updateUnavailableReason && (
-                            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] font-medium leading-relaxed text-amber-700">
+                            <div className="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-2 text-[11px] font-medium leading-relaxed text-amber-700 dark:text-amber-300">
                               {updateUnavailableReason}
                             </div>
                           )}
                           {hasUpdate && updateInfo?.warning && (
-                            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] font-medium leading-relaxed text-amber-700">
+                            <div className="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-2 text-[11px] font-medium leading-relaxed text-amber-700 dark:text-amber-300">
                               {updateInfo.warning}
                             </div>
                           )}
@@ -593,7 +601,7 @@ export default function Layout({ children }: PropsWithChildren) {
             data-slot="admin-mobile-topbar"
             className="mb-4 hidden max-lg:flex min-w-0 w-full max-w-full items-center justify-between gap-2 overflow-hidden rounded-xl border border-border bg-card/95 p-2.5 shadow-sm safe-pt"
           >
-            <div className="flex min-w-0 flex-1 items-center gap-2.5">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
               <button
                 type="button"
                 onClick={() => setMobileMoreOpen(true)}
@@ -603,22 +611,33 @@ export default function Layout({ children }: PropsWithChildren) {
               >
                 <Menu className="size-5" />
               </button>
-              <img src={logoSrc} alt={siteName} className="size-8 rounded-[10px] object-cover" />
-              <strong className="min-w-0 flex-1 truncate text-base font-semibold sm:text-lg" title={siteName}>
+              <img src={logoSrc} alt={siteName} className="size-8 rounded-[10px] object-cover shrink-0" />
+              <strong className="min-w-0 flex-1 truncate text-base font-semibold" title={siteName}>
                 {siteName}
               </strong>
+              <button
+                type="button"
+                className="relative inline-flex shrink-0 items-center rounded-md bg-primary/10 px-2 py-0.5 text-[11px] font-bold text-primary ring-1 ring-primary/10 transition-colors hover:bg-primary/15"
+                title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
+                onClick={() => setShowVersionPopover((current) => !current)}
+              >
+                {buildVersionLabel(__APP_VERSION__)}
+                {hasUpdate && (
+                  <span className="absolute -top-1 -right-1 size-2 rounded-full bg-red-500 shadow-sm ring-2 ring-card animate-pulse" />
+                )}
+              </button>
             </div>
             <div className="flex shrink-0 items-center gap-0.5">
               <button
                 onClick={toggleLang}
-                className="flex size-10 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+                className="flex size-9 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
                 title={i18n.language === 'zh' ? 'English' : '中文'}
               >
                 <Languages className="size-4" />
               </button>
               <button
                 onClick={handleThemeToggle}
-                className="flex size-10 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+                className="flex size-9 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
                 title={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
                 aria-label={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
               >
@@ -628,7 +647,7 @@ export default function Layout({ children }: PropsWithChildren) {
               </button>
               <button
                 onClick={resetAdminAuthState}
-                className="flex size-10 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+                className="flex size-9 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
                 title={t('common.logout')}
                 aria-label={t('common.logout')}
               >
@@ -637,8 +656,12 @@ export default function Layout({ children }: PropsWithChildren) {
             </div>
           </header>
 
-          <SecurityBanner />
-          <div className="min-h-full">{children}</div>
+          {/* 统一测宽：超宽屏上卡片/表格不再无界拉伸，与 Settings 固定导航的 72rem 上限同族。
+              账号管理/使用统计是列多的表格重度页，放开限宽让高分屏铺满（issue #522）。 */}
+          <div className={`mx-auto w-full ${isFullWidthRoute ? 'max-w-none' : 'max-w-[96rem]'}`}>
+            <SecurityBanner />
+            <div className="min-h-full">{children}</div>
+          </div>
         </main>
 
         {/* Mobile bottom nav — primary destinations only */}
@@ -696,8 +719,9 @@ export default function Layout({ children }: PropsWithChildren) {
               aria-label={t('common.close')}
               onClick={() => setMobileMoreOpen(false)}
             />
-            <div className="absolute inset-x-0 bottom-0 max-h-[min(82dvh,640px)] overflow-hidden rounded-t-2xl border border-border bg-card shadow-2xl safe-pb animate-in slide-in-from-bottom-4 fade-in-0 duration-200">
-              <div className="flex items-center justify-between border-b border-border px-4 py-3">
+            <div className="absolute inset-x-0 bottom-0 max-h-[min(85dvh,640px)] overflow-hidden rounded-t-2xl border border-border bg-card shadow-2xl safe-pb animate-in slide-in-from-bottom-4 fade-in-0 duration-200">
+              <div className="mx-auto my-2.5 h-1.5 w-10 rounded-full bg-muted-foreground/30" />
+              <div className="flex items-center justify-between border-b border-border px-4 pb-3">
                 <div>
                   <div className="text-sm font-semibold text-foreground">{t('common.moreMenu')}</div>
                   <div className="mt-0.5 text-xs text-muted-foreground">{t('common.moreMenuDesc')}</div>
@@ -711,7 +735,7 @@ export default function Layout({ children }: PropsWithChildren) {
                   <X className="size-5" />
                 </button>
               </div>
-              <div className="max-h-[calc(min(82dvh,640px)-4.5rem)] overflow-y-auto p-3">
+              <div className="max-h-[calc(min(85dvh,640px)-5rem)] overflow-y-auto p-3">
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                   {mobileMoreNav.map((item) => {
                     const active = isNavActive(item)
@@ -735,6 +759,15 @@ export default function Layout({ children }: PropsWithChildren) {
                       </NavLink>
                     )
                   })}
+                </div>
+                <div className="mt-4 flex items-center justify-between border-t border-border/80 pt-3 px-1 text-xs text-muted-foreground">
+                  <span className="inline-flex items-center gap-1.5 font-medium text-emerald-600 dark:text-emerald-400">
+                    <span className="size-2 rounded-full bg-emerald-500 animate-pulse" />
+                    {t('common.online')}
+                  </span>
+                  <span className="font-mono text-[11px] font-semibold">
+                    {buildVersionLabel(__APP_VERSION__)}
+                  </span>
                 </div>
               </div>
             </div>

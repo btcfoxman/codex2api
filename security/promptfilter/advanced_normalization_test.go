@@ -6,7 +6,9 @@ import (
 	"compress/zlib"
 	"encoding/base64"
 	"encoding/hex"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func encodedStrictConfig() Config {
@@ -151,6 +153,77 @@ func TestNormalizeAdvancedConfigClampsDecoderResources(t *testing.T) {
 	}
 	if cfg.ContextDiscount.MaxDiscount != 90 || cfg.ContextDiscount.OperationalMaxDiscount != 90 {
 		t.Fatalf("context discount limits were not clamped: %+v", cfg.ContextDiscount)
+	}
+}
+
+func TestAdaptiveReviewCompatibilityAndRecommendedDefaults(t *testing.T) {
+	compatibility := NormalizeAdvancedConfig(DefaultAdvancedConfig())
+	if compatibility.AdaptiveReview.Enabled {
+		t.Fatal("compatibility defaults unexpectedly enabled adaptive review")
+	}
+	if compatibility.AdaptiveReview.MinCleanReviews != 10 || compatibility.AdaptiveReview.MinObservationHours != 24 || compatibility.AdaptiveReview.SamplePercent != 5 || compatibility.AdaptiveReview.ForceReviewIntervalMinutes != 360 {
+		t.Fatalf("unexpected adaptive compatibility defaults: %+v", compatibility.AdaptiveReview)
+	}
+	recommended := RecommendedAdvancedConfig()
+	if !recommended.AdaptiveReview.Enabled {
+		t.Fatal("recommended protection did not enable adaptive review")
+	}
+	recommended.AdaptiveReview.SamplePercent = 999
+	recommended.AdaptiveReview.ReactivationCleanReviews = 999
+	recommended = NormalizeAdvancedConfig(recommended)
+	if recommended.AdaptiveReview.SamplePercent != 100 || recommended.AdaptiveReview.ReactivationCleanReviews != recommended.AdaptiveReview.MinCleanReviews {
+		t.Fatalf("adaptive review limits were not normalized: %+v", recommended.AdaptiveReview)
+	}
+}
+
+func TestConversationLockTTLDefaultsAndClamps(t *testing.T) {
+	cfg := NormalizeAdvancedConfig(AdvancedConfig{})
+	if cfg.Enforcement.ConversationLockTTLHours != 168 {
+		t.Fatalf("default conversation lock TTL = %d, want 168", cfg.Enforcement.ConversationLockTTLHours)
+	}
+	if cfg.Enforcement.UserCyberCooldownMinutes != DefaultUserCyberCooldownMinutes {
+		t.Fatalf("default user cyber cooldown = %d, want %d", cfg.Enforcement.UserCyberCooldownMinutes, DefaultUserCyberCooldownMinutes)
+	}
+	cfg.Enforcement.ConversationLockTTLHours = 9999
+	cfg.Enforcement.UserCyberCooldownMinutes = 9999
+	cfg = NormalizeAdvancedConfig(cfg)
+	if cfg.Enforcement.ConversationLockTTLHours != 720 {
+		t.Fatalf("clamped conversation lock TTL = %d, want 720", cfg.Enforcement.ConversationLockTTLHours)
+	}
+	if cfg.Enforcement.UserCyberCooldownMinutes != MaxUserCyberCooldownMinutes {
+		t.Fatalf("clamped user cyber cooldown = %d, want %d", cfg.Enforcement.UserCyberCooldownMinutes, MaxUserCyberCooldownMinutes)
+	}
+}
+
+func TestNormalizeAdvancedConfigLocalBlockMessage(t *testing.T) {
+	cfg := DefaultAdvancedConfig()
+	cfg.Enforcement.LocalBlockMessage = "  Request blocked by Example Gateway.  "
+
+	got := NormalizeAdvancedConfig(cfg)
+
+	if got.Enforcement.LocalBlockMessage != "Request blocked by Example Gateway." {
+		t.Fatalf("message = %q", got.Enforcement.LocalBlockMessage)
+	}
+}
+
+func TestNormalizeAdvancedConfigLocalBlockMessageRuneLimit(t *testing.T) {
+	cfg := DefaultAdvancedConfig()
+	cfg.Enforcement.LocalBlockMessage = strings.Repeat("界", MaxLocalBlockMessageRunes+1)
+
+	got := NormalizeAdvancedConfig(cfg)
+
+	if count := utf8.RuneCountInString(got.Enforcement.LocalBlockMessage); count != MaxLocalBlockMessageRunes {
+		t.Fatalf("runes = %d, want %d", count, MaxLocalBlockMessageRunes)
+	}
+}
+
+func TestNormalizeAdvancedConfigLocalBlockMessageTrimsAfterRuneLimit(t *testing.T) {
+	cfg := DefaultAdvancedConfig()
+	cfg.Enforcement.LocalBlockMessage = strings.Repeat("界", MaxLocalBlockMessageRunes-1) + "   尾"
+
+	got := NormalizeAdvancedConfig(cfg)
+	if strings.HasSuffix(got.Enforcement.LocalBlockMessage, " ") {
+		t.Fatalf("message retains trailing whitespace after truncation: %q", got.Enforcement.LocalBlockMessage[len(got.Enforcement.LocalBlockMessage)-4:])
 	}
 }
 

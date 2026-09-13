@@ -1,12 +1,15 @@
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   BarChart3,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
   ExternalLink,
   FileJson,
+  Fingerprint,
   FlaskConical,
   Lock,
   Pencil,
@@ -17,6 +20,7 @@ import {
   Timer,
   Trash2,
   Unlock,
+  X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
@@ -24,7 +28,11 @@ import AccountHealthBar from "./AccountHealthBar";
 import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
+import RequestCountPills from "./RequestCountPills";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Sheet,
   SheetBody,
@@ -35,7 +43,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
-import { formatLongUsageWindowLabel } from "../lib/usageFormat";
+import { formatLongUsageWindowLabel, getAccountStatusBadgeStatus } from "../lib/usageFormat";
 
 function isFutureTime(value?: string): boolean {
   if (!value) return false;
@@ -50,15 +58,87 @@ function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
   if (status === "rate_limited_7d") return "7d";
   if (reason === "rate_limited_5h") return "5h";
   if (reason === "rate_limited_7d") return "7d";
-  if (status === "rate_limited" || status === "quota_paused" || status === "usage_exhausted") {
-    if (account.reset_5h_at && isFutureTime(account.reset_5h_at)) return "5h";
-    if (account.reset_7d_at && isFutureTime(account.reset_7d_at)) return "7d";
-    if (typeof account.usage_percent_5h === "number" && account.usage_percent_5h >= 100)
-      return "5h";
-    if (typeof account.usage_percent_7d === "number" && account.usage_percent_7d >= 100)
-      return "7d";
+  const explicitlyRateLimited =
+    status === "rate_limited" ||
+    status === "responses_rate_limited" ||
+    status === "quota_paused" ||
+    status === "usage_exhausted" ||
+    reason === "responses_rate_limited";
+  if (!explicitlyRateLimited) return null;
+
+  if (
+    typeof account.usage_percent_7d === "number" &&
+    account.usage_percent_7d >= 100 &&
+    (!account.reset_7d_at || isFutureTime(account.reset_7d_at))
+  ) {
+    return "7d";
   }
-  return null;
+  if (
+    typeof account.usage_percent_5h === "number" &&
+    account.usage_percent_5h >= 100 &&
+    (!account.reset_5h_at || isFutureTime(account.reset_5h_at))
+  ) {
+    return "5h";
+  }
+
+  const has5hWindow =
+    typeof account.usage_percent_5h === "number" || !!account.reset_5h_at;
+  const has7dWindow =
+    typeof account.usage_percent_7d === "number" || !!account.reset_7d_at;
+  return has7dWindow && !has5hWindow ? "7d" : "5h";
+}
+
+// 复制邮箱按钮。navigator.clipboard 在非安全上下文（局域网 http 访问）下不存在，
+// 回退到隐藏 textarea + execCommand，否则内网部署里这个按钮会静默失效。
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  document.body.removeChild(ta);
+}
+
+function CopyValueButton({ value, label }: { value: string; label: string }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    try {
+      await copyTextToClipboard(value);
+      setCopied(true);
+    } catch {
+      // 剪贴板权限被拒时不打断查看详情，保持静默。
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={() => void handleCopy()}
+      title={copied ? t("common.copied") : label}
+      aria-label={label}
+      className="inline-flex size-6 shrink-0 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:border-border hover:bg-muted hover:text-foreground"
+    >
+      {copied ? (
+        <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+      ) : (
+        <Copy className="size-3.5" />
+      )}
+    </button>
+  );
 }
 
 function Section({
@@ -106,6 +186,7 @@ export interface AccountDetailSheetProps {
   healthBuckets?: AccountHealthBucket[];
   sequence?: number;
   usageSlot?: ReactNode;
+  providerSlot?: ReactNode;
   canGoPrev?: boolean;
   canGoNext?: boolean;
   refreshing?: boolean;
@@ -113,6 +194,7 @@ export interface AccountDetailSheetProps {
   onClose: () => void;
   onPrev?: () => void;
   onNext?: () => void;
+  onQuickConfig?: () => void;
   onEdit: () => void;
   onUsage: () => void;
   onTest: () => void;
@@ -121,6 +203,13 @@ export interface AccountDetailSheetProps {
   onToggleEnabled: () => void;
   onToggleLock: () => void;
   onResetStatus: () => void;
+  onSaveModelCooldownPolicy: (data: {
+    mode: "off" | "fixed" | "adaptive" | null;
+    seconds: number | null;
+    backoff_enabled: boolean | null;
+  }) => void;
+  onClearModelCooldown: (model: string) => void;
+  onClearAllModelCooldowns: () => void;
   onResetCredits: () => void;
   onDelete: () => void;
 }
@@ -131,6 +220,7 @@ export default function AccountDetailSheet({
   healthBuckets,
   sequence,
   usageSlot,
+  providerSlot,
   canGoPrev = false,
   canGoNext = false,
   refreshing = false,
@@ -138,6 +228,7 @@ export default function AccountDetailSheet({
   onClose,
   onPrev,
   onNext,
+  onQuickConfig,
   onEdit,
   onUsage,
   onTest,
@@ -146,11 +237,32 @@ export default function AccountDetailSheet({
   onToggleEnabled,
   onToggleLock,
   onResetStatus,
+  onSaveModelCooldownPolicy,
+  onClearModelCooldown,
+  onClearAllModelCooldowns,
   onResetCredits,
   onDelete,
 }: AccountDetailSheetProps) {
   const { t } = useTranslation();
   const open = Boolean(account);
+  const [cooldownMode, setCooldownMode] = useState<string>("inherit");
+  const [cooldownSeconds, setCooldownSeconds] = useState(300);
+  const [cooldownBackoff, setCooldownBackoff] = useState(true);
+
+  useEffect(() => {
+    if (!account) return;
+    setCooldownMode(account.model_cooldown_mode_override ?? "inherit");
+    setCooldownSeconds(
+      account.model_cooldown_seconds_override ??
+        account.model_cooldown_seconds_effective ??
+        300,
+    );
+    setCooldownBackoff(
+      account.model_cooldown_backoff_override ??
+        account.model_cooldown_backoff_effective ??
+        true,
+    );
+  }, [account]);
 
   useEffect(() => {
     if (!open) return;
@@ -172,8 +284,13 @@ export default function AccountDetailSheet({
       ? account.name || account.email || `#${account.id}`
       : account.email || account.name || `#${account.id}`
     : "";
+  // 标题退化成 "#12" 这种 id 兜底时没有复制价值（旁边就有 ID 徽章），不显示按钮。
+  const copyableName = Boolean(
+    account && displayName && displayName !== `#${account.id}`,
+  );
   const rateWindow = account ? getRateLimitWindow(account) : null;
   const isGrok = Boolean(account?.grok_api);
+  const isClaude = Boolean(account?.claude_api);
   // Grok API Key 无 refresh_token；Codex AT-only / Responses 也不走 AT 刷新。
   const refreshDisabled = Boolean(
     account &&
@@ -182,12 +299,13 @@ export default function AccountDetailSheet({
         account.openai_responses_api ||
         (isGrok && account.grok_auth_kind !== "oauth")),
   );
-  // auth.json / 额度券是 Codex 订阅路径专属，Grok 不展示。
+  // 凭据导出由各 provider 自己决定格式；Claude 使用专用安全导出端点，
+  // Grok 仍由其专用页面处理。旧的 Codex auth.json 行为保持不变。
   const showAuthJson = Boolean(account && !isGrok);
-  const showResetCredits = Boolean(account && !isGrok);
+  const showResetCredits = Boolean(account && !isGrok && !isClaude);
   const authJsonDisabled = Boolean(
     account &&
-      (authJsonExporting || account.at_only || account.openai_responses_api),
+      (authJsonExporting || (!isClaude && (account.at_only || account.openai_responses_api))),
   );
   const resetCredits = account?.rate_limit_reset_credits ?? 0;
   const healthLabel = (() => {
@@ -232,7 +350,9 @@ export default function AccountDetailSheet({
             <div className="flex items-start justify-between gap-3 pr-2">
               <div className="flex min-w-0 flex-1 items-start gap-3">
                 <span className="mt-0.5 flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-card ring-1 ring-border shadow-sm">
-                  {account.grok_api ? (
+                  {account.claude_api ? (
+                    <ChannelLogo channel="claude" size={22} />
+                  ) : account.grok_api ? (
                     <ChannelLogo channel="grok" size={22} />
                   ) : account.openai_responses_api ? (
                     <ModelLogo model="openai" variant="plain" size={22} />
@@ -256,13 +376,41 @@ export default function AccountDetailSheet({
                     </span>
                   )}
                 </div>
-                <SheetTitle className="break-all text-[17px] leading-snug">
-                  {displayName}
-                </SheetTitle>
-                {account.chatgpt_account_id ? (
-                  <SheetDescription className="mt-1 break-all font-mono text-[11px]">
-                    {account.chatgpt_account_id}
-                  </SheetDescription>
+                <div className="flex items-start gap-1.5">
+                  <SheetTitle className="break-all text-[17px] leading-snug">
+                    {displayName}
+                  </SheetTitle>
+                  {copyableName && (
+                    <span className="mt-0.5">
+                      <CopyValueButton
+                        value={displayName}
+                        label={
+                          displayName.includes("@")
+                            ? t("accounts.detailCopyEmail")
+                            : t("common.copy")
+                        }
+                      />
+                    </span>
+                  )}
+                </div>
+                {account.effective_workspace_id ? (
+                  <div className="mt-1 space-y-0.5">
+                    <SheetDescription className="break-all font-mono text-[11px]">
+                      {account.workspace_id_override
+                        ? `${t("accounts.workspaceRouteBadge")}: `
+                        : ""}
+                      {account.effective_workspace_id}
+                    </SheetDescription>
+                    {account.workspace_id_override &&
+                    account.token_workspace_id &&
+                    account.token_workspace_id !==
+                      account.effective_workspace_id ? (
+                      <SheetDescription className="break-all font-mono text-[10px] text-muted-foreground/70">
+                        {t("accounts.tokenWorkspaceLabel")}:{" "}
+                        {account.token_workspace_id}
+                      </SheetDescription>
+                    ) : null}
+                  </div>
                 ) : isGrok && account.email && account.name && account.email !== account.name ? (
                   <SheetDescription className="mt-1 break-all text-[12px]">
                     {account.email}
@@ -306,16 +454,22 @@ export default function AccountDetailSheet({
               <div className="space-y-3 rounded-xl border border-border bg-card p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <StatusBadge
-                    status={account.status}
+                    status={getAccountStatusBadgeStatus(account)}
                     detail={rateWindow ?? undefined}
                     errorMessage={account.error_message}
                   />
-                  {(account.active_requests ?? 0) > 0 && (
+                  {Math.max(account.active_requests ?? 0, account.occupied_requests ?? 0) > 0 && (
                     <span className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 dark:text-blue-400">
                       <span className="size-1.5 animate-pulse rounded-full bg-blue-500" />
-                      {t("accounts.activeRequestsTooltip", {
-                        count: account.active_requests ?? 0,
-                      })}
+                      {account.session_slot_buffer_enabled === true
+                        ? t("accounts.occupiedRequestsTooltip", {
+                            active: account.active_requests ?? 0,
+                            occupied: account.occupied_requests ?? account.active_requests ?? 0,
+                            buffered: (account.occupied_requests ?? account.active_requests ?? 0) - (account.active_requests ?? 0),
+                          })
+                        : t("accounts.activeRequestsTooltip", {
+                            count: account.active_requests ?? 0,
+                          })}
                     </span>
                   )}
                   {account.enabled === false && (
@@ -369,6 +523,140 @@ export default function AccountDetailSheet({
               </div>
             </Section>
 
+            {providerSlot}
+
+            {!isGrok ? <Section
+              title={t("accounts.modelCooldownPolicy")}
+              action={
+                (account.model_cooldowns?.length ?? 0) > 0 ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    onClick={onClearAllModelCooldowns}
+                    className="h-7 text-[11px] text-amber-700 dark:text-amber-300"
+                  >
+                    <X className="size-3" />
+                    {t("accounts.clearAllModelCooldowns")}
+                  </Button>
+                ) : null
+              }
+            >
+              <div className="space-y-3 rounded-xl border border-border bg-card p-3">
+                <div className="rounded-lg bg-muted/40 px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
+                  {t("accounts.modelCooldownEffective", {
+                    mode: t(
+                      `settings.modelCooldownMode${(
+                        account.model_cooldown_mode_effective ?? "adaptive"
+                      )
+                        .charAt(0)
+                        .toUpperCase()}${(
+                        account.model_cooldown_mode_effective ?? "adaptive"
+                      ).slice(1)}`,
+                    ),
+                    seconds: account.model_cooldown_seconds_effective ?? 0,
+                    backoff: account.model_cooldown_backoff_effective
+                      ? t("common.enabled")
+                      : t("common.disabled"),
+                  })}
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="col-span-2">
+                    <label className="mb-1 block text-[11px] font-medium text-muted-foreground">
+                      {t("accounts.modelCooldownModeOverride")}
+                    </label>
+                    <Select
+                      value={cooldownMode}
+                      onValueChange={setCooldownMode}
+                      options={[
+                        { label: t("accounts.modelCooldownInherit"), value: "inherit" },
+                        { label: t("settings.modelCooldownModeOff"), value: "off" },
+                        { label: t("settings.modelCooldownModeFixed"), value: "fixed" },
+                        { label: t("settings.modelCooldownModeAdaptive"), value: "adaptive" },
+                      ]}
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] font-medium text-muted-foreground">
+                      {t("settings.modelCooldownSeconds")}
+                    </label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={1800}
+                      value={cooldownSeconds}
+                      disabled={cooldownMode === "off"}
+                      onChange={(event) =>
+                        setCooldownSeconds(
+                          Math.max(1, Math.min(1800, Number(event.target.value) || 1)),
+                        )
+                      }
+                    />
+                  </div>
+                  <div className="flex items-end">
+                    <div className="flex h-10 w-full items-center justify-between rounded-md border border-input px-3">
+                      <span className="text-xs text-muted-foreground">
+                        {t("settings.modelCooldownBackoff")}
+                      </span>
+                      <Switch
+                        checked={cooldownBackoff}
+                        disabled={cooldownMode !== "adaptive"}
+                        onCheckedChange={setCooldownBackoff}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  onClick={() =>
+                    onSaveModelCooldownPolicy({
+                      mode:
+                        cooldownMode === "inherit"
+                          ? null
+                          : (cooldownMode as "off" | "fixed" | "adaptive"),
+                      seconds:
+                        cooldownMode === "inherit" ? null : cooldownSeconds,
+                      backoff_enabled:
+                        cooldownMode === "inherit" ? null : cooldownBackoff,
+                    })
+                  }
+                >
+                  {t("accounts.saveModelCooldownPolicy")}
+                </Button>
+                {(account.model_cooldowns?.length ?? 0) > 0 ? (
+                  <div className="space-y-1.5 border-t border-border pt-3">
+                    {account.model_cooldowns?.map((cooldown) => (
+                      <div
+                        key={cooldown.model}
+                        className="flex items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-2.5 py-2 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-amber-800 dark:text-amber-200">
+                            {cooldown.model}
+                          </div>
+                          <div className="text-[10px] text-muted-foreground">
+                            {cooldown.reason} · {cooldown.remaining_seconds}s
+                          </div>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => onClearModelCooldown(cooldown.model)}
+                          title={t("accounts.clearModelCooldown")}
+                        >
+                          <X className="size-3.5" />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </Section> : null}
+
             <Section
               title={t("accounts.usage")}
               action={
@@ -394,22 +682,7 @@ export default function AccountDetailSheet({
             <Section title={t("accounts.detailMetrics")}>
               <div className="grid grid-cols-2 gap-2">
                 <MetricCard label={t("accounts.requests")}>
-                  <div className="flex items-baseline gap-1.5 tabular-nums">
-                    <span className="font-semibold text-emerald-600 dark:text-emerald-400">
-                      {account.success_requests ?? 0}
-                    </span>
-                    <span className="text-muted-foreground">/</span>
-                    <span className="font-semibold text-red-500">
-                      {account.error_requests ?? 0}
-                    </span>
-                  </div>
-                  {((account.retry_error_requests ?? 0) > 0 ||
-                    (account.rate_limit_attempts ?? 0) > 0) && (
-                    <div className="mt-1 text-[11px] text-muted-foreground">
-                      retry {account.retry_error_requests ?? 0} · 429{" "}
-                      {account.rate_limit_attempts ?? 0}
-                    </div>
-                  )}
+                  <RequestCountPills account={account} />
                 </MetricCard>
                 <MetricCard label={t("accounts.billed")}>
                   {h5 === null && d7 === null ? (
@@ -428,6 +701,11 @@ export default function AccountDetailSheet({
                     {formatBeijingTime(account.created_at)}
                   </span>
                 </MetricCard>
+                {account.codex_last_refresh_at ? (
+                  <MetricCard label={t("accounts.lastTokenRefresh")}>
+                    <span className="text-[12px]">{formatBeijingTime(account.codex_last_refresh_at)}</span>
+                  </MetricCard>
+                ) : null}
                 <MetricCard label={t("accounts.updatedAt")}>
                   <div className="space-y-0.5 text-[12px]">
                     <div>{formatRelativeTime(account.updated_at)}</div>
@@ -441,6 +719,14 @@ export default function AccountDetailSheet({
                 </MetricCard>
               </div>
             </Section>
+
+            {account.codex_refresh_error ? (
+              <Section title={t("accounts.tokenRefreshNotice")}>
+                <p className="break-words rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-900 dark:text-amber-200">
+                  {account.codex_refresh_error}
+                </p>
+              </Section>
+            ) : null}
 
             {((account.tags ?? []).length > 0 || groups.length > 0) && (
               <Section title={t("accounts.detailOrganization")}>
@@ -488,6 +774,7 @@ export default function AccountDetailSheet({
               account.at_only ||
               account.openai_responses_api ||
               account.grok_api ||
+              account.claude_api ||
               account.base_url ||
               (!account.openai_responses_api &&
                 (account.models?.length ?? 0) > 0)) && (
@@ -511,6 +798,14 @@ export default function AccountDetailSheet({
                       <span className="font-medium text-foreground">
                         {t("accounts.detailApiResponses")}
                       </span>
+                    </div>
+                  )}
+                  {isClaude && (
+                    <div className="flex justify-between gap-3">
+                      <span className="text-muted-foreground">
+                        {t("accounts.detailAuthType")}
+                      </span>
+                      <span className="font-medium text-foreground">{t("claude.authOAuth")}</span>
                     </div>
                   )}
                   {isGrok && (
@@ -574,6 +869,18 @@ export default function AccountDetailSheet({
 
           <SheetFooter>
             <div className="grid grid-cols-2 gap-2">
+              {onQuickConfig ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onQuickConfig}
+                  className="col-span-2 border-primary/40 bg-primary/10 font-bold text-primary hover:bg-primary/20"
+                >
+                  <Fingerprint className="size-4 text-primary" />
+                  <span>指纹与快捷配置</span>
+                </Button>
+              ) : null}
               <Button type="button" variant="default" size="sm" onClick={onEdit}>
                 <Pencil className="size-3.5" />
                 {t("accounts.editScheduler")}
@@ -596,7 +903,9 @@ export default function AccountDetailSheet({
                 <RefreshCw
                   className={`size-3.5 ${refreshing ? "animate-spin" : ""}`}
                 />
-                {isGrok
+                {isClaude
+                  ? t("claude.actionRefresh")
+                  : isGrok
                   ? t("grok.actionRefresh")
                   : t("accounts.actionRefreshAT")}
               </Button>
@@ -609,7 +918,7 @@ export default function AccountDetailSheet({
                   onClick={onGenerateAuthJson}
                 >
                   <FileJson className="size-3.5" />
-                  {t("accounts.actionAuthJson")}
+                  {isClaude ? t("claude.exportCredential") : t("accounts.actionAuthJson")}
                 </Button>
               )}
               <Button

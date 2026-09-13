@@ -33,6 +33,12 @@ func TestShouldMarkBatchTestAccountError(t *testing.T) {
 			want:       true,
 		},
 		{
+			name:       "bare payment required is account scoped",
+			statusCode: http.StatusPaymentRequired,
+			body:       []byte(`{"detail":"Payment Required"}`),
+			want:       true,
+		},
+		{
 			name:       "invalid grant bad request is account scoped",
 			statusCode: http.StatusBadRequest,
 			body:       []byte(`{"error":"invalid_grant"}`),
@@ -58,6 +64,62 @@ func TestShouldMarkBatchTestAccountError(t *testing.T) {
 				t.Fatalf("shouldMarkBatchTestAccountError() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBatchOperationHTTPStatus(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  string
+		message string
+		want    int
+	}{
+		{name: "success", status: "success", message: "测试通过", want: http.StatusOK},
+		{name: "upstream chinese", status: "failed", message: "上游返回 402: workspace deactivated", want: http.StatusPaymentRequired},
+		{name: "http prefix", status: "failed", message: "HTTP 500: upstream failed", want: http.StatusInternalServerError},
+		{name: "embedded status", status: "failed", message: "token endpoint returned status 401", want: http.StatusUnauthorized},
+		{name: "status code", status: "failed", message: "token endpoint returned status code 403", want: http.StatusForbidden},
+		{name: "status equals", status: "failed", message: "OAuth refresh failed (status=429)", want: http.StatusTooManyRequests},
+		{name: "application error", status: "failed", message: "response.failed: model unavailable", want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := batchOperationHTTPStatus(tt.status, tt.message); got != tt.want {
+				t.Fatalf("batchOperationHTTPStatus(%q, %q) = %d, want %d", tt.status, tt.message, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEmitBatchTestProgressIncludesStructuredResult(t *testing.T) {
+	var completed, success, failed, banned, rateLimited int64
+	atomic.StoreInt64(&failed, 1)
+	atomic.StoreInt64(&rateLimited, 1)
+
+	var got batchOperationEvent
+	handler := &Handler{}
+	handler.emitBatchTestProgress(
+		func(event batchOperationEvent) {
+			got = event
+		},
+		42,
+		3,
+		&completed,
+		&success,
+		&failed,
+		&banned,
+		&rateLimited,
+		"rate_limited",
+		"上游返回 429: 账号触发限流",
+	)
+
+	if got.Type != "progress" || got.Action != "batch_test" {
+		t.Fatalf("event type/action = %q/%q, want progress/batch_test", got.Type, got.Action)
+	}
+	if got.AccountID != 42 || got.Status != "rate_limited" || got.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("event account/status/http = %d/%q/%d, want 42/rate_limited/429", got.AccountID, got.Status, got.HTTPStatus)
+	}
+	if got.Current != 1 || got.Total != 3 || got.Failed != 1 || got.RateLimited != 1 {
+		t.Fatalf("event counters = current:%d total:%d failed:%d rate_limited:%d", got.Current, got.Total, got.Failed, got.RateLimited)
 	}
 }
 
@@ -285,7 +347,7 @@ func TestRunSingleBatchTestResponseFailedMarksReadyAccountError(t *testing.T) {
 	}
 }
 
-func TestRunSingleBatchTestUsageLimitResponseFailedMarksRateLimited(t *testing.T) {
+func TestRunSingleBatchTestRelayUsageLimitDoesNotPersistAccountCooldown(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -310,8 +372,8 @@ func TestRunSingleBatchTestUsageLimitResponseFailedMarksRateLimited(t *testing.T
 	if status != "rate_limited" {
 		t.Fatalf("status = %q, message = %q, want rate_limited", status, msg)
 	}
-	if got := account.RuntimeStatus(); got != "rate_limited" {
-		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active for direct API upstream", got)
 	}
 }
 
@@ -397,6 +459,89 @@ func TestRunSingleBatchTestUnauthorizedRecordsErrorMessage(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "token_invalidated") {
 		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	}
+}
+
+func TestRunSingleBatchTestSkipsDeactivatedWorkspaceHandshake(t *testing.T) {
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":{"code":"deactivated_workspace"}}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	trigger := &auth.Account{
+		DBID:        1,
+		AccessToken: "at-trigger",
+		AccountID:   "org-ws",
+		PlanType:    "team",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	k12Seat := &auth.Account{
+		DBID:        2,
+		AccessToken: "at-k12",
+		AccountID:   "seat-k12",
+		PlanType:    "k12",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	k12Seat.CustomHeaders = map[string]string{"Chatgpt-Account-Id": "org-ws"}
+	store.AddAccount(trigger)
+	store.AddAccount(k12Seat)
+	store.MarkDeactivatedWorkspace(trigger, "WHAM 用量探针返回 402: deactivated_workspace")
+
+	handler := &Handler{store: store}
+	status, msg := handler.runSingleBatchTest(context.Background(), k12Seat)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
+	}
+	if !strings.Contains(msg, "工作区联动") {
+		t.Fatalf("message = %q, want linked workspace skip", msg)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("deactivated workspace sibling still probed upstream %d times", hits.Load())
+	}
+	if k12Seat.RuntimeStatus() != "error" {
+		t.Fatalf("k12 status = %q, want error", k12Seat.RuntimeStatus())
+	}
+}
+
+func TestRunSingleBatchTestPaymentRequiredMarksError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":"Payment Required"}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
+	}
+	if got := account.RuntimeStatus(); got != "error" {
+		t.Fatalf("RuntimeStatus() = %q, want error", got)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "402") {
+		t.Fatalf("ErrorMsg = %q, want 402", errorMsg)
 	}
 }
 

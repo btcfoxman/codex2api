@@ -2,9 +2,12 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +15,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
+	"github.com/gin-gonic/gin"
 )
 
 func TestUpstreamResetErrorMessage_CreditsOnlyMapsToChineseAndKeepsRaw(t *testing.T) {
@@ -462,5 +466,145 @@ func TestConsumeResetCreditLockedRefreshes401WithSameRequestID(t *testing.T) {
 	}
 	if outcome.WindowsReset != 1 || outcome.Remaining != 0 {
 		t.Fatalf("outcome = %+v", outcome)
+	}
+}
+
+// 手动重置必须等用量探针跑完再响应。此前响应先于探针返回，前端收到成功立刻刷新，
+// 拿到的还是旧的用量与状态，表现为「点了重置但进度条和状态没变，得去点测试连接再手动刷新」。
+func TestResetCreditsWaitsForUsageProbeBeforeResponding(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 21, AccountID: "workspace-21", AccessToken: "token", PlanType: "plus"}
+	account.SetRateLimitResetCredits(1)
+	store.AddAccount(account)
+
+	probeStarted := make(chan struct{})
+	var probeFinished atomic.Bool
+	handler := &Handler{
+		store: store,
+		consumeResetCredit: func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error) {
+			return &proxy.WhamResetResult{WindowsReset: 2}, &http.Response{StatusCode: http.StatusOK}, nil
+		},
+		recordAccountEvent: func(int64, string, string) {},
+		probeUsage: func(context.Context, *auth.Account) error {
+			close(probeStarted)
+			// 模拟一次真实的 wham 往返：响应绝不能抢在它前面返回。
+			time.Sleep(150 * time.Millisecond)
+			probeFinished.Store(true)
+			return nil
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "21"}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/accounts/21/reset-credits", nil)
+
+	handler.ResetCredits(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-probeStarted:
+	default:
+		t.Fatal("usage probe never started")
+	}
+	if !probeFinished.Load() {
+		t.Fatal("response returned before the usage probe finished — the UI would show stale usage")
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if refreshed, _ := payload["usage_refreshed"].(bool); !refreshed {
+		t.Errorf("usage_refreshed = %v, want true", payload["usage_refreshed"])
+	}
+}
+
+// 重置券不可退：客户端断开不得中断已经发出的消费。若消费挂在请求 context 上，
+// 断开会把「已经扣掉的券」报成失败，用户重试时另生成幂等键，同一张券被扣两次。
+func TestResetCreditsSurvivesClientDisconnect(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 23, AccountID: "workspace-23", AccessToken: "token", PlanType: "plus"}
+	account.SetRateLimitResetCredits(1)
+	store.AddAccount(account)
+
+	var consumeCtxErr error
+	consumes := 0
+	handler := &Handler{
+		store: store,
+		consumeResetCredit: func(ctx context.Context, _ *auth.Account, _, _ string) (*proxy.WhamResetResult, *http.Response, error) {
+			consumes++
+			// 上游往返期间客户端已经走了：这里的 context 不能是已取消的。
+			consumeCtxErr = ctx.Err()
+			return &proxy.WhamResetResult{WindowsReset: 1}, &http.Response{StatusCode: http.StatusOK}, nil
+		},
+		recordAccountEvent: func(int64, string, string) {},
+		probeUsage:         func(context.Context, *auth.Account) error { return nil },
+	}
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "23"}}
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/23/reset-credits", nil)
+	// 客户端在网关发出上游请求之前就断开。
+	cancelledCtx, cancel := context.WithCancel(req.Context())
+	cancel()
+	c.Request = req.WithContext(cancelledCtx)
+
+	handler.ResetCredits(c)
+
+	if consumes != 1 {
+		t.Fatalf("consume calls = %d, want exactly 1", consumes)
+	}
+	if consumeCtxErr != nil {
+		t.Fatalf("consume ran with a cancelled context (%v) — an already-spent credit would be reported as failure and invite a double spend", consumeCtxErr)
+	}
+	if remaining, ok := account.GetRateLimitResetCredits(); !ok || remaining != 0 {
+		t.Fatalf("remaining credits = %d (ok=%v), want 0 after a completed consume", remaining, ok)
+	}
+}
+
+// 探针不可用时不能把请求挂住：usage_refreshed 报 false，让前端稍后补刷。
+func TestResetCreditsReportsUnrefreshedWhenProbeMissing(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 22, AccountID: "workspace-22", AccessToken: "token", PlanType: "plus"}
+	account.SetRateLimitResetCredits(1)
+	store.AddAccount(account)
+
+	handler := &Handler{
+		store: store,
+		consumeResetCredit: func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error) {
+			return &proxy.WhamResetResult{WindowsReset: 1}, &http.Response{StatusCode: http.StatusOK}, nil
+		},
+		recordAccountEvent: func(int64, string, string) {},
+		probeUsage:         nil,
+	}
+	// 关闭后置刷新通道，模拟探针不可用。
+	handler.resetCreditPostClosed = true
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "22"}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/accounts/22/reset-credits", nil)
+
+	start := time.Now()
+	handler.ResetCredits(c)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("handler blocked for %s, want an immediate return when no probe is available", elapsed)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if refreshed, _ := payload["usage_refreshed"].(bool); refreshed {
+		t.Error("usage_refreshed = true, want false when no probe ran")
 	}
 }

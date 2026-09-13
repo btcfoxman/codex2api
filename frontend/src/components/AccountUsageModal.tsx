@@ -5,18 +5,26 @@ import { useTranslation } from 'react-i18next'
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts'
 import {
   Activity,
+  AlertTriangle,
+  Banknote,
   BarChart3,
   Clock3,
+  Coins,
   Gauge,
   KeyRound,
+  Link2,
   Package,
+  Receipt,
+  RefreshCw,
   RotateCcw,
   Search,
   Zap,
 } from 'lucide-react'
 import Modal from './Modal'
 import { api } from '../api'
-import type { AccountKeyStat, AccountModelStat, AccountRow, AccountUsageDayStat, AccountUsageDetail, ResetCreditItem } from '../types'
+import type { AccountKeyStat, AccountModelStat, AccountRow, AccountUsageDayStat, AccountUsageDetail, ResetCreditItem, WhamDailyUsageBreakdownEntry, WhamDailyUsageCycle, WhamDailyUsageItem, WhamDailyUsageResponse, WhamDailyUsageSplit } from '../types'
+import { formatUsageNumber, officialUsdFromDailyItems, supportsOfficialUsage } from '../lib/usageFormat'
+import { useShowFullUsageNumbers } from '../hooks/useShowFullUsageNumbers'
 import { getErrorMessage } from '../utils/error'
 import { formatBeijingTime } from '../utils/time'
 
@@ -33,7 +41,11 @@ const COLORS = [
   '#db2777',
 ]
 
-type UsagePage = 'overview' | 'detail' | 'quality'
+// 官方统计的数据来源，展示在范围选择器旁边（与后端 proxy.WhamDailyUsageURL 一致）。
+const WHAM_DAILY_USAGE_ENDPOINT =
+  'https://chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts'
+
+type UsagePage = 'overview' | 'detail' | 'quality' | 'official'
 type UsageRangeKey = '7' | '30' | '90' | 'all'
 type ModelMetricKey = 'requests' | 'tokens' | 'cost'
 type QualityTone = 'neutral' | 'success' | 'warning' | 'danger'
@@ -51,24 +63,42 @@ const MODEL_METRIC_OPTIONS: Array<{ key: ModelMetricKey; labelKey: string }> = [
   { key: 'cost', labelKey: 'accounts.usageModelMetricCost' },
 ]
 
+export interface OfficialUsageRefreshPatch {
+  accountId: number
+  officialUsd: number | null
+}
+
 interface Props {
   account: AccountRow
   onClose: () => void
   onCreditsReset?: () => void
   // Codex 专属的额度券/credit 设置区块;Grok 等非 Codex 账号传 false 隐藏。
   showCreditSettings?: boolean
+  // 打开时直接停在指定 tab（列表里点「官方结算」成本就该落在官方统计上，
+  // 而不是让用户开完概览再自己切一次）。
+  initialPage?: UsagePage
+  // 官方统计同步成功后回调:列表页立刻用这次 7d 额度改徽章,
+  // 并重拉 page-stats 对齐快照,不用等下一次翻页。
+  onOfficialUsageRefreshed?: (patch: OfficialUsageRefreshPatch) => void
+  // 官方统计 tab 强制开关:Claude 等无 ChatGPT 官方结算链路的渠道传 false 隐藏;
+  // 缺省时按 supportsOfficialUsage(account) 自动判定。
+  officialUsage?: boolean
 }
 
-export default function AccountUsageModal({ account, onClose, onCreditsReset, showCreditSettings = true }: Props) {
+export default function AccountUsageModal({ account, onClose, onCreditsReset, showCreditSettings = true, initialPage, onOfficialUsageRefreshed, officialUsage }: Props) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const [data, setData] = useState<AccountUsageDetail | null>(null)
   const [dataRange, setDataRange] = useState<UsageRangeKey | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [page, setPage] = useState<UsagePage>('overview')
+  const [page, setPage] = useState<UsagePage>(initialPage ?? 'overview')
   const [range, setRange] = useState<UsageRangeKey>('30')
   const requestSeq = useRef(0)
+
+  // 官方结算统计只有 ChatGPT OAuth 账号能查（wham 端点属于 ChatGPT 后端）。
+  // codex_at、Responses API 中转和 Grok 没有这条链路，不显示这个 tab。
+  const showOfficialUsage = officialUsage ?? supportsOfficialUsage(account)
 
   const [creditEnabled, setCreditEnabled] = useState(account.credit_enabled ?? false)
   const [creditSkipWindow, setCreditSkipWindow] = useState(account.credit_skip_usage_window ?? false)
@@ -114,24 +144,37 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
     navigate(`/usage?${params.toString()}`)
   }
 
-  const handleCreditToggle = async (field: 'credit_enabled' | 'credit_skip_usage_window', value: boolean) => {
+  // 单开关同时写两列：后端门控是 CreditEnabled && CreditSkipUsageWindow，保持不动，
+  // 只是界面不再暴露那个自身无行为的中间开关。
+  const handleCreditToggle = async (value: boolean) => {
     setCreditError(null)
-    const newEnabled = field === 'credit_enabled' ? value : creditEnabled
-    const newSkip = field === 'credit_skip_usage_window' ? value : creditSkipWindow
     setSavingCredit(true)
+    // 乐观更新：开关立刻滑过去，不等请求往返（后端这一步可能顺带释放冷却、耗时可观）。
+    // 失败再回滚到原值并显示错误。
+    const prevEnabled = creditEnabled
+    const prevSkipWindow = creditSkipWindow
+    setCreditEnabled(value)
+    setCreditSkipWindow(value)
     try {
       await api.updateAccountCredit(account.id, {
-        credit_enabled: newEnabled,
-        credit_skip_usage_window: newSkip,
+        credit_enabled: value,
+        credit_skip_usage_window: value,
       })
-      if (field === 'credit_enabled') setCreditEnabled(value)
-      if (field === 'credit_skip_usage_window') setCreditSkipWindow(value)
+      // 后端在积分门打开时可能释放了用量窗口冷却，让外层刷新以更新状态与徽章。
+      onCreditsReset?.()
     } catch (err) {
+      setCreditEnabled(prevEnabled)
+      setCreditSkipWindow(prevSkipWindow)
       setCreditError(getErrorMessage(err))
     } finally {
       setSavingCredit(false)
     }
   }
+
+  // 从列表点「官方结算」进来时，官方统计不依赖本地 usage_logs。
+  // 先把官方页亮出来并立刻打上游，徽章才能对齐这次同步时间点，
+  // 不用卡在网关用量接口后面。
+  const officialReady = page === 'official' && showOfficialUsage
 
   return (
     <Modal
@@ -141,13 +184,13 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
       contentClassName="sm:max-w-[960px]"
       bodyClassName="px-5 py-5 sm:px-6"
     >
-      {loading && !data ? (
+      {loading && !data && !officialReady ? (
         <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
           {t('common.loading')}
         </div>
-      ) : error && !data ? (
+      ) : error && !data && !officialReady ? (
         <div className="py-8 text-center text-sm text-red-500">{error}</div>
-      ) : !data ? (
+      ) : !data && !officialReady ? (
         <div className="py-12 text-center text-sm text-muted-foreground">
           {t('accounts.noUsageData')}
         </div>
@@ -155,8 +198,9 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
         <UsageStatsContent
           account={account}
           accountLabel={accountLabel}
-          data={data}
-          page={page}
+          data={data ?? emptyUsageDetail()}
+          // 中转账号没有官方统计 tab，深链进来时退回概览而不是停在空白页。
+          page={page === 'official' && !showOfficialUsage ? 'overview' : page}
           range={range}
           dataRange={dataRange || range}
           refreshing={loading}
@@ -164,12 +208,15 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
           onPageChange={setPage}
           onRangeChange={setRange}
           onViewLogs={handleViewLogs}
+          showOfficialUsage={showOfficialUsage}
+          onOfficialUsageRefreshed={onOfficialUsageRefreshed}
         />
       )}
 
       {showCreditSettings && (
         <>
           <CreditSettings
+            account={account}
             creditEnabled={creditEnabled}
             creditSkipWindow={creditSkipWindow}
             savingCredit={savingCredit}
@@ -196,6 +243,8 @@ function UsageStatsContent({
   onPageChange,
   onRangeChange,
   onViewLogs,
+  showOfficialUsage,
+  onOfficialUsageRefreshed,
 }: {
   account: AccountRow
   accountLabel: string
@@ -208,6 +257,11 @@ function UsageStatsContent({
   onPageChange: (page: UsagePage) => void
   onRangeChange: (range: UsageRangeKey) => void
   onViewLogs: () => void
+  showOfficialUsage: boolean
+  onOfficialUsageRefreshed?: (patch: OfficialUsageRefreshPatch) => void
+  // 官方统计 tab 强制开关:Claude 等无 ChatGPT 官方结算链路的渠道传 false 隐藏;
+  // 缺省时按 supportsOfficialUsage(account) 自动判定。
+  officialUsage?: boolean
 }) {
   const { t } = useTranslation()
   const activeDays = Math.max(0, data.active_days || 0)
@@ -260,7 +314,7 @@ function UsageStatsContent({
               <Search className="size-3.5" />
               {t('accounts.usageViewLogs')}
             </button>
-            <div className="grid h-9 grid-cols-3 rounded-lg border bg-muted/40 p-1">
+            <div className={`grid h-9 ${showOfficialUsage ? 'grid-cols-4' : 'grid-cols-3'} rounded-lg border bg-muted/40 p-1`}>
               <PageButton
                 active={page === 'overview'}
                 icon={<Gauge className="size-3.5" />}
@@ -279,6 +333,14 @@ function UsageStatsContent({
                 label={t('accounts.usageQualityTab')}
                 onClick={() => onPageChange('quality')}
               />
+              {showOfficialUsage && (
+                <PageButton
+                  active={page === 'official'}
+                  icon={<Receipt className="size-3.5" />}
+                  label={t('accounts.usageOfficialTab')}
+                  onClick={() => onPageChange('official')}
+                />
+              )}
             </div>
           </div>
         </div>
@@ -297,6 +359,20 @@ function UsageStatsContent({
               />
             ))}
           </div>
+          {/* 官方统计与其他 tab 的数据源不同(上游账单 vs 本地 usage_logs),
+              把来源端点标出来,免得两套口径对不上时无从查起。 */}
+          {page === 'official' && (
+            <span
+              className="ml-auto inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-lg border border-primary/20 bg-primary/5 px-2.5 py-1 text-[11px] text-muted-foreground"
+              title={WHAM_DAILY_USAGE_ENDPOINT}
+            >
+              <Link2 className="size-3.5 shrink-0 text-primary" aria-hidden />
+              <span className="shrink-0">{t('accounts.usageOfficialSource')}</span>
+              <span className="min-w-0 truncate font-mono text-foreground">
+                {WHAM_DAILY_USAGE_ENDPOINT}
+              </span>
+            </span>
+          )}
         </div>
 
         {page === 'overview' ? (
@@ -315,6 +391,14 @@ function UsageStatsContent({
             data={data}
             activeDays={activeDays}
             periodDays={periodDays}
+          />
+        ) : page === 'official' ? (
+          <OfficialUsagePage
+            accountId={account.id}
+            range={range}
+            // 点进官方统计就打一次上游：列表「官方结算」徽章跟这次同步时间对齐。
+            autoRefresh
+            onRefreshed={onOfficialUsageRefreshed}
           />
         ) : (
           <QualityPage data={data} />
@@ -343,6 +427,7 @@ function OverviewPage({
   totalCostLabel: string
   topModel?: { model: string; requests: number; tokens: number }
 }) {
+  const fullNumbers = useShowFullUsageNumbers()
   const { t } = useTranslation()
   const activeDaysText = formatActiveDaysText(activeDays, periodDays, t('accounts.usageDaysUnit'))
   return (
@@ -365,8 +450,8 @@ function OverviewPage({
           </div>
 
           <div className="mt-6 grid gap-3 sm:grid-cols-3">
-            <CompactMetric icon={<Zap className="size-4" />} label={t('accounts.totalRequests')} value={formatCompactNumber(data.total_requests)} />
-            <CompactMetric icon={<Package className="size-4" />} label={t('accounts.totalTokens')} value={formatTokens(data.total_tokens)} />
+            <CompactMetric icon={<Zap className="size-4" />} label={t('accounts.totalRequests')} value={formatCompactNumber(data.total_requests, fullNumbers)} />
+            <CompactMetric icon={<Package className="size-4" />} label={t('accounts.totalTokens')} value={formatTokens(data.total_tokens, fullNumbers)} />
             <CompactMetric icon={<Clock3 className="size-4" />} label={t('accounts.usageAvgResponse')} value={formatDuration(data.avg_duration_ms)} />
           </div>
 
@@ -379,7 +464,7 @@ function OverviewPage({
             title={t('accounts.usageTodayOverview')}
             rows={[
               [t('accounts.usageRequests'), formatNumber(today.requests)],
-              [t('accounts.usageTokens'), formatTokens(today.tokens)],
+              [t('accounts.usageTokens'), formatTokens(today.tokens, fullNumbers)],
               [t('accounts.usageTodayCost'), `$${formatCost(today.account_billed)}`],
             ]}
           />
@@ -388,7 +473,7 @@ function OverviewPage({
             title={t('accounts.usageDailyBaseline')}
             rows={[
               [t('accounts.usageAvgDailyCost'), `$${formatCost(data.avg_daily_account_billed)}`],
-              [t('accounts.usageAvgDailyRequests'), formatCompactNumber(Math.round(data.avg_daily_requests))],
+              [t('accounts.usageAvgDailyRequests'), formatCompactNumber(Math.round(data.avg_daily_requests), fullNumbers)],
               [t('accounts.usageActiveDays'), activeDaysText],
             ]}
           />
@@ -403,12 +488,12 @@ function OverviewPage({
         <HighlightStrip
           label={t('accounts.usageHighestRequestDay')}
           value={highestRequestDay.label || '-'}
-          detail={`${formatCompactNumber(highestRequestDay.requests)} ${t('accounts.usageReqUnit')} · $${formatCost(highestRequestDay.account_billed)}`}
+          detail={`${formatCompactNumber(highestRequestDay.requests, fullNumbers)} ${t('accounts.usageReqUnit')} · $${formatCost(highestRequestDay.account_billed)}`}
         />
         <HighlightStrip
           label={t('accounts.usageTopModel')}
           value={topModel?.model || '-'}
-          detail={topModel ? `${formatNumber(topModel.requests)} ${t('accounts.usageReqUnit')} · ${formatTokens(topModel.tokens)} ${t('accounts.usageTokUnit')}` : '-'}
+          detail={topModel ? `${formatNumber(topModel.requests)} ${t('accounts.usageReqUnit')} · ${formatTokens(topModel.tokens, fullNumbers)} ${t('accounts.usageTokUnit')}` : '-'}
         />
       </div>
     </div>
@@ -421,6 +506,518 @@ function QualityPage({ data }: { data: AccountUsageDetail }) {
       <QualitySignals data={data} />
     </div>
   )
+}
+
+// OfficialUsagePage 展示 OpenAI 侧的结算口径用量，与其他 tab 的本地 usage_logs
+// 聚合是两套数据：这里的 credits 与 token 是官方账单数，且能按客户端入口拆分，
+// 能看出某个号有多少消耗来自本网关、多少来自官方客户端；按模型的成本来自
+// 模型×速度拆分端点的份额分摊（含 fast/priority 档）。
+function OfficialUsagePage({
+  accountId,
+  range,
+  autoRefresh = false,
+  onRefreshed,
+}: {
+  accountId: number
+  range: UsageRangeKey
+  // 点进这个界面时先打上游，再让列表徽章跟上这次同步；换日期范围只读本地快照。
+  autoRefresh?: boolean
+  onRefreshed?: (patch: OfficialUsageRefreshPatch) => void
+}) {
+  const fullNumbers = useShowFullUsageNumbers()
+  const { t } = useTranslation()
+  const [data, setData] = useState<WhamDailyUsageResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const requestSeq = useRef(0)
+  const autoRefreshedAccountRef = useRef<number | null>(null)
+  // 'all' 在这里没有意义（本地快照最多留一年），按上限天数取。
+  const days = range === 'all' ? 365 : usageRangeToDays(range)
+
+  const load = useCallback(async (refresh: boolean) => {
+    const seq = requestSeq.current + 1
+    requestSeq.current = seq
+    if (refresh) setRefreshing(true)
+    else setLoading(true)
+    setError(null)
+    try {
+      const result = await api.getWhamDailyUsage(accountId, days, refresh)
+      if (requestSeq.current !== seq) return
+      setData(result)
+      // 只有真刷成功了才通知列表(refresh_error 时快照没变,重拉没意义)。
+      if (refresh && !result.refresh_error) {
+        onRefreshed?.({
+          accountId,
+          officialUsd: officialUsdFromDailyItems(result.items ?? []),
+        })
+      }
+    } catch (err) {
+      if (requestSeq.current !== seq) return
+      setError(getErrorMessage(err))
+    } finally {
+      if (requestSeq.current === seq) {
+        setLoading(false)
+        setRefreshing(false)
+      }
+    }
+  }, [accountId, days, onRefreshed])
+
+  useEffect(() => {
+    const shouldRefresh = autoRefresh && autoRefreshedAccountRef.current !== accountId
+    if (shouldRefresh) autoRefreshedAccountRef.current = accountId
+    void load(shouldRefresh)
+  }, [load, accountId, autoRefresh])
+
+  const items = data?.items ?? []
+  const maxCredits = useMemo(
+    () => items.reduce((max, item) => Math.max(max, item.credits), 0),
+    [items],
+  )
+  // 换算率由后端下发，前端不硬编码，官方改比例时只动一处。
+  const creditsPerUSD = data?.credits_per_usd || 25
+  // 客户端拆分按整个窗口累加：单看某一天噪声太大，看不出入口占比。
+  const clientTotals = useMemo(
+    () => aggregateSplits(items, 'clients', creditsPerUSD),
+    [items, creditsPerUSD],
+  )
+  // 模型维度的成本来自 daily-token-usage-breakdown 的份额分摊（counts 在模型维度
+  // 不给 credits）。窗口里一天拆分都没同步到时退回旧的按轮次展示。
+  const modelSplit = useMemo(
+    () => aggregateModelBreakdown(items, creditsPerUSD),
+    [items, creditsPerUSD],
+  )
+
+  if (loading) {
+    return <div className="py-12 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
+  }
+
+  return (
+    <div className="space-y-4 p-4 sm:p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-foreground">{t('accounts.usageOfficialTitle')}</span>
+          <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+            {t('accounts.usageOfficialRetentionHint', { days: data?.retention_days ?? 7 })}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          {data?.last_synced_at && (
+            <span className="text-[11px] text-muted-foreground">
+              {t('accounts.usageOfficialLastSynced', { time: formatBeijingTime(data.last_synced_at) })}
+            </span>
+          )}
+          <button
+            type="button"
+            disabled={refreshing}
+            onClick={() => void load(true)}
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border bg-background px-3 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground disabled:opacity-60"
+          >
+            <RefreshCw className={`size-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+            {t('accounts.usageOfficialRefresh')}
+          </button>
+        </div>
+      </div>
+
+      {error && <div className="rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-500">{error}</div>}
+      {data?.refresh_error && (
+        <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          {t('accounts.usageOfficialRefreshFailed', { reason: data.refresh_error })}
+        </div>
+      )}
+      {data?.breakdown_refresh_error && (
+        <div className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          {t('accounts.usageOfficialBreakdownRefreshFailed', { reason: data.breakdown_refresh_error })}
+        </div>
+      )}
+
+      {items.length === 0 ? (
+        <div className="py-10 text-center text-sm text-muted-foreground">
+          {t('accounts.usageOfficialEmpty')}
+        </div>
+      ) : (
+        <>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <CompactMetric
+              icon={<Banknote className="size-4" />}
+              label={t('accounts.usageOfficialCost')}
+              value={formatUSD(data?.totals.usd ?? 0)}
+              // 美元是按 credits 折算出来的,原始 credits 一并给出,方便与官方后台对账。
+              detail={t('accounts.usageOfficialCredits', {
+                credits: formatCredits(data?.totals.credits ?? 0),
+                rate: data?.credits_per_usd ?? 25,
+              })}
+            />
+            <CompactMetric
+              icon={<Package className="size-4" />}
+              label={t('accounts.usageOfficialTokens')}
+              value={formatTokens(data?.totals.total_tokens ?? 0, fullNumbers)}
+            />
+            <CompactMetric
+              icon={<Zap className="size-4" />}
+              label={t('accounts.usageOfficialTurns')}
+              value={formatNumber(data?.totals.turns ?? 0)}
+            />
+          </div>
+
+          {data?.cycle && <OfficialCycleCards cycle={data.cycle} />}
+
+          <section className="rounded-2xl border bg-background p-4">
+            <div className="mb-3 text-xs font-semibold uppercase text-muted-foreground">
+              {t('accounts.usageOfficialDailyTrend')}
+            </div>
+            <div className="space-y-1.5">
+              {items.map((item) => (
+                <OfficialUsageDayRow key={item.day} item={item} maxCredits={maxCredits} />
+              ))}
+            </div>
+          </section>
+
+          <div className="grid gap-3 lg:grid-cols-2">
+            <OfficialSplitTable
+              title={t('accounts.usageOfficialByClient')}
+              rows={clientTotals}
+              emptyLabel={t('accounts.usageOfficialEmpty')}
+            />
+            <OfficialSplitTable
+              title={t('accounts.usageOfficialByModel')}
+              rows={modelSplit.rows}
+              emptyLabel={t('accounts.usageOfficialEmpty')}
+              // 有拆分就按分摊成本展示；free 号 credits 恒 0 只有份额，改显示平均占比；
+              // 窗口内一天拆分都没有（旧快照）时退回只看轮次。
+              costMode={!modelSplit.hasBreakdown ? 'none' : modelSplit.hasCost ? 'usd' : 'share'}
+              footnote={
+                modelSplit.hasBreakdown && modelSplit.breakdownDays < modelSplit.totalDays
+                  ? t('accounts.usageOfficialBreakdownCoverage', { covered: modelSplit.breakdownDays, total: modelSplit.totalDays })
+                  : undefined
+              }
+            />
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function OfficialUsageDayRow({ item, maxCredits }: { item: WhamDailyUsageItem; maxCredits: number }) {
+  const fullNumbers = useShowFullUsageNumbers()
+  const { t } = useTranslation()
+  const width = maxCredits > 0 ? Math.max(2, (item.credits / maxCredits) * 100) : 0
+  return (
+    <div className="flex items-center gap-3 text-xs">
+      <span className="w-20 shrink-0 font-mono text-muted-foreground">{item.day.slice(5)}</span>
+      <div className="h-4 flex-1 overflow-hidden rounded bg-muted/50">
+        <div className="h-full rounded bg-primary/70" style={{ width: `${width}%` }} />
+      </div>
+      <span
+        className="w-20 shrink-0 text-right font-semibold tabular-nums text-foreground"
+        title={t('accounts.usageOfficialCreditsRaw', { credits: formatCredits(item.credits) })}
+      >
+        {formatUSD(item.usd)}
+      </span>
+      {/* 当天（UTC）的行也带 token，只是全天在变：有数就显示，未结算时挂个标记。 */}
+      <span
+        className="w-20 shrink-0 text-right tabular-nums text-muted-foreground"
+        title={item.settled ? undefined : t('accounts.usageOfficialUnsettled')}
+      >
+        {item.total_tokens > 0 ? formatTokens(item.total_tokens, fullNumbers) : t('accounts.usageOfficialUnsettled')}
+        {item.total_tokens > 0 && !item.settled && <span className="ml-0.5 text-[10px] opacity-70">*</span>}
+      </span>
+    </div>
+  )
+}
+
+// OfficialCycleCards 展示当前重置周期的已用官方成本、实时已用百分比与额度估算。
+// 估算 = 已用成本 ÷ 已用百分比：两个上游端点都给不出周额度的绝对值（拆分端点的
+// percent 是区间峰值归一化），这是唯一站得住的推法。百分比只有整数精度，所以给出
+// ±0.5% 的区间，并在不足 10% 时标不可靠。
+function OfficialCycleCards({ cycle }: { cycle: WhamDailyUsageCycle }) {
+  const { t } = useTranslation()
+  const reasonText = (() => {
+    switch (cycle.reason) {
+      case 'no_window':
+        return t('accounts.usageOfficialCycleReasonNoWindow')
+      case 'window_stale':
+        return t('accounts.usageOfficialCycleReasonWindowStale')
+      case 'no_percent':
+        return t('accounts.usageOfficialCycleReasonNoPercent')
+      case 'no_credits':
+        return t('accounts.usageOfficialCycleReasonNoCredits')
+      case 'percent_too_low':
+        return t('accounts.usageOfficialCycleReasonPercentTooLow')
+      default:
+        return ''
+    }
+  })()
+  const percent = cycle.used_percent
+  const percentText = percent == null ? '—' : `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%`
+  const estimate = cycle.estimate
+  const estimateDetail = estimate
+    ? [
+        t('accounts.usageOfficialCycleEstimateRange', { low: formatUSD(estimate.usd_low), high: formatUSD(estimate.usd_high) }),
+        estimate.reliable ? '' : t('accounts.usageOfficialCycleUnreliable'),
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    : reasonText
+  return (
+    <div className="grid gap-3 sm:grid-cols-3">
+      <CompactMetric
+        icon={<Coins className="size-4" />}
+        label={t('accounts.usageOfficialCycleUsed')}
+        value={formatUSD(cycle.used_usd)}
+        detail={
+          cycle.start_at
+            ? t('accounts.usageOfficialCycleUsedDetail', { days: cycle.days, start: formatBeijingTime(cycle.start_at) })
+            : reasonText || undefined
+        }
+      />
+      <CompactMetric
+        icon={<Gauge className="size-4" />}
+        label={t('accounts.usageOfficialCyclePercent')}
+        value={percentText}
+        detail={
+          cycle.reset_at
+            ? t('accounts.usageOfficialCyclePercentDetail', {
+                reset: formatBeijingTime(cycle.reset_at),
+                time: cycle.used_percent_updated_at ? formatBeijingTime(cycle.used_percent_updated_at) : '—',
+              })
+            : reasonText || undefined
+        }
+      />
+      <div title={t('accounts.usageOfficialCycleEstimateHint')}>
+        <CompactMetric
+          icon={<BarChart3 className="size-4" />}
+          label={t('accounts.usageOfficialCycleEstimate')}
+          value={estimate ? formatUSD(estimate.usd) : t('accounts.usageOfficialCycleUnavailable')}
+          detail={estimateDetail || undefined}
+        />
+      </div>
+    </div>
+  )
+}
+
+// costMode 决定最右列：usd 显示分摊成本；share 显示窗口内的平均日份额（free 号只有
+// 份额没有 credits）；none 不显示（旧快照的模型维度没有成本）。
+type SplitCostMode = 'usd' | 'share' | 'none'
+
+function OfficialSplitTable({
+  title,
+  rows,
+  emptyLabel,
+  costMode = 'usd',
+  footnote,
+}: {
+  title: string
+  rows: AggregatedSplit[]
+  emptyLabel: string
+  costMode?: SplitCostMode
+  // 表格下方的说明，例如拆分只覆盖了窗口内的一部分天数。
+  footnote?: string
+}) {
+  const { t } = useTranslation()
+  return (
+    <section className="rounded-2xl border bg-background p-4">
+      <div className="mb-3 text-xs font-semibold uppercase text-muted-foreground">{title}</div>
+      {rows.length === 0 ? (
+        <div className="py-4 text-center text-xs text-muted-foreground">{emptyLabel}</div>
+      ) : (
+        <div className="space-y-1.5">
+          {rows.map((row) => (
+            <div key={row.label} className="flex items-center justify-between gap-3 text-xs">
+              <span className="min-w-0 flex-1 truncate text-foreground" title={row.label}>
+                {row.label}
+              </span>
+              <span className="shrink-0 tabular-nums text-muted-foreground">
+                {formatNumber(row.turns)} {t('accounts.usageOfficialTurnUnit')}
+              </span>
+              {costMode === 'usd' && (
+                <span
+                  className="w-20 shrink-0 text-right font-semibold tabular-nums text-foreground"
+                  title={t('accounts.usageOfficialCreditsRaw', { credits: formatCredits(row.credits) })}
+                >
+                  {formatUSD(row.usd)}
+                </span>
+              )}
+              {costMode === 'share' && (
+                <span
+                  className="w-20 shrink-0 text-right font-semibold tabular-nums text-foreground"
+                  title={t('accounts.usageOfficialShareHint')}
+                >
+                  {formatShare(row.share)}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {footnote && <div className="mt-3 text-[11px] text-muted-foreground">{footnote}</div>}
+    </section>
+  )
+}
+
+interface AggregatedSplit {
+  label: string
+  credits: number
+  usd: number
+  turns: number
+  tokens: number
+  // 窗口内的平均日份额（0~1），只有模型拆分会填；份额不能跨天相加，这里是按天平均。
+  share: number
+}
+
+interface ModelBreakdownSplit {
+  rows: AggregatedSplit[]
+  // 窗口内至少一天同步到了拆分；否则退回 counts.models 的轮次视图。
+  hasBreakdown: boolean
+  // 拆分里有任何非零成本；free 号全为 0，此时只有份额可看。
+  hasCost: boolean
+  // 有拆分的天数 / 窗口内的天数：老快照只有最近几天带拆分，成本与轮次只统计这些天，
+  // 覆盖不全时表格下方要说明，否则会被当成整个窗口的模型成本。
+  breakdownDays: number
+  totalDays: number
+}
+
+// aggregateModelBreakdown 把每天的模型×速度份额分摊成本累加到整个窗口。
+//
+// 行按 (model, speed) 分；fast（priority 档）单独成行并在标签上标出。轮次来自
+// counts.models（只有模型维度、没有速度维度）：一个模型有 standard 行就记在
+// standard 行上，只有 fast 行就记在 fast 行上，绝不重复计入。counts 里有、拆分里没有
+// 的模型（例如占比为 0 的目录项）补一行零成本，保证轮次不丢。
+function aggregateModelBreakdown(items: WhamDailyUsageItem[], creditsPerUSD: number): ModelBreakdownSplit {
+  const withBreakdown = items.filter((item) => item.breakdown_available && Array.isArray(item.breakdown))
+  if (withBreakdown.length === 0) {
+    return {
+      rows: aggregateSplits(items, 'models', creditsPerUSD),
+      hasBreakdown: false,
+      hasCost: false,
+      breakdownDays: 0,
+      totalDays: items.length,
+    }
+  }
+
+  type Row = AggregatedSplit & { model: string; speed: string; shareSum: number }
+  const rows = new Map<string, Row>()
+  const keyOf = (model: string, speed: string) => `${model} ${speed}`
+  for (const item of withBreakdown) {
+    for (const entry of item.breakdown as WhamDailyUsageBreakdownEntry[]) {
+      const model = (entry.model ?? '').trim() || '-'
+      const speed = (entry.speed ?? '').trim().toLowerCase() || 'standard'
+      const key = keyOf(model, speed)
+      const row =
+        rows.get(key) ??
+        {
+          label: speed === 'standard' ? model : `${model} · ${speed}`,
+          model,
+          speed,
+          credits: 0,
+          usd: 0,
+          turns: 0,
+          tokens: 0,
+          share: 0,
+          shareSum: 0,
+        }
+      row.credits += entry.credits ?? 0
+      row.usd += (entry.credits ?? 0) / creditsPerUSD
+      row.shareSum += entry.share ?? 0
+      rows.set(key, row)
+    }
+  }
+
+  // 轮次按模型汇总，再挂到该模型的 standard 行（没有则挂到它唯一的其他速度行）。
+  // 只统计带拆分的那些天：成本与轮次必须是同一个窗口，否则 7 天的成本配 30 天的轮次
+  // 会让人误读单轮成本。
+  const turnsByModel = new Map<string, number>()
+  for (const item of withBreakdown) {
+    for (const split of item.models ?? []) {
+      const model = (split.model ?? '').trim() || '-'
+      turnsByModel.set(model, (turnsByModel.get(model) ?? 0) + (split.turns ?? 0))
+    }
+  }
+  for (const [model, turns] of turnsByModel) {
+    const standard = rows.get(keyOf(model, 'standard'))
+    if (standard) {
+      standard.turns += turns
+      continue
+    }
+    const sibling = [...rows.values()].find((row) => row.model === model)
+    if (sibling) {
+      sibling.turns += turns
+      continue
+    }
+    rows.set(keyOf(model, 'standard'), {
+      label: model,
+      model,
+      speed: 'standard',
+      credits: 0,
+      usd: 0,
+      turns,
+      tokens: 0,
+      share: 0,
+      shareSum: 0,
+    })
+  }
+
+  const days = withBreakdown.length
+  const out: AggregatedSplit[] = [...rows.values()].map(({ model: _model, speed: _speed, shareSum, ...row }) => ({
+    ...row,
+    share: days > 0 ? shareSum / days : 0,
+  }))
+  const hasCost = out.some((row) => row.usd > 0)
+  out.sort((a, b) =>
+    hasCost
+      ? (b.usd - a.usd) || (b.turns - a.turns)
+      : (b.share - a.share) || (b.turns - a.turns),
+  )
+  return { rows: out, hasBreakdown: true, hasCost, breakdownDays: days, totalDays: items.length }
+}
+
+// aggregateSplits 把每天的拆分数组按 client_id / model 累加到整个窗口，按成本降序。
+// counts 在模型维度不给 credits，直接用这个函数看模型时只能按轮次排序；模型成本
+// 走 aggregateModelBreakdown。
+function aggregateSplits(
+  items: WhamDailyUsageItem[],
+  field: 'clients' | 'models',
+  creditsPerUSD: number,
+): AggregatedSplit[] {
+  const totals = new Map<string, AggregatedSplit>()
+  for (const item of items) {
+    const splits: WhamDailyUsageSplit[] = item[field] ?? []
+    for (const split of splits) {
+      const label = (field === 'clients' ? split.client_id : split.model)?.trim() || '-'
+      const current = totals.get(label) ?? { label, credits: 0, usd: 0, turns: 0, tokens: 0, share: 0 }
+      current.credits += split.credits ?? 0
+      current.usd += (split.credits ?? 0) / creditsPerUSD
+      current.turns += split.turns ?? 0
+      current.tokens += split.text_total_tokens ?? 0
+      totals.set(label, current)
+    }
+  }
+  return [...totals.values()].sort((a, b) => (b.usd - a.usd) || (b.turns - a.turns))
+}
+
+// credits 是官方的原始计费单位,保留两位小数(上游给的是小数),整数则不补零。
+function formatCredits(value: number): string {
+  if (!Number.isFinite(value)) return '0'
+  const rounded = Math.round(value * 100) / 100
+  return rounded.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  })
+}
+
+function formatUSD(value: number): string {
+  if (!Number.isFinite(value) || value === 0) return '$0'
+  if (Math.abs(value) < 0.01) return '<$0.01'
+  return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+// 份额（0~1）显示成百分比；小于 0.1% 的碎屑显示 "<0.1%"。
+function formatShare(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0%'
+  const percent = value * 100
+  if (percent < 0.1) return '<0.1%'
+  return `${percent.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: percent < 10 ? 1 : 0 })}%`
 }
 
 function QualitySignals({ data }: { data: AccountUsageDetail }) {
@@ -488,6 +1085,7 @@ function DetailPage({
   activeDays: number
   periodDays: number
 }) {
+  const fullNumbers = useShowFullUsageNumbers()
   const { t } = useTranslation()
   const [modelMetric, setModelMetric] = useState<ModelMetricKey>('requests')
   const activeDaysText = formatActiveDaysText(activeDays, periodDays, t('accounts.usageDaysUnit'))
@@ -524,7 +1122,7 @@ function DetailPage({
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
               <span className="rounded-full bg-muted px-3 py-1 text-xs font-semibold text-muted-foreground">
-                {formatModelMetricValue(modelMetricTotal, modelMetric)} {t(modelMetricLabelKey(modelMetric))}
+                {formatModelMetricValue(modelMetricTotal, modelMetric, fullNumbers)} {t(modelMetricLabelKey(modelMetric))}
               </span>
               <div className="flex rounded-lg border bg-muted/40 p-1">
                 {MODEL_METRIC_OPTIONS.map((option) => (
@@ -559,7 +1157,7 @@ function DetailPage({
                     ))}
                   </Pie>
                   <Tooltip
-                    formatter={(value, name) => [formatModelMetricValue(Number(value || 0), modelMetric), String(name ?? '')]}
+                    formatter={(value, name) => [formatModelMetricValue(Number(value || 0), modelMetric, fullNumbers), String(name ?? '')]}
                     contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid hsl(var(--border))' }}
                   />
                 </PieChart>
@@ -599,7 +1197,7 @@ function DetailPage({
 
       <div className="mt-4 grid gap-3 md:grid-cols-4">
         <DetailKpi label={t('accounts.usageActiveDays')} value={activeDaysText} />
-        <DetailKpi label={t('accounts.usageDailyAvgTokens')} value={formatTokens(Math.round(data.avg_daily_tokens))} />
+        <DetailKpi label={t('accounts.usageDailyAvgTokens')} value={formatTokens(Math.round(data.avg_daily_tokens), fullNumbers)} />
         <DetailKpi label={t('accounts.usageCacheHitRate')} value={formatPercent(data.cache_hit_rate)} />
         <DetailKpi label={t('accounts.usageAvgResponse')} value={formatDuration(data.avg_duration_ms)} />
       </div>
@@ -608,6 +1206,7 @@ function DetailPage({
 }
 
 function KeyDistribution({ data }: { data: AccountUsageDetail }) {
+  const fullNumbers = useShowFullUsageNumbers()
   const { t } = useTranslation()
   const [metric, setMetric] = useState<ModelMetricKey>('requests')
   const sortedKeys = useMemo(() => {
@@ -641,7 +1240,7 @@ function KeyDistribution({ data }: { data: AccountUsageDetail }) {
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <span className="rounded-full bg-muted px-3 py-1 text-xs font-semibold tabular-nums text-muted-foreground">
-            {formatModelMetricValue(metricTotal, metric)} {t(modelMetricLabelKey(metric))}
+            {formatModelMetricValue(metricTotal, metric, fullNumbers)} {t(modelMetricLabelKey(metric))}
           </span>
           {sortedKeys.length > 0 && (
             <span className="rounded-full bg-muted/70 px-3 py-1 text-xs font-medium text-muted-foreground">
@@ -693,10 +1292,11 @@ function KeyRow({
   metric: ModelMetricKey
   total: number
 }) {
+  const fullNumbers = useShowFullUsageNumbers()
   const { t } = useTranslation()
   const value = keyMetricValue(stat, metric)
   const percent = total > 0 ? Math.min(100, Math.max(0, (value / total) * 100)) : 0
-  const detail = keyMetricDetail(stat, metric, t)
+  const detail = keyMetricDetail(stat, metric, t, fullNumbers)
   return (
     <div className="rounded-xl border border-border/80 bg-muted/15 px-3 py-2.5 transition-colors hover:border-border hover:bg-muted/25">
       <div className="mb-2 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 text-sm">
@@ -724,7 +1324,7 @@ function KeyRow({
       </div>
       <div className="mt-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
         <span className="font-semibold tabular-nums text-foreground">
-          {formatModelMetricValue(value, metric)}
+          {formatModelMetricValue(value, metric, fullNumbers)}
         </span>
         <span className="truncate text-right">{detail}</span>
       </div>
@@ -732,20 +1332,54 @@ function KeyRow({
   )
 }
 
+// CreditSettings 只暴露一个开关：「使用积分顶替限流」。
+//
+// 历史上这里是两级开关，外层「启用信用」是 commit c72e267 加的前置保险栓
+// （把原本单独生效的 CreditSkipUsageWindow 改成两者同真才生效）。但它自身不产生
+// 任何行为，只是把真正干活的开关藏了起来，反而让人找不到功能。
+//
+// 后端 `CreditEnabled && CreditSkipUsageWindow` 的门控**保持不动**：线上可能存在
+// 只开了其中一列的历史数据，拆掉门控会让它们突然开始绕过限流。这里改为一个开关
+// 同时写两列，行为零变化，只是界面上不再暴露那个没有意义的中间态。
 function CreditSettings({
+  account,
   creditEnabled,
   creditSkipWindow,
   savingCredit,
   creditError,
   onToggle,
 }: {
+  account: AccountRow
   creditEnabled: boolean
   creditSkipWindow: boolean
   savingCredit: boolean
   creditError: string | null
-  onToggle: (field: 'credit_enabled' | 'credit_skip_usage_window', value: boolean) => Promise<void>
+  onToggle: (value: boolean) => Promise<void>
 }) {
   const { t } = useTranslation()
+  // 积分门的几种状态，用来告诉用户这个开关此刻到底生不生效：
+  // unlimited / 有余额 → 顶替限流；余额 0 或上游报超额 → 已恢复限流；未探测 → 按没积分处理。
+  const balance = Number.parseFloat((account.credits_balance ?? '').trim())
+  const unlimited = account.credits_unlimited === true
+  const probed = account.credits_balance != null || unlimited
+  const overageReached = account.credits_overage_limit_reached === true
+  const hasCredits =
+    !overageReached &&
+    (unlimited || (account.credits_has_credits === true && Number.isFinite(balance) && balance > 0))
+
+  const skipHint = !probed
+    ? t('accounts.creditSkipWindowHintUnprobed')
+    : unlimited
+      ? t('accounts.creditSkipWindowHintUnlimited')
+      : hasCredits
+        ? t('accounts.creditSkipWindowHintActive', { balance: formatCreditsBalance(balance) })
+        : overageReached
+          ? t('accounts.creditSkipWindowHintOverage')
+          : t('accounts.creditSkipWindowHintDrained')
+
+  // 两列同真才算开。历史数据里只开了一列的组合在后端本就不生效，显示为关是准确的。
+  const skipActive = creditEnabled && creditSkipWindow
+
   return (
     <div className="mt-5 rounded-2xl border bg-card p-4">
       <h4 className="mb-3 text-base font-semibold">{t('accounts.creditSettings')}</h4>
@@ -754,24 +1388,35 @@ function CreditSettings({
       )}
       <div className="space-y-3">
         <CreditToggle
-          label={t('accounts.creditEnabled')}
-          hint={t('accounts.creditEnabledHint')}
-          checked={creditEnabled}
+          label={t('accounts.creditSkipWindow')}
+          hint={skipHint}
+          checked={skipActive}
           disabled={savingCredit}
-          onClick={() => void onToggle('credit_enabled', !creditEnabled)}
+          onClick={() => void onToggle(!skipActive)}
         />
-        {creditEnabled && (
-          <CreditToggle
-            label={t('accounts.creditSkipWindow')}
-            hint={t('accounts.creditSkipWindowHint')}
-            checked={creditSkipWindow}
-            disabled={savingCredit}
-            onClick={() => void onToggle('credit_skip_usage_window', !creditSkipWindow)}
-          />
+        {/* 开关开着但当下没积分可花时明确说清：调度不会放行，状态仍是限流。 */}
+        {skipActive && !hasCredits && (
+          <p className="flex items-start gap-1.5 rounded-lg bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700 dark:text-amber-300">
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+            <span>{t('accounts.creditSkipWindowInactive')}</span>
+          </p>
+        )}
+        {/* 开着且有积分时给出正向确认，避免"开了但不知道有没有用"。 */}
+        {skipActive && hasCredits && (
+          <p className="flex items-start gap-1.5 rounded-lg bg-teal-500/10 px-2.5 py-2 text-xs text-teal-700 dark:text-teal-300">
+            <Coins className="mt-0.5 size-3.5 shrink-0" />
+            <span>{t('accounts.creditSkipWindowActiveNote')}</span>
+          </p>
         )}
       </div>
     </div>
   )
+}
+
+// formatCreditsBalance 把 "1000.0000000000" 这类长小数收敛到 2 位，避免开关说明被撑长。
+function formatCreditsBalance(balance: number): string {
+  if (!Number.isFinite(balance)) return '-'
+  return balance.toFixed(2)
 }
 
 function ResetCreditsSection({
@@ -831,7 +1476,12 @@ function ResetCreditsSection({
       setCount(next)
       setDone(true)
       setConfirming(false)
+      // 后端已等过用量探针，此时刷新拿到的是新的用量与状态。
       onResetDone?.()
+      // 探针超时未落地（usage_refreshed=false）时补刷一次，否则进度条会停在旧值。
+      if (res.usage_refreshed === false) {
+        window.setTimeout(() => onResetDone?.(), 5000)
+      }
       // 重置消耗了一张券,重新拉取明细同步有效期列表。
       void loadDetail()
     } catch (err) {
@@ -1071,7 +1721,18 @@ function MiniPill({ label, value }: { label: string; value: string }) {
   )
 }
 
-function CompactMetric({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {
+function CompactMetric({
+  icon,
+  label,
+  value,
+  detail,
+}: {
+  icon: ReactNode
+  label: string
+  value: string
+  // 副行:展示换算前的原始口径(如美元下面的 credits 原值)。
+  detail?: string
+}) {
   return (
     <div className="rounded-xl border bg-background px-3 py-3">
       <div className="mb-2 flex items-center gap-2 text-muted-foreground">
@@ -1079,6 +1740,9 @@ function CompactMetric({ icon, label, value }: { icon: ReactNode; label: string;
         <span className="text-xs font-medium">{label}</span>
       </div>
       <div className="text-xl font-semibold tabular-nums text-foreground">{value}</div>
+      {detail && (
+        <div className="mt-0.5 text-[11px] tabular-nums text-muted-foreground">{detail}</div>
+      )}
     </div>
   )
 }
@@ -1180,6 +1844,7 @@ function qualityToneClass(tone: QualityTone): { box: string; icon: string; value
 }
 
 function UsageTrend({ history }: { history: AccountUsageDayStat[] }) {
+  const fullNumbers = useShowFullUsageNumbers()
   const { t } = useTranslation()
   const display = history.slice(-60)
   const maxCost = Math.max(...display.map((day) => day.account_billed), 0)
@@ -1199,7 +1864,7 @@ function UsageTrend({ history }: { history: AccountUsageDayStat[] }) {
         {display.length > 0 && (
           <div className="text-right text-xs text-muted-foreground">
             <div>{t('accounts.usageHighestCostDay')}: ${formatCost(maxCost)}</div>
-            <div>{t('accounts.usageHighestRequestDay')}: {formatCompactNumber(maxRequests)}</div>
+            <div>{t('accounts.usageHighestRequestDay')}: {formatCompactNumber(maxRequests, fullNumbers)}</div>
           </div>
         )}
       </div>
@@ -1237,10 +1902,11 @@ function ModelRow({
   metric: ModelMetricKey
   total: number
 }) {
+  const fullNumbers = useShowFullUsageNumbers()
   const { t } = useTranslation()
   const value = modelMetricValue(model, metric)
   const percent = total > 0 ? Math.min(100, Math.max(0, (value / total) * 100)) : 0
-  const detail = modelMetricDetail(model, metric, t)
+  const detail = modelMetricDetail(model, metric, t, fullNumbers)
   return (
     <div className="rounded-xl border bg-background px-3 py-2.5">
       <div className="mb-2 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 text-sm">
@@ -1252,7 +1918,7 @@ function ModelRow({
         <div className="h-full rounded-full" style={{ width: `${percent}%`, background: color }} />
       </div>
       <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-        <span className="font-semibold text-foreground">{formatModelMetricValue(value, metric)}</span>
+        <span className="font-semibold text-foreground">{formatModelMetricValue(value, metric, fullNumbers)}</span>
         <span className="truncate text-right">{detail}</span>
       </div>
     </div>
@@ -1260,12 +1926,13 @@ function ModelRow({
 }
 
 function TokenBar({ label, value, total }: { label: string; value: number; total: number }) {
+  const fullNumbers = useShowFullUsageNumbers()
   const percent = total > 0 ? Math.min(100, Math.max(0, (value / total) * 100)) : 0
   return (
     <div>
       <div className="mb-1 flex items-center justify-between gap-3 text-sm">
         <span className="text-muted-foreground">{label}</span>
-        <span className="font-semibold tabular-nums text-foreground">{formatTokens(value)}</span>
+        <span className="font-semibold tabular-nums text-foreground">{formatTokens(value, fullNumbers)}</span>
       </div>
       <div className="h-2 overflow-hidden rounded-full bg-muted">
         <div className="h-full rounded-full bg-foreground" style={{ width: `${percent}%` }} />
@@ -1328,6 +1995,41 @@ function emptyDayStat(): AccountUsageDayStat {
   }
 }
 
+function emptyUsageDetail(): AccountUsageDetail {
+  return {
+    period_days: 30,
+    active_days: 0,
+    total_requests: 0,
+    total_tokens: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    reasoning_tokens: 0,
+    cached_tokens: 0,
+    cache_hit_rate: 0,
+    total_account_billed: 0,
+    total_user_billed: 0,
+    avg_daily_account_billed: 0,
+    avg_daily_user_billed: 0,
+    avg_daily_requests: 0,
+    avg_daily_tokens: 0,
+    avg_duration_ms: 0,
+    avg_first_token_ms: 0,
+    p95_duration_ms: 0,
+    error_requests: 0,
+    error_rate: 0,
+    retry_requests: 0,
+    first_token_samples: 0,
+    stream_requests: 0,
+    stream_rate: 0,
+    compact_requests: 0,
+    compact_rate: 0,
+    today: emptyDayStat(),
+    history: [],
+    models: [],
+    by_api_key: [],
+  }
+}
+
 function usageRangeToDays(range: UsageRangeKey): number {
   return USAGE_RANGE_OPTIONS.find((option) => option.key === range)?.days ?? 30
 }
@@ -1359,10 +2061,10 @@ function modelMetricLabelKey(metric: ModelMetricKey): string {
   }
 }
 
-function formatModelMetricValue(value: number, metric: ModelMetricKey): string {
+function formatModelMetricValue(value: number, metric: ModelMetricKey, full: boolean): string {
   switch (metric) {
     case 'tokens':
-      return formatTokens(value)
+      return formatTokens(value, full)
     case 'cost':
       return `$${formatCost(value)}`
     default:
@@ -1370,9 +2072,9 @@ function formatModelMetricValue(value: number, metric: ModelMetricKey): string {
   }
 }
 
-function modelMetricDetail(model: AccountModelStat, metric: ModelMetricKey, t: (key: string) => string): string {
+function modelMetricDetail(model: AccountModelStat, metric: ModelMetricKey, t: (key: string) => string, full: boolean): string {
   const requests = `${formatNumber(model.requests)} ${t('accounts.usageReqUnit')}`
-  const tokens = `${formatTokens(model.tokens)} ${t('accounts.usageTokUnit')}`
+  const tokens = `${formatTokens(model.tokens, full)} ${t('accounts.usageTokUnit')}`
   const cost = `$${formatCost(model.account_billed)}`
   switch (metric) {
     case 'tokens':
@@ -1399,9 +2101,9 @@ function keyMetricValue(stat: AccountKeyStat, metric: ModelMetricKey): number {
   }
 }
 
-function keyMetricDetail(stat: AccountKeyStat, metric: ModelMetricKey, t: (key: string) => string): string {
+function keyMetricDetail(stat: AccountKeyStat, metric: ModelMetricKey, t: (key: string) => string, full: boolean): string {
   const requests = `${formatNumber(stat.requests)} ${t('accounts.usageReqUnit')}`
-  const tokens = `${formatTokens(stat.tokens)} ${t('accounts.usageTokUnit')}`
+  const tokens = `${formatTokens(stat.tokens, full)} ${t('accounts.usageTokUnit')}`
   const cost = `$${formatCost(stat.account_billed)}`
   switch (metric) {
     case 'tokens':
@@ -1417,15 +2119,14 @@ function formatNumber(value: number): string {
   return Math.round(Number(value || 0)).toLocaleString()
 }
 
-function formatCompactNumber(value: number): string {
-  const n = Number(value || 0)
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}K`
-  return Math.round(n).toLocaleString()
+// 数字格式统一走 lib/usageFormat：它认「显示完整用量数字」设置，且紧凑单位
+// 覆盖到 B/T（本地实现原来顶到 M 就不再进位，几十亿 token 会显示成 6609M）。
+function formatCompactNumber(value: number, full: boolean): string {
+  return formatUsageNumber(Number(value || 0), full)
 }
 
-function formatTokens(value: number): string {
-  return formatCompactNumber(value)
+function formatTokens(value: number, full: boolean): string {
+  return formatCompactNumber(value, full)
 }
 
 function formatCost(value: number): string {

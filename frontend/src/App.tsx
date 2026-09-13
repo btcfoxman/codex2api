@@ -6,6 +6,7 @@ import RouteErrorBoundary from './components/RouteErrorBoundary'
 import StateShell from './components/StateShell'
 import { ToastProvider } from './components/ToastProvider'
 import { BrandingProvider } from './branding'
+import { VisibleChannelsProvider } from './visibleChannels'
 import { ThemeProvider } from './hooks/useTheme'
 import Dashboard from './pages/Dashboard'
 
@@ -23,6 +24,7 @@ const ImageStudioPortal = lazy(() => import('./pages/ImageStudioPortal'))
 const AccountPortal = lazy(() => import('./pages/AccountPortal'))
 const Usage = lazy(() => import('./pages/Usage'))
 const ImageStudio = lazy(() => import('./pages/ImageStudio'))
+const QualityTest = lazy(() => import('./pages/QualityTest'))
 const PromptFilter = lazy(() => import('./pages/PromptFilter'))
 const ThemeSettings = lazy(() => import('./pages/ThemeSettings'))
 const ModelPricing = lazy(() => import('./pages/ModelPricing'))
@@ -55,15 +57,20 @@ export default function App() {
 function AdminApp() {
   return (
     <AuthGate>
+      <VisibleChannelsProvider>
       <Layout>
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/accounts" element={<Accounts />} />
           <Route path="/accounts/grok" element={<Accounts />} />
+          <Route path="/accounts/antigravity" element={<Accounts />} />
+          <Route path="/accounts/claude" element={<Accounts />} />
+          <Route path="/accounts/invite" element={<Accounts />} />
           <Route path="/api-keys" element={<APIKeys />} />
           <Route path="/proxies" element={<Proxies />} />
           <Route path="/images" element={<Navigate to="/images/studio" replace />} />
           <Route path="/images/:view" element={<ImageStudio />} />
+          <Route path="/quality-test" element={<QualityTest />} />
           <Route path="/prompt-filter" element={<Navigate to="/prompt-filter/overview" replace />} />
           <Route path="/prompt-filter/:view" element={<PromptFilter />} />
           <Route path="/ops" element={<Navigate to="/ops/overview" replace />} />
@@ -82,6 +89,7 @@ function AdminApp() {
           <Route path="/api-reference" element={<Navigate to="/docs#model-api" replace />} />
         </Routes>
       </Layout>
+      </VisibleChannelsProvider>
     </AuthGate>
   )
 }

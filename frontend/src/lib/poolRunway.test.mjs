@@ -6,7 +6,9 @@ import {
   estimatePressureForecast,
   getAccountWindowMs,
   hasBurnPrediction,
+  isClaudeUsagePlan,
   selectPoolRunway,
+  selectPoolRunwayFromAnalysis,
 } from "./poolRunway.ts";
 
 const HOUR = 60 * 60_000;
@@ -31,6 +33,28 @@ test("hasBurnPrediction skips premium 5h when snapshot is missing (#382)", () =>
   const account = baseAccount({ plan_type: "plus", usage_percent_5h: null, reset_5h_at: undefined });
   assert.equal(hasBurnPrediction(account, "5h"), false);
   assert.equal(hasBurnPrediction({ ...account, usage_percent_5h: 40 }, "5h"), true);
+});
+
+test("Claude Max plans participate in native 5h burn prediction", () => {
+  assert.equal(isClaudeUsagePlan("max-5x"), true);
+  assert.equal(isClaudeUsagePlan("max-20x"), true);
+  assert.equal(isClaudeUsagePlan("claude-max-5x"), true);
+  assert.equal(isClaudeUsagePlan("enterprise"), true);
+  assert.equal(
+    hasBurnPrediction(
+      baseAccount({
+        claude_api: true,
+        plan_type: "max-5x",
+        usage_percent_5h: 42,
+      }),
+      "5h",
+    ),
+    true,
+  );
+});
+
+test("Claude free tier does not claim a premium 5h window", () => {
+  assert.equal(isClaudeUsagePlan("free"), false);
 });
 
 test("getAccountWindowMs uses monthly seconds for team long window", () => {
@@ -127,6 +151,19 @@ test("estimatePressureForecast prefers real account window length for burn", () 
   }
 });
 
+test("estimatePressureForecast excludes Responses-limited accounts from supply", () => {
+  const now = Date.now();
+  const forecast = estimatePressureForecast([
+    baseAccount({
+      status: "responses_rate_limited",
+      usage_percent_5h: 20,
+      reset_5h_at: new Date(now + HOUR).toISOString(),
+    }),
+  ], "5h", now, 0, 0, 10_000);
+  assert.equal(forecast.dispatchableAccounts, 0);
+  assert.equal(forecast.rateLimitPressure, 1);
+});
+
 test("selectPoolRunway picks earlier pressure between 5h and 7d", () => {
   const now = Date.now();
   const accounts = [
@@ -148,4 +185,32 @@ test("selectPoolRunway picks earlier pressure between 5h and 7d", () => {
   // Prefer window that has a nearer pressure if any
   assert.ok(runway.windowKey === "5h" || runway.windowKey === "7d");
   assert.ok(["critical", "hours", "day_plus", "stable", "unknown"].includes(runway.kind));
+});
+
+test("selectPoolRunwayFromAnalysis consumes fixed-size server forecasts", () => {
+  const now = Date.now();
+  const forecast = (predictedAt) => ({
+    sampled: 40000,
+    threshold: 100,
+    predicted_at: predictedAt,
+    predicted_count: 100,
+    unknown: 0,
+    rpm: 120,
+    effective_rpm_limit: 500,
+    rpm_pressure: 0.24,
+    active_pressure: 0.1,
+    rate_limit_pressure: 0,
+    dispatchable_accounts: 39900,
+    avg_concurrency: 2,
+    high_pressure_at: null,
+    supply_shortage_at: null,
+    risk_level: "medium",
+    confidence: 1,
+  });
+  const runway = selectPoolRunwayFromAnalysis({
+    "5h": forecast(now + 2 * HOUR),
+    "7d": forecast(now + 2 * DAY),
+  }, now);
+  assert.equal(runway.windowKey, "5h");
+  assert.equal(runway.forecast.dispatchableAccounts, 39900);
 });

@@ -1,3 +1,4 @@
+import { ImageBillingCost } from '../components/image-studio/ImageBillingCost'
 import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, useNavigate, useParams } from 'react-router-dom'
@@ -30,6 +31,8 @@ import {
 import { api } from '../api'
 import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
 import Pagination from '../components/Pagination'
+import CompactionBadges from '../components/CompactionBadges'
+import APIKeyModelRequestUsageCard from '../components/APIKeyModelRequestUsage'
 import { useTheme } from '../hooks/useTheme'
 import { usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import type {
@@ -380,6 +383,7 @@ export default function APIKeyUsagePortal() {
         {data && summary ? (
           <div className="space-y-5">
             <UsageTabs activeView={activeView} />
+            <APIKeyModelRequestUsageCard items={data.model_request_usage ?? []} />
 
             {/* 概览：核心指标 + 模型/端点分布 */}
             {activeView === 'overview' ? (
@@ -658,10 +662,11 @@ function QuotaCard({ data, quotaPercent }: { data: PublicAPIKeyUsageResponse; qu
 function WindowUsageCard({ limits, windows }: { limits: APIKeyLimits; windows: PublicAPIKeyUsageResponse['usage']['windows'] }) {
   const { t } = useTranslation()
   const rows = [
+    { label: t('keyUsage.windowToday'), usage: windows.today, costLimit: limits.cost_limit_daily ?? 0, tokenLimit: limits.token_limit_daily ?? 0 },
     { label: '5h', usage: windows.last_5h, costLimit: limits.cost_limit_5h ?? 0, tokenLimit: limits.token_limit_5h ?? 0 },
     { label: '7d', usage: windows.last_7d, costLimit: limits.cost_limit_7d ?? 0, tokenLimit: limits.token_limit_7d ?? 0 },
     { label: '30d', usage: windows.last_30d, costLimit: limits.cost_limit_30d ?? 0, tokenLimit: limits.token_limit_30d ?? 0 },
-  ]
+  ].filter((row) => row.usage)
   return (
     <PanelShell>
       <PanelHeader accent="cyan" icon={<Clock3 />} title={t('keyUsage.windows')} />
@@ -687,8 +692,46 @@ function WindowRow({ label, usage, costLimit, tokenLimit }: { label: string; usa
         <UsageLimitBar label="USD" used={formatUSD(usage.user_billed)} limit={costLimit > 0 ? formatUSD(costLimit) : '-'} percent={costPct} />
         <UsageLimitBar label="Tok" used={formatCompact(usage.tokens)} limit={tokenLimit > 0 ? formatCompact(tokenLimit) : '-'} percent={tokenPct} />
       </div>
+      <WindowResetHint usage={usage} />
     </div>
   )
+}
+
+// WindowResetHint 展示服务端下发的窗口重置/回落时刻(issue #460):
+// fixed(自然日)窗口有确定的清零时刻;sliding 窗口没有单一重置点,
+// 只有最早一笔用量滚出窗口、额度开始回落的时间。
+function WindowResetHint({ usage }: { usage: PublicAPIKeyWindowUsage }) {
+  const { t } = useTranslation()
+  if (usage.window_kind === 'fixed' && usage.reset_at) {
+    return (
+      <div className="mt-2 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>{t('keyUsage.resetsAt', { time: formatBeijingTime(usage.reset_at) })}</span>
+        <span className="tabular-nums">{t('keyUsage.resetRemaining', { duration: formatDurationUntil(usage.reset_at) })}</span>
+      </div>
+    )
+  }
+  if (usage.window_kind === 'sliding') {
+    return (
+      <div className="mt-2 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>{t('keyUsage.slidingWindow')}</span>
+        {usage.decay_at ? <span className="tabular-nums">{t('keyUsage.decayAt', { time: formatBeijingTime(usage.decay_at) })}</span> : null}
+      </div>
+    )
+  }
+  return null
+}
+
+// formatDurationUntil 计算距目标时刻的剩余时长(向上取整到分钟)。
+function formatDurationUntil(dateStr: string): string {
+  const diff = new Date(dateStr).getTime() - Date.now()
+  if (!Number.isFinite(diff) || diff <= 0) return '0m'
+  const totalMinutes = Math.ceil(diff / 60000)
+  const days = Math.floor(totalMinutes / 1440)
+  const hours = Math.floor((totalMinutes % 1440) / 60)
+  const minutes = totalMinutes % 60
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
 }
 
 function LimitsCard({ limits }: { limits: APIKeyLimits }) {
@@ -700,9 +743,11 @@ function LimitsCard({ limits }: { limits: APIKeyLimits }) {
     [t('apiKeys.limits.cost5h'), limits.cost_limit_5h ? formatUSD(limits.cost_limit_5h) : ''],
     [t('apiKeys.limits.cost7d'), limits.cost_limit_7d ? formatUSD(limits.cost_limit_7d) : ''],
     [t('apiKeys.limits.cost30d'), limits.cost_limit_30d ? formatUSD(limits.cost_limit_30d) : ''],
+    [t('apiKeys.limits.costDaily'), limits.cost_limit_daily ? formatUSD(limits.cost_limit_daily) : ''],
     [t('apiKeys.limits.tokens5h'), limits.token_limit_5h ? formatCompact(limits.token_limit_5h) : ''],
     [t('apiKeys.limits.tokens7d'), limits.token_limit_7d ? formatCompact(limits.token_limit_7d) : ''],
     [t('apiKeys.limits.tokens30d'), limits.token_limit_30d ? formatCompact(limits.token_limit_30d) : ''],
+    [t('apiKeys.limits.tokensDaily'), limits.token_limit_daily ? formatCompact(limits.token_limit_daily) : ''],
   ]
   const visible = items.filter(([, value]) => value !== undefined && value !== '' && value !== 0)
   const hasModels = (limits.model_allow?.length ?? 0) > 0 || (limits.model_deny?.length ?? 0) > 0
@@ -926,7 +971,48 @@ function RecentLogsTable({
           <h3 className="text-base font-semibold text-foreground">{t('keyUsage.recent')}</h3>
           <span className="text-xs text-muted-foreground">{t('usage.recordsCount', { count: totalItems })}</span>
         </div>
-        <div className="data-table-shell">
+        <div className="grid gap-3 lg:hidden">
+          {logs.length > 0 ? logs.map((log) => (
+            <Card key={log.id} className="p-3.5 space-y-2">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                  <Badge variant="outline" className={`text-[12px] ${statusBadgeClass(log.status_code)}`}>{log.status_code}</Badge>
+                  <Badge variant="outline" className="text-[12px]">{log.model || '-'}</Badge>
+                  {log.effective_model && log.effective_model !== log.model ? (
+                    <Badge variant="outline" className="border-transparent bg-blue-500/10 text-[11px] font-medium text-blue-600 dark:bg-blue-500/20 dark:text-blue-400">→ {log.effective_model}</Badge>
+                  ) : null}
+                </div>
+                <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{formatBeijingTime(log.created_at)}</span>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="font-mono text-muted-foreground">{log.endpoint || '-'}</span>
+                <Badge
+                  variant="outline"
+                  className="text-[11px]"
+                  style={{ background: log.stream ? 'rgba(99, 102, 241, 0.12)' : 'rgba(107, 114, 128, 0.12)', color: log.stream ? '#6366f1' : '#6b7280', borderColor: 'transparent' }}
+                >
+                  {log.stream ? 'stream' : 'sync'}
+                </Badge>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-border/50 text-xs">
+                {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
+                  <div className="font-mono text-[12px] tabular-nums">
+                    <span className="text-blue-500">↓{formatNumber(log.input_tokens)}</span>
+                    <span className="mx-1 text-border">|</span>
+                    <span className="text-emerald-500">↑{formatNumber(log.output_tokens)}</span>
+                  </div>
+                ) : <span className="font-mono text-[12px] text-muted-foreground">-</span>}
+                <span className="font-mono text-[12px] text-muted-foreground">
+                  {log.duration_ms > 1000 ? `${(log.duration_ms / 1000).toFixed(1)}s` : `${log.duration_ms}ms`}
+                </span>
+              </div>
+            </Card>
+          )) : (
+            <div className="py-8 text-center text-sm text-muted-foreground">{t('keyUsage.noRows')}</div>
+          )}
+        </div>
+
+        <div className="data-table-shell hidden lg:block">
           <TooltipProvider>
           <Table>
             <TableHeader>
@@ -976,9 +1062,10 @@ function RecentLogsTable({
                       >
                         {log.stream ? 'stream' : 'sync'}
                       </Badge>
-                      {log.compact ? (
-                        <Badge variant="outline" className="gap-0.5 border-transparent bg-teal-500/12 text-[11px] font-semibold text-teal-700 dark:bg-teal-500/20 dark:text-teal-300"><Box className="size-3" />{t('usage.compactRequest')}</Badge>
-                      ) : null}
+                      <CompactionBadges
+                        compact={log.compact}
+                        hasCompactionHistory={log.has_compaction_history}
+                      />
                     </div>
                   </TableCell>
                   <TableCell className="text-right">
@@ -1042,6 +1129,7 @@ function RecentLogsTable({
 // LogCostCell —— 价格列：悬停展示输入/输出/缓存的费用与单价明细（与管理端口径一致）
 function LogCostCell({ log }: { log: PublicAPIKeyUsageLog }) {
   const { t } = useTranslation()
+  if (log.user_billing_mode === 'per_image') return <ImageBillingCost count={log.billed_image_count} unitPrice={log.image_unit_price} userBilled={log.user_billed} />
   const hasCostContext = log.status_code < 400 && (
     log.user_billed > 0 || log.total_cost > 0 || log.input_tokens > 0 || log.output_tokens > 0 || log.cached_tokens > 0
   )

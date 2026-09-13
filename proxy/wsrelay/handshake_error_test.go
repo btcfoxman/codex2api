@@ -148,15 +148,18 @@ func TestHandshakeUnauthorizedHTTPResponse(t *testing.T) {
 	makeErr := func(status int, body string) error {
 		resp := &http.Response{
 			StatusCode: status,
-			Header:     http.Header{"X-Request-Id": []string{"req-1"}},
-			Body:       io.NopCloser(strings.NewReader(body)),
+			Header: http.Header{
+				"Retry-After":  []string{"7"},
+				"X-Request-Id": []string{"req-1"},
+			},
+			Body: io.NopCloser(strings.NewReader(body)),
 		}
 		return formatDialHandshakeError(websocket.ErrBadHandshake, resp)
 	}
 
 	t.Run("401 converts to real-status response with raw body", func(t *testing.T) {
 		body := `{"error":{"message":"token expired","code":"token_expired"}}`
-		resp, ok := handshakeUnauthorizedHTTPResponse(makeErr(http.StatusUnauthorized, body))
+		resp, ok := handshakeAccountErrorHTTPResponse(makeErr(http.StatusUnauthorized, body))
 		if !ok {
 			t.Fatal("expected conversion for 401")
 		}
@@ -178,19 +181,52 @@ func TestHandshakeUnauthorizedHTTPResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("non-401 handshake statuses keep transport error semantics", func(t *testing.T) {
-		for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
-			if _, ok := handshakeUnauthorizedHTTPResponse(makeErr(status, `{"error":{"message":"x"}}`)); ok {
+	t.Run("402 deactivated workspace converts with parseable body", func(t *testing.T) {
+		resp, ok := handshakeAccountErrorHTTPResponse(makeErr(http.StatusPaymentRequired, `{"detail":{"code":"deactivated_workspace"}}`))
+		if !ok {
+			t.Fatal("expected conversion for 402")
+		}
+		if resp.StatusCode != http.StatusPaymentRequired {
+			t.Fatalf("StatusCode = %d, want 402", resp.StatusCode)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(got), `"deactivated_workspace"`) {
+			t.Fatalf("body missing workspace code: %q", got)
+		}
+	})
+
+	t.Run("429 converts with retry-after and parseable body", func(t *testing.T) {
+		resp, ok := handshakeAccountErrorHTTPResponse(makeErr(http.StatusTooManyRequests, `{"error":{"code":"rate_limit_exceeded"}}`))
+		if !ok {
+			t.Fatal("expected conversion for 429")
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("StatusCode = %d, want 429", resp.StatusCode)
+		}
+		if resp.Header.Get("Retry-After") != "7" {
+			t.Fatalf("Retry-After not preserved: %v", resp.Header)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(got), `"rate_limit_exceeded"`) {
+			t.Fatalf("body missing rate-limit code: %q", got)
+		}
+	})
+
+	// 403 可能来自 Cloudflare 拦截（出口 IP 维度），按账号错误分类会误伤，保持
+	// transport 语义；503 同理。
+	t.Run("non-account handshake statuses keep transport error semantics", func(t *testing.T) {
+		for _, status := range []int{http.StatusForbidden, http.StatusServiceUnavailable} {
+			if _, ok := handshakeAccountErrorHTTPResponse(makeErr(status, `{"error":{"message":"x"}}`)); ok {
 				t.Fatalf("status %d should not convert", status)
 			}
 		}
 	})
 
 	t.Run("plain errors pass through", func(t *testing.T) {
-		if _, ok := handshakeUnauthorizedHTTPResponse(errors.New("dial tcp timeout")); ok {
+		if _, ok := handshakeAccountErrorHTTPResponse(errors.New("dial tcp timeout")); ok {
 			t.Fatal("plain error should not convert")
 		}
-		if _, ok := handshakeUnauthorizedHTTPResponse(formatDialHandshakeError(errors.New("dial tcp timeout"), nil)); ok {
+		if _, ok := handshakeAccountErrorHTTPResponse(formatDialHandshakeError(errors.New("dial tcp timeout"), nil)); ok {
 			t.Fatal("no-response handshake error should not convert")
 		}
 	})

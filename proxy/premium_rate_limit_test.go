@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -18,6 +19,29 @@ func newProxyPremiumTestStore() *auth.Store {
 		UsageProbeMaxAgeMinutes:          10,
 		RecoveryProbeIntervalMinutes:     30,
 	})
+}
+
+func TestApply429CooldownRepeatedThrottleKeepsDeadlineAcrossModels(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	acc := &auth.Account{DBID: 1, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
+	body := []byte(`{"error":{"type":"rate_limit_error"}}`)
+	Apply429Cooldown(store, acc, body, nil, "gpt-5.4")
+	_, firstDeadline := acc.GetCooldownSnapshot()
+	Apply429Cooldown(store, acc, body, nil, "gpt-5.6-luna")
+	_, secondDeadline := acc.GetCooldownSnapshot()
+	if !secondDeadline.Equal(firstDeadline) || acc.TransientRateLimitBackoff() != 1 {
+		t.Fatal("a concurrent bare 429 extended or escalated the same window")
+	}
+	if acc.SparkDispatchEligible() {
+		t.Fatal("Spark bypassed an account-wide transient throttle")
+	}
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("Retry-After", "120")
+	Apply429Cooldown(store, acc, body, resp, "gpt-5.4")
+	if remaining, ok := acc.TransientRateLimitRemaining(time.Now()); !ok || remaining < 119*time.Second {
+		t.Fatalf("longer Retry-After was not preserved: %v, %v", remaining, ok)
+	}
 }
 
 func TestApply429CooldownPremium5hWindowMarksRateLimited(t *testing.T) {
@@ -52,7 +76,7 @@ func TestApply429CooldownPremium5hWindowMarksRateLimited(t *testing.T) {
 	}
 }
 
-func TestApply429CooldownUnknownRateLimitSetsModelCooldown(t *testing.T) {
+func TestApply429CooldownUnknownRateLimitSetsAccountCooldown(t *testing.T) {
 	store := newProxyPremiumTestStore()
 	acc := &auth.Account{
 		DBID:        1,
@@ -64,14 +88,17 @@ func TestApply429CooldownUnknownRateLimitSetsModelCooldown(t *testing.T) {
 	start := time.Now()
 	decision := Apply429Cooldown(store, acc, []byte(`{"error":{"type":"rate_limit_error"}}`), nil, "gpt-5.4")
 
-	if decision.Scope != rateLimitScopeModel {
-		t.Fatalf("Apply429Cooldown().Scope = %q, want model", decision.Scope)
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited" {
+		t.Fatalf("Apply429Cooldown() = %#v, want account-scoped transient throttle", decision)
 	}
-	if decision.ResetAt.Before(start.Add(4*time.Minute)) || decision.ResetAt.After(start.Add(6*time.Minute)) {
-		t.Fatalf("ResetAt = %v, want about 5m from now", decision.ResetAt)
+	if decision.ResetAt.Before(start.Add(10*time.Second)) || decision.ResetAt.After(start.Add(20*time.Second)) {
+		t.Fatalf("ResetAt = %v, want about 15s from now", decision.ResetAt)
 	}
-	if !acc.IsModelRateLimited("gpt-5.4") {
-		t.Fatal("account model should enter short cooldown")
+	if acc.IsModelRateLimited("gpt-5.4") {
+		t.Fatal("transient 429 must not be scoped to one model alias")
+	}
+	if !acc.HasActiveCooldown() || acc.GetCooldownReason() != auth.ResponsesRateLimitedCooldownReason {
+		t.Fatal("transient 429 should freeze the whole account")
 	}
 }
 
@@ -95,6 +122,42 @@ func TestApply429CooldownUsageLimitWithoutResetStaysAccountScoped(t *testing.T) 
 	}
 	if acc.IsModelRateLimited("gpt-5.4") {
 		t.Fatal("usage_limit_reached should not be stored as a model cooldown")
+	}
+}
+
+func TestApply429CooldownUsageLimitTriggersImmediateUsageProbe(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	acc := &auth.Account{
+		DBID:        2,
+		AccessToken: "token",
+		PlanType:    "plus",
+		Status:      auth.StatusReady,
+	}
+	store.AddAccount(acc)
+	probed := make(chan *auth.Account, 1)
+	store.SetUsageProbeFunc(func(_ context.Context, account *auth.Account) error {
+		probed <- account
+		return nil
+	})
+
+	Apply429Cooldown(
+		store,
+		acc,
+		[]byte(`{"error":{"type":"usage_limit_reached"}}`),
+		nil,
+		"gpt-5.4",
+	)
+
+	select {
+	case got := <-probed:
+		if got != acc {
+			t.Fatalf("usage probe account = %p, want %p", got, acc)
+		}
+		if !got.InLimitedState() {
+			t.Fatal("usage probe started before the Responses cooldown was visible")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered immediately after Responses limit")
 	}
 }
 
@@ -140,6 +203,8 @@ func TestSyncCodexUsageStateCreditAccountSkipsPremium5hWindowLimit(t *testing.T)
 		CreditEnabled:         true,
 		CreditSkipUsageWindow: true,
 	}
+	// 信用开关现在还要求当下确实有积分可花，快照缺失会按「没有积分」处理。
+	acc.SetCreditBalance("1000.0000000000", true, false, false)
 	resp := &http.Response{Header: make(http.Header)}
 	resp.Header.Set("x-codex-primary-used-percent", "100")
 	resp.Header.Set("x-codex-primary-window-minutes", "300")
@@ -165,7 +230,7 @@ func TestSyncCodexUsageStateCreditAccountSkipsPremium5hWindowLimit(t *testing.T)
 	}
 }
 
-func TestSyncCodexUsageStateIgnoredLimitRecordsSnapshotWithoutBlocking(t *testing.T) {
+func TestSyncCodexUsageStateIgnoredLimitRecordsSnapshotForContinuationOnly(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:         4,
 		TestConcurrency:        1,
@@ -195,9 +260,15 @@ func TestSyncCodexUsageStateIgnoredLimitRecordsSnapshotWithoutBlocking(t *testin
 	if result.Premium5hRateLimited || acc.IsPremium5hRateLimited() {
 		t.Fatal("100% usage metadata must not create a premium cooldown when ignored")
 	}
-	if !acc.IsAvailable() {
-		t.Fatal("account should remain schedulable after a successful Responses status")
+	if acc.IsAvailable() {
+		t.Fatal("100% usage account must stay out of fresh-session scheduling")
 	}
+	store.BindSessionAffinity("working-turn", acc, "")
+	continued, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil)
+	if continued != acc {
+		t.Fatal("100% usage metadata prevented the existing turn from continuing")
+	}
+	store.Release(continued)
 }
 
 func TestApply429CooldownUsageLimitStillBlocksWhenUsageStatusIgnored(t *testing.T) {
@@ -222,6 +293,14 @@ func TestApply429CooldownUsageLimitStillBlocksWhenUsageStatusIgnored(t *testing.
 	}
 	if !acc.HasActiveCooldown() {
 		t.Fatal("429 usage_limit_reached must create an explicit cooldown")
+	}
+	if got := acc.GetCooldownReason(); got != auth.ResponsesRateLimitedCooldownReason {
+		t.Fatalf("cooldown reason = %q, want authoritative Responses rejection", got)
+	}
+	store.BindSessionAffinity("working-turn", acc, "")
+	if got, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil); got != nil {
+		store.Release(got)
+		t.Fatal("authoritative Responses 429 must stop an existing turn")
 	}
 }
 

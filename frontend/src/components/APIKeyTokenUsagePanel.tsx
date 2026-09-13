@@ -1,9 +1,11 @@
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { useToast } from "../hooks/useToast";
 import type {
   APIKeyAccountGroup,
+  APIKeyAccountGroupUsage,
+  APIKeyAccountUsageReconciliation,
   APIKeyAccountStat,
   APIKeyTokenStat,
 } from "../types";
@@ -149,8 +151,14 @@ export default function APIKeyTokenUsagePanel({
   // 缓存按 api_key_id,切换时间范围时整体清空(下方 reload 内重置)。
   const [expandedIds, setExpandedIds] = useState<Set<number>>(() => new Set());
   const [accountData, setAccountData] = useState<Record<number, APIKeyAccountStat[]>>({});
+  const [groupData, setGroupData] = useState<Record<number, APIKeyAccountGroupUsage[]>>({});
+  const [reconciliationData, setReconciliationData] = useState<
+    Record<number, APIKeyAccountUsageReconciliation>
+  >({});
   const [accountLoadingIds, setAccountLoadingIds] = useState<Set<number>>(() => new Set());
   const [accountError, setAccountError] = useState<Record<number, string>>({});
+  const reloadAbort = useRef<AbortController | null>(null);
+  const accountAbort = useRef<Map<number, AbortController>>(new Map());
 
   const range = useMemo(() => {
     const now = new Date();
@@ -184,20 +192,27 @@ export default function APIKeyTokenUsagePanel({
 
   const reload = async () => {
     if (!range) return;
+    reloadAbort.current?.abort();
+    accountAbort.current.forEach((controller) => controller.abort());
+    accountAbort.current.clear();
+    const controller = new AbortController();
+    reloadAbort.current = controller;
     setLoading(true);
     // 范围变化或手动刷新：已展开的账号明细缓存作废。
     setExpandedIds(new Set());
     setAccountLoadingIds(new Set());
     setAccountData({});
+    setGroupData({});
+    setReconciliationData({});
     setAccountError({});
     try {
       const [data] = await Promise.all([
-        api.getAPIKeyTokenStats(range),
+        api.getAPIKeyTokenStats({ ...range, signal: controller.signal }),
         refreshFullUsageSetting(),
       ]);
       setItems(data.items ?? []);
     } catch (err) {
-      showToast(getErrorMessage(err), "error");
+      if (!controller.signal.aborted) showToast(getErrorMessage(err), "error");
     } finally {
       setLoading(false);
     }
@@ -221,6 +236,9 @@ export default function APIKeyTokenUsagePanel({
     });
     // 已缓存则直接展开，不重复请求。
     if (accountData[id] || !range) return;
+    accountAbort.current.get(id)?.abort();
+    const controller = new AbortController();
+    accountAbort.current.set(id, controller);
     setAccountLoadingIds((prev) => {
       const next = new Set(prev);
       next.add(id);
@@ -232,11 +250,22 @@ export default function APIKeyTokenUsagePanel({
       return next;
     });
     try {
-      const data = await api.getAPIKeyAccountStats(id, range);
+      const data = await api.getAPIKeyAccountStats(id, {
+        ...range,
+        signal: controller.signal,
+      });
       setAccountData((prev) => ({ ...prev, [id]: data.items ?? [] }));
+      setGroupData((prev) => ({ ...prev, [id]: data.groups ?? [] }));
+      const reconciliation = data.reconciliation;
+      if (reconciliation) {
+        setReconciliationData((prev) => ({ ...prev, [id]: reconciliation }));
+      }
     } catch (err) {
-      setAccountError((prev) => ({ ...prev, [id]: getErrorMessage(err) }));
+      if (!controller.signal.aborted) {
+        setAccountError((prev) => ({ ...prev, [id]: getErrorMessage(err) }));
+      }
     } finally {
+      accountAbort.current.delete(id);
       setAccountLoadingIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
@@ -250,6 +279,11 @@ export default function APIKeyTokenUsagePanel({
     void reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [range?.start, range?.end]);
+
+  useEffect(() => () => {
+    reloadAbort.current?.abort();
+    accountAbort.current.forEach((controller) => controller.abort());
+  }, []);
 
   useEffect(() => {
     if (typeof showFullUsageNumbersProp === "boolean") {
@@ -613,6 +647,8 @@ export default function APIKeyTokenUsagePanel({
                               loading={isLoadingAccounts}
                               error={accountError[item.api_key_id]}
                               rows={accountData[item.api_key_id]}
+                              groups={groupData[item.api_key_id]}
+                              reconciliation={reconciliationData[item.api_key_id]}
                               showFull={showFullUsageNumbers}
                               locale={locale}
                             />
@@ -702,12 +738,16 @@ function KeyAccountBreakdown({
   loading,
   error,
   rows,
+  groups,
+  reconciliation,
   showFull,
   locale,
 }: {
   loading: boolean;
   error?: string;
   rows?: APIKeyAccountStat[];
+  groups?: APIKeyAccountGroupUsage[];
+  reconciliation?: APIKeyAccountUsageReconciliation;
   showFull: boolean;
   locale: string;
 }) {
@@ -861,6 +901,110 @@ function KeyAccountBreakdown({
       </div>
 
       <div className="grid gap-2 sm:grid-cols-2">
+        {(groups && groups.length > 0) || reconciliation?.ungrouped.accounts ? (
+          <div className="col-span-full mb-1 rounded-xl border border-primary/20 bg-primary/[0.03] p-3">
+            <div className="mb-2 text-xs font-semibold text-foreground">
+              {t("apiKeys.keyGroupsTitle")}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {(groups ?? []).map((group) => (
+                <div
+                  key={group.id}
+                  className="rounded-lg border border-border/70 bg-background px-3 py-2"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span
+                      className="truncate text-xs font-semibold"
+                      style={{ color: normalizeGroupColor(group.color) }}
+                    >
+                      {group.name}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {t("apiKeys.keyGroupsAccounts", { count: group.accounts })}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] tabular-nums text-muted-foreground">
+                    <span>
+                      {formatUsageNumber(group.total_tokens, showFull, locale)}{" "}
+                      {t("apiKeys.keyAccountsTokUnit")}
+                    </span>
+                    <span>
+                      {t("apiKeys.keyGroupsAccountCost")}: {" "}
+                      <b className="text-foreground">{formatUSD(group.account_billed)}</b>
+                    </span>
+                    <span>
+                      {t("apiKeys.keyGroupsBilled")}: {" "}
+                      <b className="text-emerald-700 dark:text-emerald-400">
+                        {formatUSD(group.user_billed)}
+                      </b>
+                    </span>
+                  </div>
+                </div>
+              ))}
+              {reconciliation && reconciliation.ungrouped.accounts > 0 ? (
+                <div className="rounded-lg border border-amber-300/70 bg-amber-50/70 px-3 py-2 dark:border-amber-800/60 dark:bg-amber-950/20">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-xs font-semibold text-amber-800 dark:text-amber-300">
+                      {t("apiKeys.keyGroupsUngrouped")}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {t("apiKeys.keyGroupsAccounts", { count: reconciliation.ungrouped.accounts })}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] tabular-nums text-muted-foreground">
+                    <span>
+                      {formatUsageNumber(reconciliation.ungrouped.total_tokens, showFull, locale)}{" "}
+                      {t("apiKeys.keyAccountsTokUnit")}
+                    </span>
+                    <span>
+                      {t("apiKeys.keyGroupsAccountCost")}: {" "}
+                      <b className="text-foreground">{formatUSD(reconciliation.ungrouped.account_billed)}</b>
+                    </span>
+                    <span>
+                      {t("apiKeys.keyGroupsBilled")}: {" "}
+                      <b className="text-emerald-700 dark:text-emerald-400">
+                        {formatUSD(reconciliation.ungrouped.user_billed)}
+                      </b>
+                    </span>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+            {reconciliation ? (
+              <div className="mt-2 rounded-lg border border-border/70 bg-background/80 px-2.5 py-2 text-[10px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 tabular-nums">
+                  <span>{t("apiKeys.keyGroupsReconcileCost")}</span>
+                  <b className="text-foreground">{formatUSD(reconciliation.grouped_total.user_billed)}</b>
+                  <span>+</span>
+                  <b className="text-amber-700 dark:text-amber-300">{formatUSD(reconciliation.ungrouped.user_billed)}</b>
+                  <span>-</span>
+                  <b className="text-sky-700 dark:text-sky-300">{formatUSD(reconciliation.duplicate.user_billed)}</b>
+                  <span>=</span>
+                  <b className="text-emerald-700 dark:text-emerald-400">{formatUSD(totalBilled)}</b>
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 tabular-nums">
+                  <span>{t("apiKeys.keyGroupsReconcileAccounts")}</span>
+                  <b className="text-foreground">{reconciliation.grouped_total.accounts}</b>
+                  <span>+</span>
+                  <b className="text-amber-700 dark:text-amber-300">{reconciliation.ungrouped.accounts}</b>
+                  <span>-</span>
+                  <b className="text-sky-700 dark:text-sky-300">{reconciliation.duplicate.accounts}</b>
+                  <span>=</span>
+                  <b className="text-foreground">{rows.length}</b>
+                </div>
+                <p className="mt-1.5 leading-relaxed">
+                  {t("apiKeys.keyGroupsReconcileHint", {
+                    ungrouped: reconciliation.ungrouped.accounts,
+                    multi: reconciliation.multi_group_accounts,
+                  })}
+                </p>
+              </div>
+            ) : null}
+            <p className="mt-2 text-[10px] text-muted-foreground">
+              {t("apiKeys.keyGroupsCurrentHint")}
+            </p>
+          </div>
+        ) : null}
         {sortedRows.map((a, i) => {
           const share =
             totalRequests > 0 ? Math.min(100, (a.requests / totalRequests) * 100) : 0;
@@ -879,7 +1023,21 @@ function KeyAccountBreakdown({
                   <span className="min-w-0 truncate text-sm font-medium text-foreground">
                     {accountPrimaryLabel(a)}
                   </span>
+                  {a.account_deleted ? (
+                    <Badge
+                      variant="destructive"
+                      className="shrink-0 px-1.5 py-0 text-[10px] font-semibold"
+                      title={t("apiKeys.keyAccountDeletedHint")}
+                    >
+                      {t("apiKeys.keyAccountDeleted")}
+                    </Badge>
+                  ) : null}
                   <AccountGroupChips groups={a.groups} />
+                  {!a.groups || a.groups.length === 0 ? (
+                    <span className="inline-flex items-center rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+                      {t(a.account_deleted ? "apiKeys.keyAccountHistoricalGroupMissing" : "apiKeys.keyAccountUngrouped")}
+                    </span>
+                  ) : null}
                 </div>
                 <span className="shrink-0 tabular-nums text-xs font-semibold text-muted-foreground">
                   {formatPercent(share)}

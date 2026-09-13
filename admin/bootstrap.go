@@ -355,8 +355,9 @@ func defaultBootstrapSettings() *database.SystemSettings {
 	return &database.SystemSettings{
 		SiteName:                          database.DefaultSiteName,
 		MaxConcurrency:                    2,
+		CodexTelemetryEnabled:             false, // 实验性:模拟遥测默认不外发,由部署者显式开启
 		GlobalRPM:                         0,
-		TestModel:                         "gpt-5.4",
+		TestModel:                         auth.DefaultTestModel,
 		TestContent:                       auth.DefaultTestContent,
 		TestConcurrency:                   50,
 		BackgroundRefreshIntervalMinutes:  2,
@@ -375,7 +376,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		PromptFilterCustomPatterns:        "[]",
 		PromptFilterDisabledPatterns:      "[]",
 		ClientCompatMode:                  proxy.ClientCompatModePreserve,
-		CodexMinCLIVersion:                "0.118.0",
+		CodexMinCLIVersion:                "0.153.3",
 		UsageLogMode:                      database.UsageLogModeFull,
 		UsageLogBatchSize:                 200,
 		UsageLogFlushIntervalSeconds:      5,
@@ -385,7 +386,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		FirstTokenTimeoutSeconds:          0,
 		BillingTierPolicy:                 proxy.BillingTierPolicyActual,
 		AffinityMode:                      "bounded",
-		GrokConfig:                        `{"affinity_mode":"strict","probe_enabled":false,"probe_interval_minutes":30,"max_rate_limit_retries":0,"oauth_client_id":""}`,
+		GrokConfig:                        `{"affinity_mode":"strict","probe_enabled":false,"probe_interval_minutes":30,"max_rate_limit_retries":0,"oauth_client_id":"","follow_up_effort_enabled":false,"follow_up_tool_effort":"medium","follow_up_small_effort":"low","quality_guard_enabled":false,"quality_guard_max_attempts":6,"quality_guard_hold_timeout_sec":30,"quality_guard_on_exhausted":"fail_closed","quality_guard_account_cooldown_hours":12}`,
 		PublicKeyUsagePageEnabled:         true,
 		PublicImageStudioPageEnabled:      true,
 		CodexWSHideUpstreamErrors:         true,

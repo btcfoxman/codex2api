@@ -9,9 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	// Windows 与无 zoneinfo 的精简环境没有 IANA 时区库,内嵌兜底让 TZ=Asia/Shanghai
+	// 这类名字仍可解析(系统自带 zoneinfo 时优先用系统的)。issue #498。
+	_ "time/tzdata"
 
 	"github.com/codex2api/admin"
 	"github.com/codex2api/api"
@@ -20,6 +24,7 @@ import (
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
@@ -30,6 +35,11 @@ import (
 //go:embed frontend/dist/*
 var frontendFS embed.FS
 
+func migrateOnlyEnabled() bool {
+	value := strings.TrimSpace(os.Getenv("CODEX_MIGRATE_ONLY"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
@@ -39,7 +49,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
-	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label())
+	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s, tz=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label(), time.Local)
 
 	// 2. 初始化数据库
 	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN(), cfg.Database.Schema)
@@ -47,6 +57,10 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	if migrateOnlyEnabled() {
+		log.Println("数据库迁移完成，CODEX_MIGRATE_ONLY 已启用，进程退出")
+		return
+	}
 	switch cfg.Database.Driver {
 	case "sqlite":
 		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)
@@ -70,8 +84,9 @@ func main() {
 		settings = &database.SystemSettings{
 			SiteName:                          database.DefaultSiteName,
 			MaxConcurrency:                    2,
+			CodexTelemetryEnabled:             false, // 实验性:模拟遥测默认不外发,由部署者显式开启
 			GlobalRPM:                         0,
-			TestModel:                         "gpt-5.4",
+			TestModel:                         auth.DefaultTestModel,
 			TestContent:                       auth.DefaultTestContent,
 			TestConcurrency:                   50,
 			MaxRateLimitRetries:               1,
@@ -95,7 +110,7 @@ func main() {
 			PromptFilterCustomPatterns:        "[]",
 			PromptFilterDisabledPatterns:      "[]",
 			ClientCompatMode:                  proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                "0.118.0",
+			CodexMinCLIVersion:                "0.153.3",
 			UsageLogMode:                      database.UsageLogModeFull,
 			UsageLogBatchSize:                 200,
 			UsageLogFlushIntervalSeconds:      5,
@@ -124,8 +139,9 @@ func main() {
 		settings = &database.SystemSettings{
 			SiteName:                          database.DefaultSiteName,
 			MaxConcurrency:                    2,
+			CodexTelemetryEnabled:             false, // 实验性:模拟遥测默认不外发,由部署者显式开启
 			GlobalRPM:                         0,
-			TestModel:                         "gpt-5.4",
+			TestModel:                         auth.DefaultTestModel,
 			TestContent:                       auth.DefaultTestContent,
 			TestConcurrency:                   50,
 			MaxRateLimitRetries:               1,
@@ -146,7 +162,7 @@ func main() {
 			PromptFilterCustomPatterns:        "[]",
 			PromptFilterDisabledPatterns:      "[]",
 			ClientCompatMode:                  proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                "0.118.0",
+			CodexMinCLIVersion:                "0.153.3",
 			UsageLogMode:                      database.UsageLogModeFull,
 			UsageLogBatchSize:                 200,
 			UsageLogFlushIntervalSeconds:      5,
@@ -173,9 +189,61 @@ func main() {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
 	}
+	modelCooldownCtx, modelCooldownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	modelCooldownSettings, modelCooldownErr := db.GetModelCooldownSettings(modelCooldownCtx)
+	modelCooldownCancel()
+	if modelCooldownErr != nil {
+		log.Printf("警告: 读取模型冷却设置失败，将采用安全默认值: %v", modelCooldownErr)
+		modelCooldownSettings = database.DefaultModelCooldownSettings()
+	}
+	settings.RelayModelCooldownMode = modelCooldownSettings.RelayMode
+	settings.RelayModelCooldownSeconds = modelCooldownSettings.RelaySeconds
+	settings.RelayModelCooldownBackoffEnabled = modelCooldownSettings.RelayBackoffEnabled
+	settings.OAuthModelCooldownMode = modelCooldownSettings.OAuthMode
+	settings.OAuthModelCooldownSeconds = modelCooldownSettings.OAuthSeconds
+	settings.OAuthModelCooldownBackoffEnabled = modelCooldownSettings.OAuthBackoffEnabled
 	if envPolicy := strings.TrimSpace(os.Getenv("CODEX_BILLING_TIER_POLICY")); envPolicy != "" {
 		settings.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(envPolicy)
 	}
+	responseCacheCtx, responseCacheCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := proxy.LoadResponseCacheSettings(responseCacheCtx, db); err != nil {
+		responseCacheCancel()
+		log.Fatalf("加载响应缓存设置失败: %v", err)
+	}
+	responseCacheCancel()
+	antigravityOAuthCtx, antigravityOAuthCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if raw, err := db.LoadAntigravityOAuthConfig(antigravityOAuthCtx); err != nil {
+		log.Printf("加载 Antigravity OAuth client 设置失败(继续以环境变量为准): %v", err)
+	} else if parsed, parseErr := auth.ParseAntigravityOAuthSettings(raw); parseErr != nil {
+		log.Printf("Antigravity OAuth client 设置解析失败(继续以环境变量为准,请在管理页重新保存): %v", parseErr)
+	} else {
+		auth.SetConfiguredAntigravityOAuth(parsed)
+		if len(parsed.Clients) > 0 {
+			log.Printf("Antigravity OAuth client 设置已加载: %d 个 client", len(parsed.Clients))
+		}
+	}
+	antigravityOAuthCancel()
+	antigravityCfgCtx, antigravityCfgCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if raw, err := db.LoadAntigravityConfig(antigravityCfgCtx); err != nil {
+		log.Printf("加载 Antigravity 渠道设置失败(模型重定向不生效): %v", err)
+	} else if parsed, parseErr := auth.ParseAntigravitySettings(raw); parseErr != nil {
+		log.Printf("Antigravity 渠道设置解析失败(模型重定向不生效,请在管理页重新保存): %v", parseErr)
+	} else {
+		auth.SetConfiguredAntigravitySettings(parsed)
+		if len(parsed.ModelRedirects) > 0 {
+			log.Printf("Antigravity 模型重定向已加载: %d 条", len(parsed.ModelRedirects))
+		}
+	}
+	antigravityCfgCancel()
+
+	appliedResponseCache := proxy.GetResponseCacheAppliedConfig()
+	log.Printf(
+		"响应缓存设置已加载: generation=%d total=%d entry=%d reconstruct=%d",
+		appliedResponseCache.Generation,
+		appliedResponseCache.LocalMaxBytes,
+		appliedResponseCache.LocalMaxEntryBytes,
+		appliedResponseCache.ReconstructMaxBytes,
+	)
 
 	// 4. 初始化缓存（使用数据库中保存的连接池大小）
 	redisPoolSize := 30
@@ -255,8 +323,18 @@ func main() {
 		}
 	}
 
+	// Claude CLI 同步版本先于账号加载发布，保证 GenerateClaudeFingerprint 与回写使用同一生效版本。
+	claudeCLIVersionCtx, claudeCLIVersionCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if synced, err := db.GetClaudeSyncedCLIVersion(claudeCLIVersionCtx); err == nil {
+		auth.SetClaudeSyncedCLIVersion(synced)
+	} else {
+		log.Printf("读取 Claude CLI 同步版本失败（使用内置 %s）: %v", auth.BuiltinClaudeCLIVersion, err)
+	}
+	claudeCLIVersionCancel()
+
 	// 5. 初始化账号管理器
 	store := auth.NewStore(db, tc, settings)
+	store.SetSchedulerWaitLimits(cfg.SchedulerMaxWaiters, cfg.SchedulerMaxWaitersPerKey)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	if err := store.Init(ctx); err != nil {
@@ -279,15 +357,29 @@ func main() {
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	adminHandler.StartQualityTests(backgroundCtx)
 	defer cancelBackground()
+	if !proxy.StartResponseCacheSettingsPoller(backgroundCtx, db) {
+		log.Fatalf("启动响应缓存设置同步失败")
+	}
 	adminHandler.StartAutoResetCredits(backgroundCtx)
+	adminHandler.StartAutoActivate5hWindow(backgroundCtx)
 	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
 	adminHandler.StartGrokStatusProbe(backgroundCtx)
+	// 官方结算用量按天快照：上游只保留 7 天，不落库就永久丢失，长期历史全靠这个任务。
+	adminHandler.StartWhamDailyUsageProbe(backgroundCtx)
+	// 官方模型价目轮询默认关闭；启用后只在网络解析完成后做一次短数据库写入。
+	adminHandler.StartOfficialPricingSync(backgroundCtx)
+	// Prompt 审核日志保留清理：默认保留 7 天，每小时分批清理过期行，CY 关联行不动。
+	adminHandler.StartPromptLogRetention(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
 	// CODEX_DISABLE_CLI_VERSION_SYNC 为硬关闭。
 	proxy.StartCodexCLIVersionSync(backgroundCtx, db, store.GetProxyURL)
+
+	// Claude Code CLI 版本同步：启动先用生效版本回写账号指纹，再按 ClaudeConfig 开关/间隔联网同步。
+	proxy.StartClaudeCLIVersionSync(backgroundCtx, db, store, store.GetProxyURL)
 
 	log.Printf("账号就绪: %d/%d 可用", store.AvailableCount(), store.AccountCount())
 
@@ -303,6 +395,16 @@ func main() {
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	// 账号导入端点(multipart 文件上传)单独放宽体积上限,默认 200MB,可用
+	// CODEX_MAX_IMPORT_BODY_SIZE_MB 覆盖。前端按大小分批发送,单批控制在此上限内。
+	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_IMPORT_BODY_SIZE_MB")); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			security.MaxImportBodySize = int64(mb) * 1024 * 1024
+		}
+	}
+	if security.MaxImportBodySize < int64(security.MaxRequestBodySize) {
+		security.MaxImportBodySize = int64(security.MaxRequestBodySize)
+	}
 	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
 	r.Use(security.RequestBodyDecompressor(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())
@@ -316,6 +418,8 @@ func main() {
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 	handler.SetRuntimeCache(tc)
+	defer handler.CloseAPIKeyAuthCache()
+	adminHandler.SetAPIKeyAuthCacheHandler(handler)
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
@@ -360,12 +464,30 @@ func main() {
 					fi, statErr := f.Stat()
 					f.Close()
 					if statErr == nil && !fi.IsDir() {
+						if strings.HasPrefix(trimmed, "assets/") {
+							c.Header("Cache-Control", "public, max-age=31536000, immutable")
+						} else {
+							c.Header("Cache-Control", "no-cache")
+						}
 						c.FileFromFS(fp, httpFS)
 						return
 					}
 				}
+				// 带 hash 的静态资源不存在时必须返回 404。若回退到 index.html，
+				// 浏览器会把 HTML 当成 JS/CSS 解析并反复触发 chunk load error。
+				if strings.HasPrefix(trimmed, "assets/") {
+					c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+					c.Status(http.StatusNotFound)
+					return
+				}
 			}
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
+			c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+			c.Header("Pragma", "no-cache")
+			if c.Query("refresh-assets") == "1" {
+				// 仅清理 HTTP cache，不影响登录态、localStorage 或站点配置。
+				c.Header("Clear-Site-Data", `"cache"`)
+			}
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		}
 		serveKeyUsageFrontend := func(c *gin.Context) {
@@ -441,12 +563,30 @@ func main() {
 		c.Redirect(http.StatusFound, "/admin/")
 	})
 
-	// 健康检查
+	// 健康检查：只做非阻塞的尽力统计，避免账号热路径锁竞争拖死 liveness。
+	// 但账号池读锁连续超过门槛一次都拿不到时视为疑似死锁,降 503 让
+	// healthcheck 重启实例——否则死锁实例会一直以 200 留在服务里。
+	healthProbe := &healthLockProbe{}
 	r.GET("/health", func(c *gin.Context) {
+		available, total, countsComplete := store.HealthCountsNonBlocking()
+		blocked := healthProbe.observe(total >= 0, time.Now())
+		if blocked >= healthStoreLockStallThreshold {
+			c.JSON(503, gin.H{
+				"status":          "unavailable",
+				"reason":          "account store lock stalled",
+				"blocked_seconds": int(blocked / time.Second),
+				"available":       available,
+				"total":           total,
+				"counts_complete": countsComplete,
+			})
+			return
+		}
 		c.JSON(200, gin.H{
-			"status":    "ok",
-			"available": store.AvailableCount(),
-			"total":     store.AccountCount(),
+			"status":          "ok",
+			"build_version":   version.Current(),
+			"available":       available,
+			"total":           total,
+			"counts_complete": countsComplete,
 		})
 	})
 
@@ -503,8 +643,13 @@ func main() {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
 	}
 	adminHandler.WaitAutoResetCredits()
+	adminHandler.WaitAutoActivate5hWindow()
+	adminHandler.WaitQualityTests()
 	wsKeepalive.Stop()
 	wsrelay.ShutdownExecutor()
+	if !proxy.DrainResponseCacheBackendWrites(2 * time.Second) {
+		log.Printf("部分响应上下文后台写入未在关闭窗口内完成")
+	}
 	store.Stop()
 	// 所有请求入口和后台生产者停止后，再排空仍可能访问 Store、缓存或数据库的短任务。
 	if !db.DrainBackgroundTasks(2 * time.Second) {
@@ -528,7 +673,13 @@ func loggerMiddleware() gin.HandlerFunc {
 		start := time.Now()
 		c.Next()
 		latency := time.Since(start)
-		if shouldSkipAccessLog(c.Request.Method, c.Request.URL.Path, c.Writer.Status()) {
+		statusCode := c.Writer.Status()
+		if override, ok := c.Get(proxy.AccessLogStatusContextKey); ok {
+			if status, valid := override.(int); valid && status >= 100 && status <= 599 {
+				statusCode = status
+			}
+		}
+		if shouldSkipAccessLog(c.Request.Method, c.Request.URL.Path, statusCode) {
 			return
 		}
 
@@ -565,9 +716,9 @@ func loggerMiddleware() gin.HandlerFunc {
 		}
 
 		if emailStr != "" {
-			log.Printf("%s %s %d %v%s [%s] [%s]", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), latency, tagStr, emailStr, proxyStr)
+			log.Printf("%s %s %d %v%s [%s] [%s]", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr, emailStr, proxyStr)
 		} else {
-			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), latency, tagStr)
+			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr)
 		}
 	}
 }

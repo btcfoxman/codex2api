@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -42,6 +43,10 @@ func (h *Handler) imageStudioPortalAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 		if h.imageProxy != nil {
+			if c.Request.Method == http.MethodGet {
+				h.imageProxy.APIKeyReadAuthMiddleware()(c)
+				return
+			}
 			h.imageProxy.APIKeyAuthMiddleware()(c)
 			return
 		}
@@ -72,12 +77,17 @@ func (h *Handler) portalAPIKeyAuthFallback() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		if !row.Enabled {
+			writeError(c, http.StatusUnauthorized, "API Key 已停用")
+			c.Abort()
+			return
+		}
 		if row.IsExpired(time.Now()) {
 			writeError(c, http.StatusUnauthorized, "API Key 已过期")
 			c.Abort()
 			return
 		}
-		if row.IsQuotaExhausted() {
+		if row.IsQuotaExhausted() && c.Request.Method != http.MethodGet {
 			writeError(c, http.StatusForbidden, "API Key 配额已用尽")
 			c.Abort()
 			return
@@ -180,7 +190,16 @@ func normalizePortalImageJobPayload(req *imageGenerationJobPayload, editMode boo
 	}
 	req.Background = normalizeOptionalImageParam(req.Background)
 	req.Style = normalizeOptionalImageParam(req.Style)
-	req.Upscale = imageproc.NormalizeUpscale(req.Upscale)
+	normalizedUpscale, err := normalizeImageJobUpscale(req.Model, req.Size, req.Upscale)
+	if err != nil {
+		return errors.New("放大规格必须为 2k 或 4k")
+	}
+	req.Upscale = normalizedUpscale
+	count, err := normalizeImageJobOutputCount(req.N)
+	if err != nil {
+		return fmt.Errorf("生成数量必须在 1 到 %d 之间", maxImageJobOutputCount)
+	}
+	req.N = count
 	req.TemplateID = 0 // portal never selects admin templates by id write
 
 	if editMode {
@@ -210,10 +229,12 @@ func (h *Handler) enqueuePortalImageJob(c *gin.Context, apiKey *database.APIKeyR
 	if imageProxy == nil {
 		imageProxy = proxy.NewHandler(h.store, h.db, nil, nil)
 	}
-	if status, msg := imageProxy.EnforceAPIKeyLimits(c, req.Model); status != 0 {
+	if status, msg := imageProxy.EnforceAPIKeyLimitsForRequests(c, req.Model, req.N); status != 0 {
 		proxy.SendAPIKeyLimitError(c, status, msg)
 		return
 	}
+	// Reserve the concurrency slot before accepting the job; see the same
+	// sequence in CreateExternalImageJob.
 	releaseAPIKeyConcurrency, ok := imageProxy.AcquireAPIKeyConcurrency(c)
 	if !ok {
 		return
@@ -259,11 +280,12 @@ func (h *Handler) enqueuePortalImageJob(c *gin.Context, apiKey *database.APIKeyR
 		if releaseAPIKeyConcurrency != nil {
 			defer releaseAPIKeyConcurrency()
 		}
+		opts := imageJobRunOptions{sharedAPIKeyConcurrency: true}
 		if editMode {
-			h.runImageEditJob(jobID, req, apiKey)
+			h.runImageEditJob(jobID, req, apiKey, opts)
 			return
 		}
-		h.runImageGenerationJob(jobID, req, apiKey)
+		h.runImageGenerationJob(jobID, req, apiKey, opts)
 	}()
 	c.JSON(http.StatusAccepted, imageJobResponse{Job: job})
 }

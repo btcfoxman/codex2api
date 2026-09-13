@@ -22,9 +22,9 @@ import (
 const (
 	selfServiceTag       = "self-service"
 	selfServiceSource    = "self-service"
-	selfServiceRateLimit = 10           // 单 IP 窗口内最多请求数
-	selfServiceRateWin   = time.Hour    // 限流窗口
-	selfServiceEmailMax  = 254          // 邮箱长度上限
+	selfServiceRateLimit = 10        // 单 IP 窗口内最多请求数
+	selfServiceRateWin   = time.Hour // 限流窗口
+	selfServiceEmailMax  = 254       // 邮箱长度上限
 )
 
 var selfServiceEmailRe = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
@@ -243,7 +243,7 @@ func (h *Handler) SubmitAccountPortalCode(c *gin.Context) {
 // 不加入运行时调度池（管理员批准后再启用）。重复账号返回 errDuplicateOAuthIdentity。
 func (h *Handler) upsertSelfServiceAccount(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, contactEmail string) (int64, error) {
 	seed = normalizeTokenCredentialSeed(seed)
-	if seed.email != "" && seed.workspaceID != "" {
+	if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
 		h.mergeDuplicateMu.Lock()
 		defer h.mergeDuplicateMu.Unlock()
 		if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, 0); err != nil {
@@ -253,7 +253,7 @@ func (h *Handler) upsertSelfServiceAccount(ctx context.Context, name, proxyURL s
 		}
 	}
 
-	id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), proxyURL)
+	id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
 	if err != nil {
 		return 0, err
 	}
@@ -269,6 +269,9 @@ func (h *Handler) upsertSelfServiceAccount(ctx context.Context, name, proxyURL s
 		return 0, err
 	}
 	h.db.InsertAccountEventAsync(id, "added", selfServiceSource)
+	// 公开提交不走 /api/admin/accounts* 失效中间件；不主动丢快照的话，
+	// 账号页 SWR 会继续吐旧列表，待审核面板第一次查询就是 0。
+	h.invalidateAccountSnapshotCaches()
 	log.Printf("自助门户新增待审核账号 %d (%s, 联系人 %s)", id, name, contactEmail)
 	return id, nil
 }

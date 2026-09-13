@@ -1,4 +1,4 @@
-import type { BatchUpdateAccountsRequest } from "../types";
+import type { BatchUpdateAccountsRequest, CodexFingerprintMode } from "../types";
 
 export interface BuildBatchMetadataUpdateOptions {
   ids: number[];
@@ -12,6 +12,10 @@ export interface BuildBatchMetadataUpdateOptions {
   baseConcurrency: number | null;
   updateSchedulerPriority: boolean;
   schedulerPriority: number | null;
+  updateCodexFingerprintMode?: boolean;
+  codexFingerprintMode?: CodexFingerprintMode;
+  updateTimezone?: boolean;
+  timezone?: string;
 }
 
 export function buildBatchMetadataUpdate({
@@ -26,6 +30,10 @@ export function buildBatchMetadataUpdate({
   baseConcurrency,
   updateSchedulerPriority,
   schedulerPriority,
+  updateCodexFingerprintMode,
+  codexFingerprintMode,
+  updateTimezone,
+  timezone,
 }: BuildBatchMetadataUpdateOptions): BatchUpdateAccountsRequest {
   const payload: BatchUpdateAccountsRequest = { ids: [...ids] };
   if (updateTags) payload.tags = [...tags];
@@ -34,5 +42,8 @@ export function buildBatchMetadataUpdate({
   if (updateBaseConcurrency)
     payload.base_concurrency_override = baseConcurrency;
   if (updateSchedulerPriority) payload.scheduler_priority = schedulerPriority;
+  if (updateCodexFingerprintMode)
+    payload.codex_fingerprint_mode = codexFingerprintMode ?? "off";
+  if (updateTimezone) payload.timezone = (timezone ?? "").trim();
   return payload;
 }

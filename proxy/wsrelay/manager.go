@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/security"
 	"github.com/gorilla/websocket"
 )
 
@@ -114,6 +114,24 @@ func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
 	return strings.TrimSpace(proxyURL)
 }
 
+// configureWebsocketDialerProxy applies the configured proxy to a Gorilla
+// WebSocket dialer. Gorilla accepts "socks5" but not the curl-style
+// "socks5h" alias. Its SOCKS5 implementation already sends domain names to
+// the proxy, so normalizing the alias preserves remote DNS resolution.
+func configureWebsocketDialerProxy(dialer *websocket.Dialer, rawProxyURL string) error {
+	parsed, err := security.ParseProxyURL(rawProxyURL)
+	if err != nil {
+		return fmt.Errorf("parse proxy URL failed: %w", err)
+	}
+
+	parsed.Scheme = strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	if parsed.Scheme == "socks5h" {
+		parsed.Scheme = "socks5"
+	}
+	dialer.Proxy = http.ProxyURL(parsed)
+	return nil
+}
+
 // NewWsConnection 创建 WebSocket 连接
 func NewWsConnection(conn *websocket.Conn, session *Session, wsURL string) *WsConnection {
 	wc := &WsConnection{
@@ -149,17 +167,16 @@ func (wc *WsConnection) recentInboundWithin(window time.Duration) bool {
 // IsExpired 检查连接是否过期
 func (wc *WsConnection) IsExpired() bool {
 	lastUsed := time.Unix(0, wc.lastUsed.Load())
-	return time.Since(lastUsed) > IdleTimeout
+	return time.Since(lastUsed) > connectionIdleTimeout()
 }
 
-// IsOverAge 检查连接是否超过最大寿命（MaxConnLifetime）。到龄连接不能再接新请求：
-// 上游按连接建立时间计 60 分钟寿命，撞线后 response.create 一律报错，但 Ping
-// 探活仍成功，必须按年龄主动识别。
+// IsOverAge 检查连接是否超过当前模式的最大寿命。到龄连接不能再接新请求：
+// 默认模式提前规避上游 60 分钟硬限制；弱网模式使用更短窗口主动轮换。
 func (wc *WsConnection) IsOverAge() bool {
 	if wc.createdAt == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, wc.createdAt)) > MaxConnLifetime
+	return time.Since(time.Unix(0, wc.createdAt)) > connectionMaxLifetime()
 }
 
 // IsConnected 检查是否已连接
@@ -334,7 +351,7 @@ func (m *Manager) cleanupLoop() {
 // evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）。
 // 有在途请求的连接/会话一律跳过：IsExpired 只看 lastUsed/LastActiveAt，上游长思考
 // 或 pong 丢失时会把活跃对象误判为空闲，直接 Close 会把在途流同秒批量截断
-// （issue #436）；等在途收尾（PendingRequestTimeout 兜底）后下一轮再清。
+// （issue #436）；等在途收尾（读路径业务帧静默上限 ActiveReadMaxTurnSilence 兜底）后下一轮再清。
 func (m *Manager) evictExpired() {
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)
@@ -444,12 +461,48 @@ func accountConnectionLimit(account *auth.Account) int {
 	}
 	// 尚未完成调度快照初始化的账号保留原有槽位上限，生产请求进入账号池后
 	// DynamicConcurrencyLimit 会始终为正数。
-	return StatelessConnectionSlots
+	return statelessConnectionSlots()
 }
 
 type idleAccountConnection struct {
 	wc       *WsConnection
 	lastUsed int64
+}
+
+// isOneShotPoolConn 判断连接是否挂在每请求唯一的 stateless 池键下（8 槽全忙时的
+// fallback 一次性连接，或直连 stateless key 的路径）。这类连接的池键不可能被后续
+// 请求按键命中，仅 response_id 续链亲和可能定向取回。
+func isOneShotPoolConn(wc *WsConnection) bool {
+	return wc != nil && wc.session != nil && proxy.IsStatelessWebsocketSessionID(wc.session.ID)
+}
+
+// sortIdleForEviction 决定容量裁剪的逐出顺序：一次性池键连接优先，组内按 LRU。
+// 纯 LRU 会出现倒挂——刚用完的一次性连接比几分钟前用过的可复用槽连接"更新"，
+// 结果保住永远不会被按键复用的僵尸、逐出真正的热槽，拖垮复用率。
+func sortIdleForEviction(idle []idleAccountConnection) {
+	sort.Slice(idle, func(i, j int) bool {
+		oi, oj := isOneShotPoolConn(idle[i].wc), isOneShotPoolConn(idle[j].wc)
+		if oi != oj {
+			return oi
+		}
+		return idle[i].lastUsed < idle[j].lastUsed
+	})
+}
+
+// hasLiveResponseBinding 是否存在未过期的 response_id 续链绑定指向该连接。
+func (m *Manager) hasLiveResponseBinding(wc *WsConnection) bool {
+	if m == nil || wc == nil {
+		return false
+	}
+	now := time.Now()
+	m.respConnMu.Lock()
+	defer m.respConnMu.Unlock()
+	for _, b := range m.respConnBindings {
+		if b.conn == wc && now.Before(b.expiresAt) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureAccountConnectionCapacity 为即将创建的新连接腾出一个账号级槽位。
@@ -483,7 +536,7 @@ func (m *Manager) ensureAccountConnectionCapacity(accountID int64, limit int, pr
 	if count+pendingCreates < limit {
 		return true
 	}
-	sort.Slice(idle, func(i, j int) bool { return idle[i].lastUsed < idle[j].lastUsed })
+	sortIdleForEviction(idle)
 	for _, candidate := range idle {
 		if count+pendingCreates < limit {
 			break
@@ -526,7 +579,7 @@ func (m *Manager) trimIdleAccountConnections(accountID int64, limit int, protect
 		return
 	}
 
-	sort.Slice(idle, func(i, j int) bool { return idle[i].lastUsed < idle[j].lastUsed })
+	sortIdleForEviction(idle)
 	for _, candidate := range idle {
 		if count <= limit {
 			break
@@ -1017,10 +1070,42 @@ func (m *Manager) probe(wc *WsConnection) bool {
 	if fn != nil {
 		return fn(wc)
 	}
-	if wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
+	if !weakNetworkModeEnabled() && wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
 		return true
 	}
 	return probeConnection(wc)
+}
+
+// wsCompressionSeen 记录本进程已上报过的 permessage-deflate 协商结果
+// (bit0=已见协商成功,bit1=已见未协商)。拨号器一直在 offer 压缩,但协商是否
+// 成功此前没有任何可见信号;结果由上游部署与出站链路(直连/Resin)决定,按
+// 结果去重、每种只报一次,混合链路下也不会逐连接刷日志。
+var wsCompressionSeen atomic.Int32
+
+// logCompressionNegotiation 上报本次握手的 permessage-deflate 协商结果。
+func logCompressionNegotiation(resp *http.Response, accountID int64) {
+	if resp == nil {
+		return
+	}
+	extensions := resp.Header.Get("Sec-Websocket-Extensions")
+	bit := int32(2)
+	if strings.Contains(strings.ToLower(extensions), "permessage-deflate") {
+		bit = 1
+	}
+	for {
+		seen := wsCompressionSeen.Load()
+		if seen&bit != 0 {
+			return
+		}
+		if wsCompressionSeen.CompareAndSwap(seen, seen|bit) {
+			break
+		}
+	}
+	if bit == 1 {
+		log.Printf("[WS] 上游已协商 permessage-deflate,帧压缩生效 (account=%d, extensions=%q)", accountID, extensions)
+	} else {
+		log.Printf("[WS] 上游未协商 permessage-deflate,帧走明文 (account=%d)", accountID)
+	}
 }
 
 // createConnection 创建新 WebSocket 连接
@@ -1041,12 +1126,8 @@ func (m *Manager) createConnection(
 	proxyURL := effectiveProxyURL(account, proxyOverride)
 
 	if !proxy.IsResinEnabled() && proxyURL != "" {
-		proxyURLParsed, err := url.Parse(proxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("parse proxy URL failed: %w", err)
-		}
-		dialer.Proxy = func(req *http.Request) (*url.URL, error) {
-			return proxyURLParsed, nil
+		if err := configureWebsocketDialerProxy(dialer, proxyURL); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1070,6 +1151,8 @@ func (m *Manager) createConnection(
 		// bad handshake 时 resp 常非空：附带上游 HTTP 状态/ body，便于测试连接定位。
 		return nil, formatDialHandshakeError(err, resp)
 	}
+
+	logCompressionNegotiation(resp, account.ID())
 
 	// 创建连接包装
 	wc := NewWsConnection(conn, session, wsURL)

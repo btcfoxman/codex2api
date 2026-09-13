@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/openaiidentity"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
@@ -100,15 +102,19 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		{ID: 5, Status: "active", Enabled: true},  // normal
 		{ID: 6, Status: "error", Enabled: true},   // DB error without runtime override
 		{ID: 7, Status: "cooldown", Enabled: true, CooldownReason: "rate_limited"},
+		{ID: 8, Status: "active", Enabled: true}, // runtime authoritative Responses limit
+		{ID: 9, Status: "cooldown", Enabled: true, CooldownReason: auth.ResponsesRateLimitedCooldownReason},
 	}
 
-	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1"}
+	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7dValid: true}
 	unauthorized := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
 	unauthorized.SetCooldownWithReason(time.Hour, "unauthorized")
-	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3"}
+	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UsagePercent7dValid: true}
 	rateLimited := &auth.Account{DBID: 4, Status: auth.StatusReady, AccessToken: "at-4"}
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
-	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
+	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5", UsagePercent7dValid: true}
+	responsesLimited := &auth.Account{DBID: 8, Status: auth.StatusReady, AccessToken: "at-8"}
+	responsesLimited.SetCooldownWithReason(time.Hour, auth.ResponsesRateLimitedCooldownReason)
 
 	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{
 		activeFromStaleDB,
@@ -116,10 +122,161 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		disabled,
 		rateLimited,
 		normal,
+		responsesLimited,
 	})
 
-	if got.total != 7 || got.normal != 3 || got.rateLimited != 2 || got.abnormal != 2 || got.disabled != 1 {
-		t.Fatalf("counts = %+v, want total=7 normal=3 rateLimited=2 abnormal=2 disabled=1", got)
+	if got.total != 9 || got.normal != 3 || got.rateLimited != 4 || got.abnormal != 2 || got.disabled != 1 {
+		t.Fatalf("counts = %+v, want total=9 normal=3 rateLimited=4 abnormal=2 disabled=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsIncludesClaudeChannel(t *testing.T) {
+	row := &database.AccountRow{ID: 99, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamClaude}}
+	acc := &auth.Account{DBID: 99, UpstreamType: auth.UpstreamClaude, AccessToken: "claude", Status: auth.StatusReady, UsagePercent7dValid: true}
+	_, channels := summarizeDashboardAccounts([]*database.AccountRow{row}, []*auth.Account{acc})
+	got, ok := channels[database.UpstreamChannelClaude]
+	if !ok {
+		t.Fatalf("dashboard channels missing Claude: %#v", channels)
+	}
+	if got.total != 1 || got.normal != 1 {
+		t.Fatalf("Claude dashboard counts = %+v, want total=1 normal=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsTreatsSuccessfulClaudeProbeWithoutQuotaHeadersAsSampled(t *testing.T) {
+	row := &database.AccountRow{ID: 100, Status: "active", Enabled: true, Credentials: map[string]interface{}{
+		"upstream_type":                      auth.UpstreamClaude,
+		auth.ClaudeUsageProbeAtCredentialKey: "2026-08-29T05:00:00Z",
+	}}
+	acc := &auth.Account{DBID: 100, UpstreamType: auth.UpstreamClaude, AccessToken: "claude", Status: auth.StatusReady}
+	got, channels := summarizeDashboardAccounts([]*database.AccountRow{row}, []*auth.Account{acc})
+	if got.normal != 1 || got.rateLimited != 0 || got.abnormal != 0 {
+		t.Fatalf("dashboard counts = %+v, want successful Claude probe counted as normal", got)
+	}
+	if channels[database.UpstreamChannelClaude].normal != 1 {
+		t.Fatalf("Claude channel counts = %+v", channels[database.UpstreamChannelClaude])
+	}
+}
+
+func TestClaudeChannelModelsReturnsAccountCatalog(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	defer store.Stop()
+	store.AddAccount(&auth.Account{DBID: 100, UpstreamType: auth.UpstreamClaude, AccessToken: "claude", Models: []string{"claude-sonnet-4-5", "claude-opus-4-5"}})
+	h := &Handler{store: store}
+	models := h.claudeChannelModels()
+	if len(models) != 2 || !slices.Contains(models, "claude-sonnet-4-5") || !slices.Contains(models, "claude-opus-4-5") {
+		t.Fatalf("Claude model catalog = %v, want account models", models)
+	}
+}
+
+func TestClaudeAvailableChannelModelsFiltersDisabledAndModelCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	defer store.Stop()
+	enabled := &auth.Account{
+		DBID:         101,
+		UpstreamType: auth.UpstreamClaude,
+		AccessToken:  "claude-enabled",
+		Models:       []string{"claude-fable-5", "claude-sonnet-5"},
+	}
+	enabled.SetModelCooldownUntil("claude-fable-5", "credits_required", time.Now().Add(time.Hour))
+	disabled := &auth.Account{
+		DBID:         102,
+		UpstreamType: auth.UpstreamClaude,
+		AccessToken:  "claude-disabled",
+		Models:       []string{"claude-fable-5"},
+	}
+	atomic.StoreInt32(&disabled.DispatchPaused, 1)
+	store.AddAccount(enabled)
+	store.AddAccount(disabled)
+	h := &Handler{store: store}
+	models := h.claudeAvailableChannelModels()
+	if len(models) != 1 || models[0] != "claude-sonnet-5" {
+		t.Fatalf("request-facing Claude models = %v, want only enabled cooldown-free model", models)
+	}
+}
+
+// 积分顶着限流的账号 RuntimeStatus 仍是 rate_limited（用量窗口客观上打满了），
+// 但它照常参与调度，仪表盘该把它算进「可用」而不是「限流」。
+func TestSummarizeDashboardAccountsCountsCreditBackedAsNormal(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true}, // 积分顶替限流
+		{ID: 2, Status: "active", Enabled: true}, // 真限流
+	}
+
+	usingCredits := &auth.Account{
+		DBID:                  1,
+		AccessToken:           "at-1",
+		Status:                auth.StatusReady,
+		PlanType:              "plus",
+		UsagePercent5h:        100,
+		UsagePercent5hValid:   true,
+		Reset5hAt:             time.Now().Add(2 * time.Hour),
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+		CreditsValid:          true,
+		CreditsHasCredits:     true,
+		CreditsBalance:        "1000.0000000000",
+	}
+	if !usingCredits.UsingCredits() {
+		t.Fatalf("fixture is not using credits; RuntimeStatus=%q", usingCredits.RuntimeStatus())
+	}
+	if got := usingCredits.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus = %q, want rate_limited", got)
+	}
+
+	rateLimited := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
+
+	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{usingCredits, rateLimited})
+	if got.total != 2 || got.normal != 1 || got.rateLimited != 1 {
+		t.Fatalf("counts = %+v, want total=2 normal=1 rateLimited=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsExcludesUnsampledFromAvailable(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true},
+		{ID: 2, Status: "active", Enabled: true},
+		{ID: 3, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamGrok}},
+		{ID: 4, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamOpenAIResponses}},
+	}
+	sampled := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7d: 12, UsagePercent7dValid: true}
+	unsampled := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	grok := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UpstreamType: auth.UpstreamGrok}
+	responses := &auth.Account{DBID: 4, Status: auth.StatusReady, APIKey: "sk-test", BaseURL: "https://relay.example", UpstreamType: auth.UpstreamOpenAIResponses}
+
+	got, channels := summarizeDashboardAccounts(rows, []*auth.Account{sampled, unsampled, grok, responses})
+	if got.total != 4 || got.normal != 3 || got.rateLimited != 0 || got.abnormal != 0 {
+		t.Fatalf("counts = %+v, want total=4 normal=3 rateLimited=0 abnormal=0", got)
+	}
+	if channels[database.UpstreamChannelCodex].normal != 2 || channels[database.UpstreamChannelGrok].normal != 1 {
+		t.Fatalf("channel counts = %+v", channels)
+	}
+}
+
+func TestSummarizeDashboardAccountsUsesAntigravityControlPlaneStatus(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true, Credentials: map[string]interface{}{
+			"upstream_type": auth.UpstreamAntigravity,
+			"refresh_token": "refresh-1",
+		}},
+		{ID: 2, Status: "active", Enabled: true, Credentials: map[string]interface{}{
+			"upstream_type":          auth.UpstreamAntigravity,
+			"refresh_token":          "refresh-2",
+			"antigravity_sync_error": "quota sync failed",
+		}},
+	}
+	runtimeAccounts := []*auth.Account{
+		{DBID: 1, Status: auth.StatusReady, AccessToken: "access-1", UpstreamType: auth.UpstreamAntigravity},
+		{DBID: 2, Status: auth.StatusReady, AccessToken: "access-2", UpstreamType: auth.UpstreamAntigravity},
+	}
+	got, channels := summarizeDashboardAccounts(rows, runtimeAccounts)
+	if got.total != 2 || got.normal != 1 || got.abnormal != 1 {
+		t.Fatalf("counts = %+v, want total=2 normal=1 abnormal=1", got)
+	}
+	channel := channels[database.UpstreamChannelAntigravity]
+	if channel.total != 2 || channel.normal != 1 || channel.abnormal != 1 {
+		t.Fatalf("Antigravity channel counts = %+v", channel)
 	}
 }
 
@@ -422,7 +579,7 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 	handler := &Handler{
 		refreshAccount: func(_ context.Context, id int64) error {
 			if id == 8 {
-				return errors.New("账号 8 不存在")
+				return errors.New("token endpoint returned status 401")
 			}
 			return nil
 		},
@@ -446,6 +603,10 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 		`"type":"progress"`,
 		`"type":"complete"`,
 		`"action":"batch_refresh"`,
+		`"status":"success"`,
+		`"status":"failed"`,
+		`"http_status":200`,
+		`"http_status":401`,
 		`"success":1`,
 		`"failed":1`,
 	} {
@@ -453,6 +614,98 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 			t.Fatalf("stream body missing %s:\n%s", want, body)
 		}
 	}
+}
+
+func TestCleanErrorStreamsProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", Status: auth.StatusError, Email: "a@example.com"})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", Status: auth.StatusError, Email: "b@example.com"})
+	store.AddAccount(&auth.Account{DBID: 3, AccessToken: "at-3", Status: auth.StatusReady, Email: "ok@example.com"})
+
+	handler := &Handler{store: store}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/clean-error?stream=true", nil)
+
+	handler.CleanError(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("content-type = %q, want event-stream", got)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"start"`,
+		`"type":"progress"`,
+		`"type":"complete"`,
+		`"action":"clean"`,
+		`"success":2`,
+		`"deleted":2`,
+		`"account_email":"a@example.com"`,
+		`"account_email":"b@example.com"`,
+		`"message":"已清理 2 个账号"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream body missing %s:\n%s", want, body)
+		}
+	}
+	if strings.Count(body, `"message":"账号已清理"`) > 0 {
+		t.Fatalf("progress events should not claim the clean is finished:\n%s", body)
+	}
+	remaining := accountIDsFromStore(store)
+	if remaining[1] || remaining[2] {
+		t.Fatal("expected error accounts to be removed")
+	}
+	if !remaining[3] {
+		t.Fatal("expected healthy account to remain")
+	}
+}
+
+func TestCleanErrorJSONKeepsHealthyAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", Status: auth.StatusError})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", Status: auth.StatusReady})
+
+	handler := &Handler{store: store}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/clean-error", nil)
+
+	handler.CleanError(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["cleaned"]; got != float64(1) {
+		t.Fatalf("cleaned = %v, want 1", got)
+	}
+	remaining := accountIDsFromStore(store)
+	if remaining[1] {
+		t.Fatal("expected error account to be removed")
+	}
+	if !remaining[2] {
+		t.Fatal("expected healthy account to remain")
+	}
+}
+
+func accountIDsFromStore(store *auth.Store) map[int64]bool {
+	found := make(map[int64]bool)
+	for _, acc := range store.Accounts() {
+		if acc != nil {
+			found[acc.DBID] = true
+		}
+	}
+	return found
 }
 
 func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
@@ -497,6 +750,45 @@ func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
 	}
 	if _, ok := account.GetUsagePercent7d(); ok {
 		t.Fatal("expected reset to clear cached usage")
+	}
+}
+
+func TestResetAccountStatusKeepsUsageWhenOverloadPaused(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{DBID: 42, AccessToken: "at", PlanType: "free"}
+	account.SetUsageSnapshot(12, time.Now())
+	account.SetCooldownUntil(time.Now().Add(time.Hour), "overload_paused")
+	store.AddAccount(account)
+
+	synced := make(chan struct{}, 1)
+	handler := &Handler{
+		store: store,
+		syncAccountPlanOnReset: func(_ context.Context, _ *auth.Account) error {
+			synced <- struct{}{}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "42"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/42/reset-status", nil)
+
+	handler.ResetAccountStatus(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	pct, ok := account.GetUsagePercent7d()
+	if !ok || pct != 12 {
+		t.Fatalf("usage_percent_7d = (%v, %v), want (12, true)", pct, ok)
+	}
+	select {
+	case <-synced:
+		t.Fatal("overload resume should not re-probe plan or clear usage")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -826,6 +1118,277 @@ func TestGetUsageLogsRejectsInvalidAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestGetUsageLogsRejectsInvalidCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "compact",
+			query:     "compact=maybe",
+			wantError: "compact 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "compaction history",
+			query:     "has_compaction_history=1",
+			wantError: "has_compaction_history 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsRejectsInvalidDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "status",
+			query:     "status=6xx",
+			wantError: "status/status_code 参数无效",
+		},
+		{
+			name:      "retry",
+			query:     "retry=maybe",
+			wantError: "retry 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "websocket",
+			query:     "via_websocket=1",
+			wantError: "via_websocket 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "error only",
+			query:     "error_only=yes",
+			wantError: "error_only 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsAppliesDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "matching",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "server",
+			ErrorMessage:      "boom from upstream",
+			IsRetryAttempt:    true,
+			AttemptIndex:      1,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "wrong-kind",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "transport",
+			ErrorMessage:      "boom from transport",
+			IsRetryAttempt:    true,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:    accountID,
+			Endpoint:     "/v1/responses",
+			Model:        "canceled",
+			StatusCode:   499,
+			ErrorMessage: "client canceled",
+		},
+		{
+			AccountID:  accountID,
+			Endpoint:   "/v1/responses",
+			Model:      "success",
+			StatusCode: http.StatusOK,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=5xx&error_kind=server&retry=true&via_websocket=true&q=boom",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var page database.UsageLogPage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].Model != "matching" {
+		t.Fatalf("filtered page = total %d logs %+v, want matching only", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=499",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("499 status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode 499 response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 499 {
+		t.Fatalf("499 page = total %d logs %+v", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs/error-summary?start="+start+"&end="+end,
+		nil,
+	)
+	handler.GetUsageLogsErrorSummary(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var summary database.UsageErrorSummary
+	if err := json.Unmarshal(recorder.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if summary.TotalErrors != 3 || summary.Status5xx != 2 || summary.Canceled != 1 || summary.RetryAttempts != 2 {
+		t.Fatalf("summary = %+v, want total=3 5xx=2 canceled=1 retries=2", summary)
+	}
+}
+
+func TestGetUsageLogsAppliesCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "trigger-only", StatusCode: http.StatusOK, Compact: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "history-only", StatusCode: http.StatusOK, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "both", StatusCode: http.StatusOK, Compact: true, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "neither", StatusCode: http.StatusOK},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	tests := []struct {
+		name       string
+		query      string
+		wantModels map[string]bool
+	}{
+		{
+			name:       "trigger",
+			query:      "compact=true",
+			wantModels: map[string]bool{"trigger-only": true, "both": true},
+		},
+		{
+			name:       "history",
+			query:      "has_compaction_history=true",
+			wantModels: map[string]bool{"history-only": true, "both": true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ginCtx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			var page database.UsageLogPage
+			if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if page.Total != int64(len(test.wantModels)) || len(page.Logs) != len(test.wantModels) {
+				t.Fatalf("total/logs = %d/%d, want %d; body=%s", page.Total, len(page.Logs), len(test.wantModels), recorder.Body.String())
+			}
+			for _, logRow := range page.Logs {
+				if !test.wantModels[logRow.Model] {
+					t.Fatalf("unexpected model %q for %s filter", logRow.Model, test.name)
+				}
+			}
+		})
+	}
+}
+
 func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -960,6 +1523,41 @@ func TestRuntimeStatusRouteReturnsDependencySnapshot(t *testing.T) {
 	}
 }
 
+func TestSubscriptionUpgradeRoutesAreNotRegistered(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	router := gin.New()
+	handler.RegisterRoutes(router)
+
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/admin/accounts/1/subscription"},
+		{http.MethodPost, "/api/admin/accounts/1/subscription/upgrade-quotes"},
+		{http.MethodPost, "/api/admin/accounts/1/subscription/upgrades"},
+		{http.MethodGet, "/api/admin/subscription-upgrades/operation-id"},
+		{http.MethodPost, "/api/admin/subscription-upgrades/operation-id/verify"},
+	}
+
+	for _, route := range routes {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(route.method, route.path, nil)
+			request.Header.Set("X-Admin-Key", "admin-secret")
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestUpdateSettingsPersistsAutoResetCreditsAcrossPartialUpdates(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1053,8 +1651,69 @@ func TestUpdateSettingsPersistsAutoResetCreditsAcrossPartialUpdates(t *testing.T
 	}
 }
 
+func TestUpdateSettingsPersistsAutoActivate5hWindow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	update := func(body string) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+	}
+
+	if proxy.CurrentRuntimeSettings().AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = true before explicit enable")
+	}
+	update(`{"auto_activate_5h_window_enabled":true}`)
+	select {
+	case <-handler.autoActivate5hWake:
+	default:
+		t.Fatal("enable change did not queue an immediate scan")
+	}
+	if !proxy.CurrentRuntimeSettings().AutoActivate5hWindowEnabled {
+		t.Fatal("runtime AutoActivate5hWindowEnabled = false, want true")
+	}
+	update(`{"site_name":"Codex2API Test"}`)
+	select {
+	case <-handler.autoActivate5hWake:
+		t.Fatal("unrelated partial update queued another 5h activation scan")
+	default:
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || !persisted.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled was not preserved across partial update")
+	}
+}
+
 func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
 
 	db := newTestAdminDB(t)
 	tc := cache.NewMemory(4)
@@ -1072,7 +1731,7 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	ctx.Request = httptest.NewRequest(
 		http.MethodPut,
 		"/api/admin/settings",
-		strings.NewReader(`{"retry_interval_ms":2500,"transport_retry_policy":"sticky"}`),
+		strings.NewReader(`{"retry_interval_ms":2500,"transport_retry_policy":"sticky","continuous_retry_enabled":true,"continuous_retry_catch_all":true,"continuous_retry_categories":["http_4xx","server","unknown"],"continuous_retry_status_codes":[404,403,404,99,600],"continuous_retry_error_codes":["Forbidden","forbidden","bad code!"],"continuous_retry_max_duration_seconds":75}`),
 	)
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
@@ -1091,6 +1750,217 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	if response.TransportRetryPolicy != "sticky" {
 		t.Fatalf("transport_retry_policy = %q, want sticky", response.TransportRetryPolicy)
 	}
+	if !response.ContinuousRetryEnabled {
+		t.Fatal("continuous_retry_enabled = false, want true")
+	}
+	if !response.ContinuousRetryCatchAll {
+		t.Fatal("continuous_retry_catch_all = false, want true")
+	}
+	if got := strings.Join(response.ContinuousRetryCategories, ","); got != "http_4xx,http_5xx" {
+		t.Fatalf("continuous_retry_categories = %q, want http_4xx,http_5xx", got)
+	}
+	if got := fmt.Sprint(response.ContinuousRetryStatusCodes); got != "[403 404]" {
+		t.Fatalf("continuous_retry_status_codes = %s, want [403 404]", got)
+	}
+	if got := strings.Join(response.ContinuousRetryErrorCodes, ","); got != "forbidden" {
+		t.Fatalf("continuous_retry_error_codes = %q, want forbidden", got)
+	}
+	if response.ContinuousRetryMaxDurationSeconds != 75 {
+		t.Fatalf("continuous_retry_max_duration_seconds = %d, want 75", response.ContinuousRetryMaxDurationSeconds)
+	}
+
+	for label, policy := range map[string]database.ContinuousRetryPolicy{
+		"store":   store.GetContinuousRetryPolicy(),
+		"runtime": proxy.CurrentRuntimeSettings().ContinuousRetryPolicy,
+	} {
+		if !policy.Enabled || !policy.CatchAll || strings.Join(policy.Categories, ",") != "http_4xx,http_5xx" ||
+			fmt.Sprint(policy.StatusCodes) != "[403 404]" || strings.Join(policy.ErrorCodes, ",") != "forbidden" || policy.MaxDurationSeconds != 75 {
+			t.Fatalf("%s continuous retry policy = %#v", label, policy)
+		}
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if policy := database.ParseContinuousRetryPolicy(persisted.ContinuousRetryPolicy); !policy.Enabled || !policy.CatchAll ||
+		strings.Join(policy.Categories, ",") != "http_4xx,http_5xx" || fmt.Sprint(policy.StatusCodes) != "[403 404]" ||
+		strings.Join(policy.ErrorCodes, ",") != "forbidden" || policy.MaxDurationSeconds != 75 {
+		t.Fatalf("persisted continuous retry policy = %#v", policy)
+	}
+}
+
+func TestUpdateSettingsConcurrentContinuousRetryPartialUpdatesDoNotLoseFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	settings := defaultBootstrapSettings()
+	initialPolicy := database.ContinuousRetryPolicy{
+		Enabled:     true,
+		CatchAll:    true,
+		Categories:  []string{database.ContinuousRetryCategoryTransport},
+		StatusCodes: []int{},
+		ErrorCodes:  []string{},
+	}
+	settings.ContinuousRetryPolicy = database.EncodeContinuousRetryPolicy(initialPolicy)
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	if _, err := db.UpdateContinuousRetryPolicy(context.Background(), database.ContinuousRetryPolicyUpdate{
+		Enabled:     &initialPolicy.Enabled,
+		CatchAll:    &initialPolicy.CatchAll,
+		Categories:  &initialPolicy.Categories,
+		StatusCodes: &initialPolicy.StatusCodes,
+		ErrorCodes:  &initialPolicy.ErrorCodes,
+	}); err != nil {
+		t.Fatalf("seed continuous retry policy: %v", err)
+	}
+
+	cache1 := cache.NewMemory(4)
+	cache2 := cache.NewMemory(4)
+	t.Cleanup(func() { _ = cache1.Close() })
+	t.Cleanup(func() { _ = cache2.Close() })
+	store1 := auth.NewStore(db, cache1, settings)
+	store2 := auth.NewStore(db, cache2, settings)
+	t.Cleanup(store1.Stop)
+	t.Cleanup(store2.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handlers := []*Handler{
+		NewHandler(store1, db, cache1, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret"),
+		NewHandler(store2, db, cache2, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret"),
+	}
+	bodies := []string{
+		`{"continuous_retry_catch_all":false}`,
+		`{"continuous_retry_status_codes":[403]}`,
+	}
+
+	type updateResult struct {
+		code int
+		body string
+	}
+	start := make(chan struct{})
+	results := make(chan updateResult, len(handlers))
+	for index := range handlers {
+		handler := handlers[index]
+		body := bodies[index]
+		go func() {
+			<-start
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			handler.UpdateSettings(ctx)
+			results <- updateResult{code: recorder.Code, body: recorder.Body.String()}
+		}()
+	}
+	close(start)
+	for range handlers {
+		result := <-results
+		if result.code != http.StatusOK {
+			t.Fatalf("concurrent update status=%d body=%s", result.code, result.body)
+		}
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	policy := database.ParseContinuousRetryPolicy(persisted.ContinuousRetryPolicy)
+	if !policy.Enabled || policy.CatchAll || len(policy.StatusCodes) != 1 || policy.StatusCodes[0] != 403 || len(policy.Categories) != 1 || policy.Categories[0] != database.ContinuousRetryCategoryTransport {
+		t.Fatalf("concurrent admin updates lost a policy field: %#v", policy)
+	}
+}
+
+func TestUpdateSettingsConnectionPoolCeilingIs5000(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"pg_max_conns":6000,"redis_pool_size":6000}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.PgMaxConns != 5000 {
+		t.Fatalf("pg_max_conns = %d, want 5000", response.PgMaxConns)
+	}
+	if response.RedisPoolSize != 5000 {
+		t.Fatalf("redis_pool_size = %d, want 5000", response.RedisPoolSize)
+	}
+}
+
+func TestUpdateSettingsPersistsWeakNetworkMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"codex_ws_weak_network_mode":true}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.CodexWSWeakNetworkMode {
+		t.Fatal("response codex_ws_weak_network_mode = false, want true")
+	}
+	if !proxy.CurrentRuntimeSettings().CodexWSWeakNetworkMode {
+		t.Fatal("runtime codex_ws_weak_network_mode = false, want true")
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || !persisted.CodexWSWeakNetworkMode {
+		t.Fatal("persisted codex_ws_weak_network_mode = false, want true")
+	}
 }
 
 func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.T) {
@@ -1107,10 +1977,6 @@ func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.
 	}`
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("seed settings: %v", err)
-	}
-	newAPISecret := strings.Repeat("s", 32)
-	if err := db.SetPromptFilterNewAPISecret(context.Background(), newAPISecret); err != nil {
-		t.Fatalf("seed NewAPI secret: %v", err)
 	}
 	store := auth.NewStore(db, tc, settings)
 	t.Cleanup(store.Stop)
@@ -1167,13 +2033,6 @@ func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.
 	if got := store.GetPromptFilterConfig().Advanced.Guard.Mode; got != "enforce" {
 		t.Fatalf("runtime guard.mode = %q, want enforce", got)
 	}
-	if got := store.GetPromptFilterConfig().Advanced.NewAPI.Secret; got != newAPISecret {
-		t.Fatalf("runtime NewAPI secret changed during advanced update")
-	}
-	if strings.Contains(updateResponse.PromptFilterAdvancedConfig, newAPISecret) {
-		t.Fatal("NewAPI secret leaked into prompt_filter_advanced_config")
-	}
-
 	// An unrelated partial update must not reserialize the typed runtime config
 	// and erase fields unknown to this binary.
 	unrelated := httptest.NewRecorder()
@@ -1322,6 +2181,41 @@ func TestUpdateSettingsDoesNotEnableAutoResetCreditsWhenPersistenceFails(t *test
 	}
 	if current := proxy.CurrentRuntimeSettings(); current.AutoResetCreditsEnabled {
 		t.Fatal("AutoResetCreditsEnabled became true after persistence failure")
+	}
+}
+
+func TestUpdateSettingsDoesNotPublishContinuousRetryWhenPersistenceFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"continuous_retry_enabled":true,"continuous_retry_status_codes":[403]}`))
+	ctx.Request = request.WithContext(requestCtx)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want %d body=%s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if policy := store.GetContinuousRetryPolicy(); policy.Enabled {
+		t.Fatalf("store continuous retry policy became enabled after persistence failure: %#v", policy)
+	}
+	if policy := proxy.CurrentRuntimeSettings().ContinuousRetryPolicy; policy.Enabled {
+		t.Fatalf("runtime continuous retry policy became enabled after persistence failure: %#v", policy)
 	}
 }
 
@@ -1509,7 +2403,7 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 		{
 			name:    "base concurrency out of range",
 			body:    `{"base_concurrency_override":0}`,
-			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
+			message: "base_concurrency_override 超出范围，必须 >= 1",
 		},
 		{
 			name:    "5h auto pause threshold out of range",
@@ -1575,6 +2469,143 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	}
 	if !rows[0].SkipWarmTier {
 		t.Fatal("skip_warm_tier = false, want true")
+	}
+}
+
+func TestUpdateAccountSchedulerPersistsWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertAccountWithCredentials(context.Background(), "workspace-route", map[string]interface{}{
+		"refresh_token": "rt-workspace-route",
+		"email":         "route@example.com",
+		"workspace_id":  "personal-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID),
+		strings.NewReader(`{"custom_headers":{"chatgpt-account-id":"team-workspace"}}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers")); got != "team-workspace" {
+		t.Fatalf("workspace override = %q, want team-workspace", got)
+	}
+}
+
+func TestUpdateAccountSchedulerRejectsDuplicateWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "personal", map[string]interface{}{
+		"refresh_token": "rt-shared-route",
+		"email":         "route@example.com",
+		"workspace_id":  "personal-workspace",
+	}, ""); err != nil {
+		t.Fatalf("Insert personal: %v", err)
+	}
+	teamID, err := db.InsertAccountWithCredentials(context.Background(), "team", map[string]interface{}{
+		"refresh_token": "rt-shared-route",
+		"email":         "route@example.com",
+		"workspace_id":  "personal-workspace",
+		"custom_headers": map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert team: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", teamID)}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/accounts/%d/scheduler", teamID),
+		strings.NewReader(`{"custom_headers":{}}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers")); got != "team-workspace" {
+		t.Fatalf("workspace override changed to %q after rejected update", got)
+	}
+}
+
+func TestUpdateAccountSchedulerAllowsUnchangedWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	for i := 0; i < 2; i++ {
+		if _, err := db.InsertAccountWithCredentials(context.Background(), fmt.Sprintf("team-%d", i+1), map[string]interface{}{
+			"refresh_token": "rt-shared-route",
+			"email":         "route@example.com",
+			"workspace_id":  "personal-workspace",
+			"custom_headers": map[string]string{
+				"Chatgpt-Account-Id": "team-workspace",
+			},
+		}, ""); err != nil {
+			t.Fatalf("Insert team %d: %v", i+1, err)
+		}
+	}
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	teamID := rows[1].ID
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", teamID)}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/accounts/%d/scheduler", teamID),
+		strings.NewReader(`{"custom_headers":{"chatgpt-account-id":"team-workspace","x-route-note":"kept"}}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	headers := row.GetCredentialStringMap("custom_headers")
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(headers); got != "team-workspace" {
+		t.Fatalf("workspace override = %q, want team-workspace", got)
+	}
+	if got := headers["X-Route-Note"]; got != "kept" {
+		t.Fatalf("X-Route-Note = %q, want kept", got)
 	}
 }
 
@@ -2250,6 +3281,69 @@ func TestExportAccountsIncludesATOnly(t *testing.T) {
 	}
 }
 
+// TestExportAccountsChannelScoped Codex 账号页导出必须能按渠道过滤:不带 channel
+// 时 Grok 账号会混进 codex 命名的导出文件(issue: 选 3 个 codex 导出得到 5 个)。
+func TestExportAccountsChannelScoped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+
+	codexID, err := db.InsertAccount(context.Background(), "codex-account", "rt_codex", "")
+	if err != nil {
+		t.Fatalf("insert codex account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), codexID, map[string]interface{}{
+		"email":        "codex@example.com",
+		"access_token": "at_codex",
+	}); err != nil {
+		t.Fatalf("update codex credentials: %v", err)
+	}
+
+	grokID, err := db.InsertAccount(context.Background(), "grok-account", "", "")
+	if err != nil {
+		t.Fatalf("insert grok account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), grokID, map[string]interface{}{
+		"email":         "grok@example.com",
+		"upstream_type": "grok",
+		"api_key":       "xai-test-key",
+	}); err != nil {
+		t.Fatalf("update grok credentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	export := func(query string) []map[string]any {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/export?"+query, nil)
+		handler.ExportAccounts(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d for %q: %s", recorder.Code, query, recorder.Body.String())
+		}
+		var entries []map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &entries); err != nil {
+			t.Fatalf("decode response for %q: %v", query, err)
+		}
+		return entries
+	}
+
+	codexOnly := export("filter=all&channel=codex")
+	if len(codexOnly) != 1 || codexOnly[0]["email"] != "codex@example.com" {
+		t.Fatalf("channel=codex entries = %v, want only the codex account", codexOnly)
+	}
+
+	grokOnly := export("filter=all&channel=grok")
+	if len(grokOnly) != 1 || grokOnly[0]["email"] != "grok@example.com" {
+		t.Fatalf("channel=grok entries = %v, want only the grok account", grokOnly)
+	}
+
+	// 缺省仍导出全部渠道:远程迁移依赖全量语义。
+	if all := export("filter=all"); len(all) != 2 {
+		t.Fatalf("default export entries = %d, want 2", len(all))
+	}
+}
+
 func TestExportAccountsSkipsAccountsWithoutCredentials(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2456,6 +3550,52 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 	}
 }
 
+func TestRestoreAccountRejectsDuplicateCredentialWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	handler := &Handler{db: db}
+
+	activeID, err := db.InsertAccountWithCredentials(context.Background(), "active", map[string]interface{}{
+		"access_token": "opaque-shared-token",
+		"custom_headers": map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert active: %v", err)
+	}
+	deletedID, err := db.InsertAccountWithCredentials(context.Background(), "deleted", map[string]interface{}{
+		"access_token": "opaque-shared-token",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert deleted: %v", err)
+	}
+	if err := db.SoftDeleteAccount(context.Background(), deletedID); err != nil {
+		t.Fatalf("SoftDeleteAccount: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", deletedID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/admin/accounts/%d/restore", deletedID), nil)
+
+	handler.RestoreAccount(ctx)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), fmt.Sprintf("%d", activeID)) {
+		t.Fatalf("response = %s, want active duplicate id %d", recorder.Body.String(), activeID)
+	}
+	if _, err := db.GetAccountByID(context.Background(), deletedID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted account should remain outside active pool, err=%v", err)
+	}
+}
+
 func TestRestoreAccountReportsRuntimeLoadFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2538,5 +3678,116 @@ func assertErrorMessage(t *testing.T, recorder *httptest.ResponseRecorder, want 
 	}
 	if got := payload["error"]; got != want {
 		t.Fatalf("error = %q, want %q", got, want)
+	}
+}
+
+// TestUpdateSettingsResponseIncludesPublicPortalFlags 回归 #663：PUT /api/admin/settings
+// 的响应体必须回填三个公开门户开关。此前响应遗漏这些字段，前端「设置」页保存后会用
+// 响应整体覆盖本地表单把它们静默置为 false，下一次「保存设置」再整体提交就把已经开启的
+// /key-usage 等公开页关掉——表现为「开启一天后自动关闭」。
+func TestUpdateSettingsResponseIncludesPublicPortalFlags(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+
+	settings := defaultBootstrapSettings()
+	settings.PublicKeyUsagePageEnabled = true
+	settings.PublicImageStudioPageEnabled = true
+	settings.PublicAccountPortalPageEnabled = false
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"site_name":"Portal Response Test"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.PublicKeyUsagePageEnabled {
+		t.Fatal("PUT response PublicKeyUsagePageEnabled = false, want true")
+	}
+	if !response.PublicImageStudioPageEnabled {
+		t.Fatal("PUT response PublicImageStudioPageEnabled = false, want true")
+	}
+	if response.PublicAccountPortalPageEnabled {
+		t.Fatal("PUT response PublicAccountPortalPageEnabled = true, want false")
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || !persisted.PublicKeyUsagePageEnabled {
+		t.Fatal("stored PublicKeyUsagePageEnabled = false, want true")
+	}
+}
+
+// TestUpdateSettingsResponseCoversReadSettingsFields 保证 PUT 与 GET 的响应字段集一致。
+// 前端「设置」页用 PUT 响应整体覆盖本地表单，任何只在 GET 里回填的字段都会在保存后被
+// 静默清空，并在下一次保存时写回（#663 的公开门户开关就是这样被关掉的）。
+func TestUpdateSettingsResponseCoversReadSettingsFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	readRecorder := httptest.NewRecorder()
+	readCtx, _ := gin.CreateTestContext(readRecorder)
+	readCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil)
+	handler.GetSettings(readCtx)
+	if readRecorder.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d body=%s", readRecorder.Code, http.StatusOK, readRecorder.Body.String())
+	}
+
+	writeRecorder := httptest.NewRecorder()
+	writeCtx, _ := gin.CreateTestContext(writeRecorder)
+	writeCtx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"site_name":"Field Coverage Test"}`))
+	writeCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(writeCtx)
+	if writeRecorder.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want %d body=%s", writeRecorder.Code, http.StatusOK, writeRecorder.Body.String())
+	}
+
+	var readBody, writeBody map[string]json.RawMessage
+	if err := json.Unmarshal(readRecorder.Body.Bytes(), &readBody); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	if err := json.Unmarshal(writeRecorder.Body.Bytes(), &writeBody); err != nil {
+		t.Fatalf("decode PUT response: %v", err)
+	}
+	for key := range readBody {
+		if _, ok := writeBody[key]; !ok {
+			t.Fatalf("PUT /api/admin/settings response is missing read field %q; the Settings page would overwrite it with a zero value", key)
+		}
 	}
 }

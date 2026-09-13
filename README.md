@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
 </p>
 
-**Turn a Codex account pool into an observable, schedulable, operations-ready OpenAI / Anthropic compatible gateway.** Codex2API is not a thin forwarding proxy. It is a long-running Codex access hub: it exposes `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, Images, and Models endpoints while managing Refresh Token / Access Token accounts, health scoring, dynamic concurrency, rate-limit recovery, usage tracking, and admin operations behind the scenes.
+**Turn a Codex account pool into an observable, schedulable, operations-ready OpenAI / Anthropic compatible gateway.** Codex2API is not a thin forwarding proxy. It is a long-running Codex access hub: it exposes `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, Images, Videos (Grok Imagine), and Models endpoints while managing Refresh Token / Access Token accounts, health scoring, dynamic concurrency, rate-limit recovery, usage tracking, and admin operations behind the scenes.
 
 Run it as a full **PostgreSQL + Redis** production stack or as a single-container **SQLite + in-memory cache** deployment. Point Codex CLI, Claude Code, the OpenAI SDK, or any compatible client at one Base URL, then manage accounts, proxies, API keys, prompt filtering, image workflows, and runtime settings from the built-in dashboard.
 
@@ -27,6 +27,7 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 <tr><td><b>Visual admin console</b></td><td>The embedded React / Vite dashboard covers account import and testing, API keys, proxy pools, image studio (text-to-image + image-to-image), prompt filtering, usage analytics, operations, scheduler board, and system settings.</td></tr>
 <tr><td><b>Two deployment shapes</b></td><td>Use PostgreSQL + Redis for production or SQLite + Memory for lightweight single-node deployments; Docker images, source builds, local development, and the interactive deploy script are ready to use. SQLite mode binds to <code>127.0.0.1</code> by default for security.</td></tr>
 <tr><td><b>Billing and observability</b></td><td>Per-account 5h/7d windowed USD cost tracking, credit quota support, API key usage tracking, OAuth PKCE token acquisition, prompt filtering, and a usage dashboard with request logs and trend charts.</td></tr>
+<tr><td><b>Quality check</b></td><td>Compare selected accounts, models, and reasoning effort with an editable pelican-on-a-bicycle HTML/SVG animation challenge. Run up to three background tests across accounts, keep persistent test history, and review isolated animation previews, source, timing/token metrics, and HTML downloads.</td></tr>
 </table>
 
 ---
@@ -69,39 +70,6 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 ---
 
-## Sponsors
-
-> Want to appear here? Open an issue on GitHub.
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://www.fastaitoken.com/register"><img src="assets/fastaitoken-logo.jpg" width="90" alt="FastAIToken"></a></td>
-<td valign="middle"><b><a href="https://www.fastaitoken.com/register">FastAIToken</a></b> is a developer-first AI API gateway providing unified access to leading models including OpenAI, Claude, and Gemini. Fully OpenAI-API compatible and works seamlessly with Claude Code, Codex, Gemini CLI, Cherry Studio, Cline, and Continue. With a 1:1 top-up ratio (¥1 = $1 API credit) and routes ranging from 0.02× OpenAI (limited time) to 1.2× Claude Max, plus a public status page and 24/7 human support. Enterprise-ready with invoice support and 99% SLA dedicated account pools.</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
-<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> provides cost-effective AI model API access with support for mainstream models including OpenAI, Claude, and Gemini. Top-up ratio of ¥0.2 = $1 credit, bringing per-call costs down to under 10% of official pricing. Plans start at ¥25/28 days; the Premium plan (¥129/28 days) includes about $4,752 in model credit (plans cover OpenAI models only), with high-concurrency support and 95%+ SLA stability.</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
-<td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> is a high-availability AI model API relay platform for individual developers and enterprise teams. Supports Codex/Claude Code at ~1/10 official pricing. Register using the link and promo code <code>CODEX2API</code> to get $3 test credit. </td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://ai.centos.hk"><b>星辰·AI</b></a></td>
-<td valign="middle"><b><a href="https://ai.centos.hk">星辰·AI</a></b> provides stable and high-speed relay services for Claude Code / Codex / Gemini, suitable for both individual developers and teams.</td>
-</tr>
-</table>
-
----
 
 ## Contents
 
@@ -193,12 +161,18 @@ Notes:
 
 ---
 
+## Antigravity channel (experimental API Key path)
+
+Antigravity accounts are managed as a dedicated Google channel with browser/imported OAuth credentials and an optional Google API Key credential shape. Admin tooling includes secret-bearing JSON/ZIP credential export plus sanitized state, explicit control-plane sync, and bounded capability probing. OAuth requests use the Cloud Code `v1internal` adapter. API Key requests target the Generative Language `v1beta/interactions` endpoint, but ordinary API-key dispatch is fail-closed by default and requires `ANTIGRAVITY_ENABLE_EXPERIMENTAL_INTERACTIONS=true`. The opt-in real-upstream integration test has not succeeded in this environment, so this path remains experimental rather than production-certified. See [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md) for endpoints, test instructions, models, channel restrictions, plaintext credential-storage risk, and the certification checklist.
+
 ## Documentation
 
 | Document | Description | Path |
 | --- | --- | --- |
 | [Chinese README](README.zh-CN.md) | Main Chinese project overview | `README.zh-CN.md` |
+| [Usage Guide](docs/USAGE.md) | Client setup, SDK examples, media workflows, and troubleshooting | `docs/USAGE.md` |
 | [API Documentation](docs/API.md) | API endpoints, request and response examples, error codes | `docs/API.md` |
+| [Antigravity Integration](docs/ANTIGRAVITY.md) | Google OAuth and experimental API Key channel, models, risks, and protocol status | `docs/ANTIGRAVITY.md` |
 | [Deployment Guide](docs/DEPLOYMENT.md) | Deployment modes, upgrade guide, backup and restore | `docs/DEPLOYMENT.md` |
 | [Configuration Guide](docs/CONFIGURATION.md) | Environment variables, system settings, configuration priority | `docs/CONFIGURATION.md` |
 | [Architecture](docs/ARCHITECTURE.md) | System architecture, scheduling algorithm, storage design | `docs/ARCHITECTURE.md` |
@@ -291,6 +265,22 @@ Examples include `MaxConcurrency`, `GlobalRPM`, `TestModel`, `TestContent`, `Tes
 
 Default settings are written automatically on first startup.
 
+#### Response Context Cache
+
+Locally reconstructed HTTP Responses continuations that use `previous_response_id` are protected by a bounded, per-process L1 cache. Its defaults are 64 MiB of logical retained JSON payload, 8 MiB per admitted entry, 2,000 entries, a 10-minute absolute TTL, and at most 200 raw items per entry.
+
+The Settings page exposes three persisted integer-MiB budgets:
+
+| Budget | Default | Allowed Range |
+| --- | --- | --- |
+| Local L1 total | 64 MiB | 8-4096 MiB |
+| Local L1 entry admission | 8 MiB | 1-256 MiB and no greater than the total |
+| Backend reconstruction | 64 MiB | 8-512 MiB |
+
+With Redis, a shared context that is within the reconstruction limit but above the L1 admission budget can still serve the request; it is not promoted into the local cache. Memory mode has no shared response-context fallback, so a dependent continuation whose context was oversized or evicted can return HTTP `409 response_context_unavailable`. A dependent continuation can return HTTP `503` when its shared backend is temporarily unavailable and no eligible relay fallback can preserve `previous_response_id`.
+
+Each successful budget change receives a read-only generation and is polled by every instance every five seconds. Operations shows effective/applied generations, synchronization state, logical cache bytes and counters, process memory, Go heap fields, and GC count. Logical cache bytes do not include Go/container overhead and are not an RSS or process-memory hard limit. During a rolling upgrade, a newer frontend tolerates an older backend that omits the new settings or Operations fields.
+
 ### API Keys and Admin Secret
 
 - Public API keys come from the database API Keys table. If no key is configured, `/v1/*` skips API key authentication.
@@ -303,14 +293,18 @@ Default settings are written automatically on first startup.
 
 ## Public API
 
-| Endpoint | Description |
-| --- | --- |
-| `POST /v1/chat/completions` | Chat Completions style endpoint |
-| `POST /v1/responses` | Responses style endpoint |
-| `POST /v1/images/generations` | OpenAI Images generation endpoint |
-| `POST /v1/images/edits` | OpenAI Images edit endpoint |
-| `GET /v1/models` | List available models (includes gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-image-2, etc.) |
-| `GET /health` | Health check |
+| Endpoint                                               | Description                                                                                                                           |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/chat/completions`                            | Chat Completions style endpoint                                                                                                       |
+| `POST /v1/responses`                                   | Responses style endpoint                                                                                                              |
+| `POST /v1/images/generations`                          | OpenAI Images generation endpoint (gpt-image-2 / gpt-image-2.5 via Codex, grok-imagine via Grok)                                                      |
+| `POST /v1/images/edits`                                | OpenAI Images edit endpoint                                                                                                           |
+| `POST /v1/videos/generations`                          | Grok Imagine video generation (async, returns `request_id`)                                                                           |
+| `POST /v1/videos/edits` / `POST /v1/videos/extensions` | Grok Imagine video edit / extension                                                                                                   |
+| `GET /v1/videos/:id`                                   | Poll video task status (`video.url` rewritten to the gateway content proxy)                                                           |
+| `GET /v1/videos/:id/content`                           | Download the generated video through the gateway (Range supported)                                                                    |
+| `GET /v1/models`                                       | List available models (includes gpt-6-astra, gpt-5.6-sol/terra/luna, gpt-5.5, gpt-5.3-codex-spark, gpt-image-2, grok-imagine-*, etc.) |
+| `GET /health`                                          | Health check                                                                                                                          |
 
 > **Pricing**: gpt-5.5 is billed at $5.00/M input and $30.00/M output (standard tier). Priority tier: $12.50/M input, $75.00/M output. Other models follow pricing rules in the billing engine.
 
@@ -413,9 +407,9 @@ Open `/admin/` in a browser.
 | Image Studio portal (non-admin) | `/image-studio` | Standalone studio for teammates using their own API key; toggle on the API Keys page |
 | Prompt Filter | `/admin/prompt-filter/overview` | Rules, hit logs, testing, and handling mode configuration |
 | Usage | `/admin/usage` | Request logs, metric cards, charts, log cleanup |
-| Operations | `/admin/ops` | Runtime monitoring and system overview |
+| Operations | `/admin/ops` | Runtime overview, response-context logical cache metrics, process memory, Go heap, and GC |
 | Scheduler Board | `/admin/ops/scheduler` | Scheduler health, penalties, and score breakdown |
-| Settings | `/admin/settings` | Runtime parameters and admin secret settings |
+| Settings | `/admin/settings` | Runtime parameters, response-context cache budgets, and admin secret settings |
 | Usage Guide | `/admin/docs` | Codex CLI and Claude Code integration examples |
 | API Reference | `/admin/api-reference` | OpenAI-style endpoints and admin API reference |
 
@@ -464,7 +458,7 @@ Selection strategy:
 2. Recompute health tier, scheduler score, and dynamic concurrency.
 3. Exclude accounts that have reached their concurrency limit.
 4. Prefer higher `SchedulerPriority`, then `healthy > warm > risky > banned`; within the same priority and tier, prefer higher score and lower concurrency.
-5. Apply a 15% random shuffle to reduce hotspots and starvation.
+5. In indexed mode, use a per-tier cursor or deterministic affinity offset inside the highest valid priority/health segment.
 
 When multiple end users share one downstream API key, send `X-Codex2API-Affinity-Key` with a stable user or conversation identifier. Codex2API hashes it for local account affinity only and never forwards it upstream.
 
@@ -482,8 +476,18 @@ The persistent upstream WebSocket pool is also capped by each account's current 
 Observability:
 
 - `GET /api/admin/accounts` shows health tier, scheduler score, and penalty details.
-- `GET /api/admin/ops/overview` shows runtime and connection pool state.
+- `GET /api/admin/ops/overview` shows scheduler engine, indexed/legacy selections, scan volume, event waiters, sparse routing-cache state, shadow parity, and outbox lag in addition to runtime and connection-pool state.
 - `/admin/ops/scheduler` provides the scheduler board.
+
+**Scheduler engine** (`scheduler_engine`, via Admin Settings, or `CODEX_SCHEDULER_ENGINE`):
+
+| Engine | Behavior |
+| --- | --- |
+| `legacy` | Compatibility path that scans the immutable account snapshot |
+| `shadow` | Legacy remains authoritative while 1 in 64 requests compares indexed candidate availability |
+| `indexed` | Priority/health buckets, sparse API-key sub-pools, and event-driven availability waits are authoritative |
+
+For a production rollout, use `legacy → shadow → indexed`. `CODEX_SCHEDULER_ENGINE` overrides the database setting and can pin an instance for a canary or emergency rollback. The old `FAST_SCHEDULER_ENABLED=true` switch remains a compatibility alias for `indexed` when no engine is configured.
 
 **Scheduler mode** (`scheduler_mode`, via Admin Settings):
 
@@ -491,6 +495,7 @@ Observability:
 | --- | --- |
 | `round_robin` (default) | Round-robin across available accounts per health tier, weighted by dispatch score |
 | `remaining_quota` | Prioritizes accounts with lower usage percent; round-robin for ties |
+| `fill_first` | Keeps draining the account with the least remaining quota until it is exhausted or rate-limited, then falls to the next (A → B → C) |
 
 **Credit accounts** (per-account flags):
 
@@ -558,11 +563,13 @@ Join the group to discuss deployment, usage, and development questions.
 
 ## Star History
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
-  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-</picture>
+<a href="https://star-history.dera.page/#james-6-23/codex2api&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+  </picture>
+</a>
 
 ---
 

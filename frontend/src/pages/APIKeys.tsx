@@ -1,3 +1,4 @@
+import { ANTIGRAVITY_DEFAULT_MODELS as DEFAULT_ANTIGRAVITY_MODEL_OPTIONS } from "../lib/antigravityModels";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import {
   useCallback,
@@ -7,12 +8,16 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 import { api } from "../api";
 import APIKeyTokenUsagePanel from "../components/APIKeyTokenUsagePanel";
+import APIKeyModelRequestLimitsEditor from "../components/APIKeyModelRequestLimitsEditor";
+import APIKeyModelRequestUsageCard from "../components/APIKeyModelRequestUsage";
 import ChipInput from "../components/ChipInput";
 import Modal from "../components/Modal";
 import ChannelLogo from "../components/ChannelLogo";
 import PageHeader from "../components/PageHeader";
+import { SegmentedTabs } from "../components/SegmentedTabs";
 import StateShell from "../components/StateShell";
 import StatCard from "../components/StatCard";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
@@ -21,6 +26,7 @@ import { useToast } from "../hooks/useToast";
 import type {
   AccountGroup,
   APIKeyLimits,
+  APIKeyModelRequestUsage,
   APIKeyScopeLimit,
   APIKeyScopeUsageItem,
   APIKeyScopeUsageWindow,
@@ -28,8 +34,15 @@ import type {
   APIKeyScopeSummaryItem,
   APIKeyRow,
   APIKeyWindowUsage,
+  PromptFilterNewAPIBinding,
   SystemSettings,
 } from "../types";
+import { canStartAPIKeyBulkReset } from "../lib/apiKeyOperationState";
+import {
+  modelRequestLimitsFromAPIKey,
+  modelRequestLimitsToPayload,
+  type ModelRequestLimitFormState,
+} from "../lib/apiKeyModelRequests";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
 import { Badge } from "@/components/ui/badge";
@@ -37,6 +50,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, type SelectOption } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -48,6 +62,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   Check,
+  ClipboardCheck,
   Copy,
   CalendarClock,
   CircleDollarSign,
@@ -62,6 +77,7 @@ import {
   LockKeyhole,
   Pencil,
   Plus,
+  Power,
   RotateCcw,
   Search,
   ShieldAlert,
@@ -74,8 +90,8 @@ import {
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
 type TokenLimitUnit = "token" | "k" | "m" | "b";
-type StatusFilter = "all" | "active" | "expired" | "quota_exhausted" | "expiring_soon";
-type APIKeyStatus = "active" | "expired" | "quota_exhausted";
+type StatusFilter = "all" | "active" | "expired" | "quota_exhausted" | "expiring_soon" | "disabled";
+type APIKeyStatus = "active" | "expired" | "quota_exhausted" | "disabled";
 type SortMode = "created_desc" | "last_used_desc" | "quota_usage_desc" | "name_asc";
 
 const KEY_REVEAL_MS = 30_000;
@@ -110,19 +126,25 @@ interface LimitsFormState {
   costLimit5h: string;
   costLimit7d: string;
   costLimit30d: string;
+  // 自然日(服务器时区,零点清零)限额,与上面的滑动窗口语义不同(issue #460)。
+  costLimitDaily: string;
   tokenLimit5h: string;
   tokenLimit5hUnit: TokenLimitUnit;
   tokenLimit7d: string;
   tokenLimit7dUnit: TokenLimitUnit;
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
+  tokenLimitDaily: string;
+  tokenLimitDailyUnit: TokenLimitUnit;
   imageGenerationPolicy: ImageGenerationPolicy;
+  allowLive: boolean;
   upstreamChannel: UpstreamChannel;
   scopeLimits: ScopeLimitFormState[];
+  modelRequestLimits: ModelRequestLimitFormState[];
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
-type UpstreamChannel = "auto" | "codex" | "grok";
+type UpstreamChannel = "auto" | "codex" | "grok" | "antigravity" | "claude";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -166,12 +188,43 @@ const emptyScopeLimitRow: ScopeLimitFormState = {
 
 // Grok 账号都未声明模型时的下拉兜底(与 Grok 账号页测试模型列表一致)。
 const DEFAULT_GROK_MODEL_OPTIONS = [
+  "grok-4.6",
   "grok-4.5",
   "grok-4",
   "grok-3-fast",
   "grok-3",
   "grok-2",
 ];
+
+// Keep this fallback in lockstep with proxy.defaultClaudeModelIDs. The
+// server catalog normally wins; these aliases are only used when no
+// Claude account has populated a catalog yet.
+const DEFAULT_CLAUDE_MODEL_OPTIONS = [
+  "claude-opus-4-5",
+  "claude-sonnet-4-5",
+  "claude-haiku-4-5",
+];
+
+function accountGroupsForUpstreamChannel(
+  groups: AccountGroup[],
+  channel: UpstreamChannel,
+): AccountGroup[] {
+  return channel === "auto"
+    ? groups
+    : groups.filter((group) => group.channel === channel);
+}
+
+function compatibleGroupIdsForUpstreamChannel(
+  ids: number[],
+  groups: AccountGroup[],
+  channel: UpstreamChannel,
+): number[] {
+  if (channel === "auto") return ids;
+  const compatibleIds = new Set(
+    accountGroupsForUpstreamChannel(groups, channel).map((group) => group.id),
+  );
+  return ids.filter((id) => compatibleIds.has(id));
+}
 
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
   token: 1,
@@ -193,15 +246,20 @@ const emptyLimitsForm: LimitsFormState = {
   costLimit5h: "",
   costLimit7d: "",
   costLimit30d: "",
+  costLimitDaily: "",
   tokenLimit5h: "",
   tokenLimit5hUnit: "token",
+  tokenLimitDaily: "",
+  tokenLimitDailyUnit: "token",
   tokenLimit7d: "",
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
   imageGenerationPolicy: "allow",
+  allowLive: false,
   upstreamChannel: "auto",
   scopeLimits: [],
+  modelRequestLimits: [],
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -247,6 +305,9 @@ export default function APIKeys() {
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   // 编辑抽屉里展示 scope 预算的当前用量（issue #439）；打开时按需拉一次。
   const [scopeUsage, setScopeUsage] = useState<APIKeyScopeUsageItem[]>([]);
+  const [modelRequestUsage, setModelRequestUsage] = useState<APIKeyModelRequestUsage[]>([]);
+  const [modelRequestUsageLoading, setModelRequestUsageLoading] = useState(false);
+  const [modelRequestUsageError, setModelRequestUsageError] = useState("");
   // 列表页的 scope 预算概览：按 Key ID 索引，仅在存在配了预算的 Key 时才有内容。
   const [scopeSummary, setScopeSummary] = useState<
     Record<string, APIKeyScopeSummaryItem[]>
@@ -255,6 +316,7 @@ export default function APIKeys() {
   const [editTab, setEditTab] = useState<"basic" | "limits">("basic");
   const [editDirty, setEditDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resettingAll, setResettingAll] = useState(false);
   const [savingPublicUsagePage, setSavingPublicUsagePage] = useState(false);
   const [savingPublicImageStudioPage, setSavingPublicImageStudioPage] =
     useState(false);
@@ -265,6 +327,26 @@ export default function APIKeys() {
   const { confirm, confirmDialog } = useConfirmDialog();
 
   useEffect(() => {
+    let cancelled = false;
+    setModelRequestUsage([]);
+    setModelRequestUsageError("");
+    setModelRequestUsageLoading(false);
+    if (!editingKey || !editingKey.limits?.model_request_limits?.length) return;
+    setModelRequestUsageLoading(true);
+    void api.getAPIKeyModelRequestUsage(editingKey.id)
+      .then((result) => {
+        if (!cancelled) setModelRequestUsage(result.model_request_usage ?? []);
+      })
+      .catch((error) => {
+        if (!cancelled) setModelRequestUsageError(getErrorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setModelRequestUsageLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [editingKey]);
+
+  useEffect(() => {
     return () => {
       revealTimers.current.forEach((timer) => window.clearTimeout(timer));
       revealTimers.current.clear();
@@ -272,7 +354,7 @@ export default function APIKeys() {
   }, []);
 
   const loadKeys = useCallback(async () => {
-    const [keysResponse, groupsResponse, modelsResponse, settingsResponse] = await Promise.all([
+    const [keysResponse, groupsResponse, modelsResponse, settingsResponse, promptBindingsResponse] = await Promise.all([
       api.getAPIKeys(),
       api.listAccountGroups().catch(() => ({ groups: [] })),
       api
@@ -280,15 +362,21 @@ export default function APIKeys() {
         .catch(() => ({ models: [] as string[] })) as Promise<{
         models?: string[];
         grok_models?: string[];
+        antigravity_models?: string[];
+        claude_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
+      api.getPromptFilterNewAPIBindings().catch(() => ({ bindings: [] as PromptFilterNewAPIBinding[] })),
     ]);
     return {
       keys: keysResponse.keys ?? [],
       groups: groupsResponse.groups ?? [],
       modelOptions: modelsResponse.models ?? [],
       grokModelOptions: modelsResponse.grok_models ?? [],
+      antigravityModelOptions: modelsResponse.antigravity_models ?? [],
+      claudeModelOptions: modelsResponse.claude_models ?? [],
       settings: settingsResponse,
+      promptBindings: promptBindingsResponse.bindings ?? [],
     };
   }, []);
 
@@ -297,20 +385,30 @@ export default function APIKeys() {
     groups: AccountGroup[];
     modelOptions: string[];
     grokModelOptions: string[];
+    antigravityModelOptions: string[];
+    claudeModelOptions: string[];
     settings: SystemSettings | null;
+    promptBindings: PromptFilterNewAPIBinding[];
   }>({
     initialData: {
       keys: [],
       groups: [],
       modelOptions: [],
       grokModelOptions: [],
+      antigravityModelOptions: [],
+      claudeModelOptions: [],
       settings: null,
+      promptBindings: [],
     },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+  const promptBindingsByKey = useMemo(
+    () => new Map(data.promptBindings.map((binding) => [binding.api_key_id, binding])),
+    [data.promptBindings],
+  );
 
   // scope 预算概览单独拉：它需要跨 Key 的用量聚合，不该拖慢 Key 列表本身。
   const anyScopeBudget = keys.some(
@@ -340,17 +438,47 @@ export default function APIKeys() {
     data.grokModelOptions.length > 0
       ? data.grokModelOptions
       : DEFAULT_GROK_MODEL_OPTIONS;
+  const antigravityModelOptions =
+    data.antigravityModelOptions.length > 0
+      ? data.antigravityModelOptions
+      : DEFAULT_ANTIGRAVITY_MODEL_OPTIONS;
+  const claudeModelOptions =
+    data.claudeModelOptions.length > 0
+      ? data.claudeModelOptions
+      : DEFAULT_CLAUDE_MODEL_OPTIONS;
   const modelOptionsForChannel = useCallback(
     (channel: UpstreamChannel): string[] => {
       if (channel === "grok") return grokModelOptions;
+      if (channel === "antigravity") return antigravityModelOptions;
       if (channel === "codex") return modelOptions;
+      if (channel === "claude") return claudeModelOptions;
       const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
-      return [
-        ...modelOptions,
-        ...grokModelOptions.filter((m) => !seen.has(m.toLowerCase())),
-      ];
+      const merged = [...modelOptions];
+      for (const candidate of [...grokModelOptions, ...antigravityModelOptions, ...claudeModelOptions]) {
+        if (!seen.has(candidate.toLowerCase())) {
+          seen.add(candidate.toLowerCase());
+          merged.push(candidate);
+        }
+      }
+      return merged;
     },
-    [modelOptions, grokModelOptions],
+    [modelOptions, grokModelOptions, antigravityModelOptions, claudeModelOptions],
+  );
+  const createSelectableGroups = useMemo(
+    () =>
+      accountGroupsForUpstreamChannel(
+        groups,
+        createForm.limits.upstreamChannel,
+      ),
+    [createForm.limits.upstreamChannel, groups],
+  );
+  const editSelectableGroups = useMemo(
+    () =>
+      accountGroupsForUpstreamChannel(
+        groups,
+        editForm.limits.upstreamChannel,
+      ),
+    [editForm.limits.upstreamChannel, groups],
   );
   const publicUsagePageEnabled = data.settings?.public_key_usage_page_enabled ?? true;
   const publicImageStudioPageEnabled =
@@ -390,12 +518,14 @@ export default function APIKeys() {
       expired: 0,
       quota_exhausted: 0,
       expiring_soon: 0,
+      disabled: 0,
     };
     const now = Date.now();
     for (const keyRow of keys) {
       const status = getAPIKeyStatus(keyRow);
       if (status === "active") counts.active += 1;
       else if (status === "expired") counts.expired += 1;
+      else if (status === "disabled") counts.disabled += 1;
       else counts.quota_exhausted += 1;
 
       if (
@@ -419,6 +549,7 @@ export default function APIKeys() {
       if (statusFilter === "expired" && status !== "expired") return false;
       if (statusFilter === "quota_exhausted" && status !== "quota_exhausted")
         return false;
+      if (statusFilter === "disabled" && status !== "disabled") return false;
       if (statusFilter === "expiring_soon") {
         if (status !== "active" || !keyRow.expires_at) return false;
         const expiresAt = new Date(keyRow.expires_at).getTime();
@@ -500,6 +631,25 @@ export default function APIKeys() {
 
   const updateCreateForm = (patch: Partial<CreateKeyFormState>) => {
     setCreateForm((current) => ({ ...current, ...patch }));
+  };
+
+  const updateCreateUpstreamChannel = (upstreamChannel: UpstreamChannel) => {
+    setCreateForm((current) => ({
+      ...current,
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        current.allowedGroupIds,
+        groups,
+        upstreamChannel,
+      ),
+      limits: {
+		...applyUpstreamChannel(current.limits, upstreamChannel),
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          current.limits.noAffinityGroupIds,
+          groups,
+          upstreamChannel,
+        ),
+      },
+    }));
   };
 
   const closeCreateDialog = () => {
@@ -618,7 +768,7 @@ export default function APIKeys() {
         ...(createForm.key.trim() ? { key: createForm.key.trim() } : {}),
         ...(quotaLimit && quotaLimit > 0 ? { quota_limit: quotaLimit } : {}),
         allowed_group_ids: createForm.allowedGroupIds,
-        limits: limitsFormToPayload(createForm.limits),
+        limits: limitsFormToPayload(createForm.limits, t),
         ...expirationPayload,
       };
 
@@ -689,6 +839,61 @@ export default function APIKeys() {
   };
 
   const [resettingIds, setResettingIds] = useState<Set<number>>(new Set());
+  const [togglingIds, setTogglingIds] = useState<Set<number>>(new Set());
+
+  const handleToggleEnabled = async (keyRow: APIKeyRow) => {
+    const nextEnabled = getAPIKeyStatus(keyRow) === "disabled";
+    if (!nextEnabled) {
+      const confirmed = await confirm({
+        title: t("apiKeys.disableTitle"),
+        description: t("apiKeys.disableDesc"),
+        confirmText: t("apiKeys.disableConfirm"),
+        tone: "destructive",
+        confirmVariant: "destructive",
+      });
+      if (!confirmed) return;
+    }
+
+    setTogglingIds((prev) => new Set(prev).add(keyRow.id));
+    try {
+      await api.updateAPIKey(keyRow.id, { enabled: nextEnabled });
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map((item) =>
+          item.id === keyRow.id
+            ? {
+                ...item,
+                enabled: nextEnabled,
+                status: nextEnabled ? undefined : "disabled",
+              }
+            : item,
+        ),
+      }));
+      showToast(
+        nextEnabled
+          ? t("apiKeys.enableSuccess")
+          : t("apiKeys.disableSuccess"),
+      );
+      void reloadSilently();
+    } catch (error) {
+      showToast(
+        `${t("apiKeys.toggleFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setTogglingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(keyRow.id);
+        return next;
+      });
+    }
+  };
+  const canResetAllQuotas = canStartAPIKeyBulkReset({
+    keyCount: keys.length,
+    resettingAll,
+    resettingIds,
+    deletingIds,
+  });
 
   const handleResetQuota = async (keyRow: APIKeyRow) => {
     const confirmed = await confirm({
@@ -701,24 +906,21 @@ export default function APIKeys() {
     if (!confirmed) return;
 
     setResettingIds((prev) => new Set(prev).add(keyRow.id));
-    const previousUsed = keyRow.quota_used;
     setData((current) => ({
       ...current,
       keys: current.keys.map((item) =>
-        item.id === keyRow.id ? { ...item, quota_used: 0 } : item,
+        item.id === keyRow.id ? resetAPIKeyQuotaUsage(item) : item,
       ),
     }));
     try {
-      await api.updateAPIKey(keyRow.id, { reset_quota: true });
+      await api.resetAPIKeyQuota(keyRow.id);
       showToast(t("apiKeys.resetQuotaSuccess"));
       void reloadSilently();
     } catch (error) {
       setData((current) => ({
         ...current,
         keys: current.keys.map((item) =>
-          item.id === keyRow.id
-            ? { ...item, quota_used: previousUsed }
-            : item,
+          item.id === keyRow.id ? keyRow : item,
         ),
       }));
       showToast(
@@ -731,6 +933,38 @@ export default function APIKeys() {
         next.delete(keyRow.id);
         return next;
       });
+    }
+  };
+
+  const handleResetAllQuotas = async () => {
+    if (!canResetAllQuotas) return;
+    const confirmed = await confirm({
+      title: t("apiKeys.resetAllQuotasTitle"),
+      description: t("apiKeys.resetAllQuotasDesc", { count: keys.length }),
+      confirmText: t("apiKeys.resetAllQuotasConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+
+    setResettingAll(true);
+    try {
+      const result = await api.resetAllAPIKeyQuotas();
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map(resetAPIKeyQuotaUsage),
+      }));
+      showToast(
+        t("apiKeys.resetAllQuotasSuccess", { count: result.reset_count }),
+      );
+      void reloadSilently();
+    } catch (error) {
+      showToast(
+        `${t("apiKeys.resetAllQuotasFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setResettingAll(false);
     }
   };
 
@@ -808,6 +1042,7 @@ export default function APIKeys() {
   };
 
   const startEditing = (keyRow: APIKeyRow) => {
+    const limits = limitsFromAPIKey(keyRow.limits);
     setEditingKey(keyRow);
     setScopeUsage([]);
     if ((keyRow.limits?.scope_limits?.length ?? 0) > 0) {
@@ -821,8 +1056,19 @@ export default function APIKeys() {
       quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : "",
       expireMode: keyRow.expires_at ? "custom" : "never",
       expiresAt: toDateTimeLocalValue(keyRow.expires_at),
-      allowedGroupIds: keyRow.allowed_group_ids ?? [],
-      limits: limitsFromAPIKey(keyRow.limits),
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        keyRow.allowed_group_ids ?? [],
+        groups,
+        limits.upstreamChannel,
+      ),
+      limits: {
+        ...limits,
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          limits.noAffinityGroupIds,
+          groups,
+          limits.upstreamChannel,
+        ),
+      },
     });
     setEditDirty(false);
     setEditTab("basic");
@@ -877,6 +1123,26 @@ export default function APIKeys() {
     setEditDirty(true);
   };
 
+  const updateEditUpstreamChannel = (upstreamChannel: UpstreamChannel) => {
+    setEditForm((current) => ({
+      ...current,
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        current.allowedGroupIds,
+        groups,
+        upstreamChannel,
+      ),
+      limits: {
+		...applyUpstreamChannel(current.limits, upstreamChannel),
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          current.limits.noAffinityGroupIds,
+          groups,
+          upstreamChannel,
+        ),
+      },
+    }));
+    setEditDirty(true);
+  };
+
   const handleSaveEdit = async (event?: FormEvent<HTMLFormElement>) => {
     event?.preventDefault();
     if (!editingKey) return;
@@ -891,8 +1157,11 @@ export default function APIKeys() {
       const expirationPayload = buildExpirationPayload(editForm, t, {
         clearNever: true,
       });
-      const limitsPayload = limitsFormToPayload(editForm.limits);
-      await api.updateAPIKey(editingKey.id, {
+      const limitsPayload = {
+        ...editingKey.limits,
+        ...limitsFormToPayload(editForm.limits, t),
+      };
+      const saved = await api.updateAPIKey(editingKey.id, {
         name: trimmed,
         quota_limit: quotaLimit,
         allowed_group_ids: editForm.allowedGroupIds,
@@ -924,7 +1193,7 @@ export default function APIKeys() {
             name: trimmed,
             quota_limit: quotaLimit,
             allowed_group_ids: editForm.allowedGroupIds,
-            limits: limitsPayload,
+            limits: saved.limits ?? limitsPayload,
             expires_at: nextExpires ?? null,
           };
         }),
@@ -982,13 +1251,29 @@ export default function APIKeys() {
             </span>
           }
           actions={
-            <Button
-              onClick={() => setCreateDialogOpen(true)}
-              className="max-sm:w-full"
-            >
-              <Plus className="size-3.5" />
-              {t("apiKeys.createKey")}
-            </Button>
+            <>
+              <Button
+                variant="outline"
+                disabled={!canResetAllQuotas}
+                onClick={() => void handleResetAllQuotas()}
+                className="max-sm:flex-1"
+              >
+                {resettingAll ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <RotateCcw className="size-3.5" />
+                )}
+                {t("apiKeys.resetAllQuotas")}
+              </Button>
+              <Button
+                disabled={resettingAll}
+                onClick={() => setCreateDialogOpen(true)}
+                className="max-sm:flex-1"
+              >
+                <Plus className="size-3.5" />
+                {t("apiKeys.createKey")}
+              </Button>
+            </>
           }
         />
 
@@ -1089,33 +1374,21 @@ export default function APIKeys() {
         </div>
 
         <div className="space-y-4">
-          <div className="inline-flex items-center gap-0.5 rounded-xl border border-border bg-muted/30 p-0.5">
-            {(
-              [
-                ["keys", t("apiKeys.tabKeys")],
-                ["token-usage", t("apiKeys.tabTokenUsage")],
-              ] as const
-            ).map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setActiveTab(key)}
-                className={cn(
-                  "rounded-lg px-3.5 py-1.5 text-[13px] font-semibold transition-colors",
-                  activeTab === key
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
+          <SegmentedTabs
+            size="sm"
+            className="w-full max-w-[320px]"
+            tabs={[
+              { value: "keys", label: t("apiKeys.tabKeys") },
+              { value: "token-usage", label: t("apiKeys.tabTokenUsage") },
+            ]}
+            value={activeTab}
+            onValueChange={(value) => setActiveTab(value as "keys" | "token-usage")}
+          />
 
           {activeTab === "keys" && (
             <>
               <div className="toolbar-surface flex flex-col gap-2.5">
-                <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                <div className="flex items-center gap-1.5 overflow-x-auto [-mx-3] [px-3] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                   <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
                     {t("apiKeys.filter")}
                   </span>
@@ -1142,6 +1415,11 @@ export default function APIKeys() {
                         t("apiKeys.status.quota_exhausted"),
                         statusCounts.quota_exhausted,
                       ],
+                      [
+                        "disabled",
+                        t("apiKeys.status.disabled"),
+                        statusCounts.disabled,
+                      ],
                     ] as const
                   ).map(([key, label, count]) => (
                     <button
@@ -1149,18 +1427,26 @@ export default function APIKeys() {
                       type="button"
                       onClick={() => setStatusFilter(key)}
                       className={cn(
-                        "shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[12px] font-semibold transition-colors",
+                        "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-[12px] font-semibold transition-all duration-150",
                         statusFilter === key
-                          ? "bg-primary text-primary-foreground"
-                          : "bg-muted/50 text-muted-foreground hover:bg-muted",
+                          ? "bg-primary text-primary-foreground shadow-2xs ring-1 ring-primary/20 scale-[1.02]"
+                          : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
                       )}
                     >
-                      {label} {count}
+                      <span>{label}</span>
+                      <span className={cn(
+                        "rounded-full px-1.5 py-0.2 text-[10px] font-mono tabular-nums font-bold",
+                        statusFilter === key
+                          ? "bg-primary-foreground/20 text-primary-foreground"
+                          : "bg-muted/80 text-muted-foreground",
+                      )}>
+                        {count}
+                      </span>
                     </button>
                   ))}
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <div className="relative min-w-0 flex-1 sm:max-w-sm">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
+                  <div className="relative w-full min-w-0 flex-1 sm:max-w-sm">
                     <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                     <Input
                       value={searchQuery}
@@ -1171,9 +1457,10 @@ export default function APIKeys() {
                       className="h-8 pl-8 text-[13px]"
                     />
                   </div>
-                  <div className="flex min-w-[10.5rem] items-center gap-1.5">
+                  <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:min-w-[10.5rem]">
                     <ArrowUpDown className="size-3.5 shrink-0 text-muted-foreground" />
                     <Select
+                      className="w-full min-w-0"
                       value={sortMode}
                       onValueChange={(value) =>
                         setSortMode(value as SortMode)
@@ -1234,8 +1521,10 @@ export default function APIKeys() {
                         const isVisible = visibleKeys.has(keyRow.id);
                         const isNew = createdKeyId === keyRow.id;
                         const isBusy =
+                          resettingAll ||
                           deletingIds.has(keyRow.id) ||
-                          resettingIds.has(keyRow.id);
+                          resettingIds.has(keyRow.id) ||
+                          togglingIds.has(keyRow.id);
                         const displayKey = isVisible
                           ? keyRow.raw_key || keyRow.key
                           : keyRow.key;
@@ -1269,6 +1558,7 @@ export default function APIKeys() {
                                     t={t}
                                   />
                                   <KeyChannelBadge keyRow={keyRow} t={t} />
+                                  <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                   <KeyScopeBudgetBadge
                                     items={scopeSummary[String(keyRow.id)]}
                                     t={t}
@@ -1354,22 +1644,38 @@ export default function APIKeys() {
                             </div>
 
                             <div className="mt-3 flex flex-wrap gap-1.5">
-                              {keyRow.quota_limit > 0 ? (
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={resettingIds.has(keyRow.id)}
-                                  onClick={() => void handleResetQuota(keyRow)}
-                                  className="min-w-[7rem] flex-1"
-                                >
-                                  {resettingIds.has(keyRow.id) ? (
-                                    <Loader2 className="size-3.5 animate-spin" />
-                                  ) : (
-                                    <RotateCcw className="size-3.5" />
-                                  )}
-                                  {t("apiKeys.resetQuota")}
-                                </Button>
-                              ) : null}
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={
+                                  resettingAll || resettingIds.has(keyRow.id)
+                                }
+                                onClick={() => void handleResetQuota(keyRow)}
+                                className="min-w-[7rem] flex-1"
+                              >
+                                {resettingIds.has(keyRow.id) ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <RotateCcw className="size-3.5" />
+                                )}
+                                {t("apiKeys.resetQuota")}
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={isBusy}
+                                onClick={() => void handleToggleEnabled(keyRow)}
+                                className="min-w-[6rem] flex-1"
+                              >
+                                {togglingIds.has(keyRow.id) ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <Power className="size-3.5" />
+                                )}
+                                {getAPIKeyStatus(keyRow) === "disabled"
+                                  ? t("apiKeys.enable")
+                                  : t("apiKeys.disable")}
+                              </Button>
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -1383,7 +1689,7 @@ export default function APIKeys() {
                               <Button
                                 variant="destructive"
                                 size="sm"
-                                disabled={deletingIds.has(keyRow.id)}
+                                disabled={isBusy}
                                 onClick={() => void handleDeleteKey(keyRow.id)}
                                 className="min-w-[6rem] flex-1"
                               >
@@ -1421,8 +1727,10 @@ export default function APIKeys() {
                             const isVisible = visibleKeys.has(keyRow.id);
                             const isNew = createdKeyId === keyRow.id;
                             const isBusy =
+                              resettingAll ||
                               deletingIds.has(keyRow.id) ||
-                              resettingIds.has(keyRow.id);
+                              resettingIds.has(keyRow.id) ||
+                              togglingIds.has(keyRow.id);
                             const displayKey = isVisible
                               ? keyRow.raw_key || keyRow.key
                               : keyRow.key;
@@ -1459,6 +1767,7 @@ export default function APIKeys() {
                                         t={t}
                                       />
                                       <KeyChannelBadge keyRow={keyRow} t={t} />
+                                      <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                       <KeyScopeBudgetBadge
                                         items={scopeSummary[String(keyRow.id)]}
                                         t={t}
@@ -1512,7 +1821,7 @@ export default function APIKeys() {
                                 </TableCell>
                                 <TableCell className="min-w-[160px] text-sm text-muted-foreground">
                                   <div className="space-y-1">
-                                    <div className="font-medium text-foreground">
+                                    <div className="font-medium tabular-nums text-foreground">
                                       {formatQuotaLimit(keyRow, t)}
                                     </div>
                                     {keyRow.quota_limit > 0 ? (
@@ -1563,24 +1872,47 @@ export default function APIKeys() {
                                 </TableCell>
                                 <TableCell>
                                   <div className="flex flex-wrap items-center justify-end gap-1.5">
-                                    {keyRow.quota_limit > 0 ? (
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={resettingIds.has(keyRow.id)}
-                                        onClick={() =>
-                                          void handleResetQuota(keyRow)
-                                        }
-                                        title={t("apiKeys.resetQuota")}
-                                      >
-                                        {resettingIds.has(keyRow.id) ? (
-                                          <Loader2 className="size-3.5 animate-spin" />
-                                        ) : (
-                                          <RotateCcw className="size-3.5" />
-                                        )}
-                                        {t("apiKeys.resetQuota")}
-                                      </Button>
-                                    ) : null}
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={
+                                        resettingAll ||
+                                        resettingIds.has(keyRow.id)
+                                      }
+                                      onClick={() =>
+                                        void handleResetQuota(keyRow)
+                                      }
+                                      title={t("apiKeys.resetQuota")}
+                                    >
+                                      {resettingIds.has(keyRow.id) ? (
+                                        <Loader2 className="size-3.5 animate-spin" />
+                                      ) : (
+                                        <RotateCcw className="size-3.5" />
+                                      )}
+                                      {t("apiKeys.resetQuota")}
+                                    </Button>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={isBusy}
+                                      onClick={() =>
+                                        void handleToggleEnabled(keyRow)
+                                      }
+                                      title={
+                                        getAPIKeyStatus(keyRow) === "disabled"
+                                          ? t("apiKeys.enable")
+                                          : t("apiKeys.disable")
+                                      }
+                                    >
+                                      {togglingIds.has(keyRow.id) ? (
+                                        <Loader2 className="size-3.5 animate-spin" />
+                                      ) : (
+                                        <Power className="size-3.5" />
+                                      )}
+                                      {getAPIKeyStatus(keyRow) === "disabled"
+                                        ? t("apiKeys.enable")
+                                        : t("apiKeys.disable")}
+                                    </Button>
                                     <Button
                                       variant="outline"
                                       size="sm"
@@ -1594,7 +1926,7 @@ export default function APIKeys() {
                                     <Button
                                       variant="destructive"
                                       size="sm"
-                                      disabled={deletingIds.has(keyRow.id)}
+                                      disabled={isBusy}
                                       onClick={() =>
                                         void handleDeleteKey(keyRow.id)
                                       }
@@ -1791,8 +2123,9 @@ export default function APIKeys() {
                         <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
                           {t("apiKeys.publicAccountPortalDesc")}
                         </p>
-                        {publicAccountPortalPageEnabled ? (
-                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          {publicAccountPortalPageEnabled ? (
+                            <>
                             <code
                               className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
                               title={accountPortalUrl}
@@ -1816,8 +2149,16 @@ export default function APIKeys() {
                               <ExternalLink className="size-3.5" />
                               {t("apiKeys.publicUsageOpen")}
                             </a>
-                          </div>
-                        ) : null}
+                            </>
+                          ) : null}
+                          <Link
+                            to="/accounts?pending=1"
+                            className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                          >
+                            <ClipboardCheck className="size-3.5" />
+                            {t("apiKeys.publicAccountPortalReview")}
+                          </Link>
+                        </div>
                       </div>
                       <Button
                         variant={
@@ -1927,13 +2268,19 @@ export default function APIKeys() {
             >
               <UpstreamChannelPicker
                 value={createForm.limits.upstreamChannel}
-                onChange={(upstreamChannel) =>
+                onChange={updateCreateUpstreamChannel}
+              />
+            </FormField>
+            {createForm.limits.upstreamChannel === "codex" ? (
+              <AllowLiveField
+                checked={createForm.limits.allowLive}
+                onCheckedChange={(allowLive) =>
                   updateCreateForm({
-                    limits: { ...createForm.limits, upstreamChannel },
+                    limits: { ...createForm.limits, allowLive },
                   })
                 }
               />
-            </FormField>
+            ) : null}
 
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
@@ -1985,7 +2332,7 @@ export default function APIKeys() {
               as="div"
             >
               <GroupMultiSelect
-                groups={groups}
+                groups={createSelectableGroups}
                 value={createForm.allowedGroupIds}
                 onChange={(allowedGroupIds) =>
                   updateCreateForm({ allowedGroupIds })
@@ -2059,30 +2406,20 @@ export default function APIKeys() {
                 </div>
               </div>
 
-              <div className="flex gap-1 rounded-xl border border-border bg-muted/50 p-1">
-                <button
-                  type="button"
-                  onClick={() => setEditTab("basic")}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
-                    editTab === "basic"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {t("apiKeys.editTabBasic")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setEditTab("limits")}
-                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
-                    editTab === "limits"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {t("apiKeys.editTabLimits")}
-                </button>
-              </div>
+              <SegmentedTabs
+                tabs={[
+                  { value: "basic", label: t("apiKeys.editTabBasic") },
+                  { value: "limits", label: t("apiKeys.editTabLimits") },
+                ]}
+                value={editTab}
+                onValueChange={(value) => setEditTab(value as "basic" | "limits")}
+              />
+
+              <APIKeyModelRequestUsageCard
+                items={modelRequestUsage}
+                loading={modelRequestUsageLoading}
+                error={modelRequestUsageError}
+              />
 
               {editTab === "basic" ? (
                 <>
@@ -2122,13 +2459,19 @@ export default function APIKeys() {
                   >
                     <UpstreamChannelPicker
                       value={editForm.limits.upstreamChannel}
-                      onChange={(upstreamChannel) =>
+                      onChange={updateEditUpstreamChannel}
+                    />
+                  </FormField>
+                  {editForm.limits.upstreamChannel === "codex" ? (
+                    <AllowLiveField
+                      checked={editForm.limits.allowLive}
+                      onCheckedChange={(allowLive) =>
                         updateEditForm({
-                          limits: { ...editForm.limits, upstreamChannel },
+                          limits: { ...editForm.limits, allowLive },
                         })
                       }
                     />
-                  </FormField>
+                  ) : null}
 
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField
@@ -2173,7 +2516,7 @@ export default function APIKeys() {
                     as="div"
                   >
                     <GroupMultiSelect
-                      groups={groups}
+                      groups={editSelectableGroups}
                       value={editForm.allowedGroupIds}
                       onChange={(allowedGroupIds) =>
                         updateEditForm({ allowedGroupIds })
@@ -2193,7 +2536,7 @@ export default function APIKeys() {
                     as="div"
                   >
                     <GroupMultiSelect
-                      groups={groups}
+                      groups={editSelectableGroups}
                       value={editForm.limits.noAffinityGroupIds}
                       onChange={(noAffinityGroupIds) =>
                         updateEditForm({
@@ -2353,6 +2696,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
   const token5h = formatTokenLimitForForm(limits.token_limit_5h);
   const token7d = formatTokenLimitForForm(limits.token_limit_7d);
   const token30d = formatTokenLimitForForm(limits.token_limit_30d);
+  const tokenDaily = formatTokenLimitForForm(limits.token_limit_daily);
   return {
     modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
@@ -2378,18 +2722,29 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.cost_limit_30d && limits.cost_limit_30d > 0
         ? String(limits.cost_limit_30d)
         : "",
+    costLimitDaily:
+      limits.cost_limit_daily && limits.cost_limit_daily > 0
+        ? String(limits.cost_limit_daily)
+        : "",
     tokenLimit5h: token5h.value,
     tokenLimit5hUnit: token5h.unit,
     tokenLimit7d: token7d.value,
     tokenLimit7dUnit: token7d.unit,
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
+    tokenLimitDaily: tokenDaily.value,
+    tokenLimitDailyUnit: tokenDaily.unit,
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
+    allowLive: Boolean(limits.allow_live),
     upstreamChannel:
-      limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
+      limits.upstream_channel === "codex" ||
+      limits.upstream_channel === "grok" ||
+      limits.upstream_channel === "antigravity"
+      || limits.upstream_channel === "claude"
         ? limits.upstream_channel
         : "auto",
     scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
+    modelRequestLimits: modelRequestLimitsFromAPIKey(limits.model_request_limits),
   };
 }
 
@@ -2441,7 +2796,7 @@ function scopeLimitRowHasLimit(row: ScopeLimitFormState): boolean {
   ].some((value) => Number(value.trim()) > 0);
 }
 
-// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
+// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道选择。
 // 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
 function UpstreamChannelPicker({
   value,
@@ -2471,10 +2826,20 @@ function UpstreamChannelPicker({
       label: t("apiKeys.limits.upstreamChannelGrok"),
       icon: <ChannelLogo channel="grok" size={18} />,
     },
+    {
+      key: "antigravity",
+      label: t("apiKeys.limits.upstreamChannelAntigravity"),
+      icon: <ChannelLogo channel="antigravity" size={18} />,
+    },
+    {
+      key: "claude",
+      label: t("apiKeys.limits.upstreamChannelClaude"),
+      icon: <ChannelLogo channel="claude" size={18} />,
+    },
   ];
   return (
     <div>
-      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+      <div className="grid grid-cols-5 gap-1 rounded-xl border border-border bg-muted/30 p-1">
         {options.map(({ key, label, icon }) => (
           <button
             key={key}
@@ -2495,6 +2860,41 @@ function UpstreamChannelPicker({
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">
         {t(`apiKeys.limits.upstreamChannelHint.${value}`)}
+      </p>
+    </div>
+  );
+}
+
+function applyUpstreamChannel(
+  limits: LimitsFormState,
+  upstreamChannel: UpstreamChannel,
+): LimitsFormState {
+  return {
+    ...limits,
+    upstreamChannel,
+    allowLive: upstreamChannel === "codex" ? limits.allowLive : false,
+    planAllow: prunePlanAllow(limits.planAllow, upstreamChannel),
+  };
+}
+
+function AllowLiveField({
+  checked,
+  onCheckedChange,
+}: {
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
+      <div className="flex items-center justify-between gap-3">
+        <label className="text-xs font-medium text-foreground">
+          {t("apiKeys.limits.allowLive")}
+        </label>
+        <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      </div>
+      <p className="text-[10px] text-muted-foreground">
+        {t("apiKeys.limits.allowLiveHint")}
       </p>
     </div>
   );
@@ -2546,7 +2946,7 @@ function parseTokenLimit(value: string, unit: TokenLimitUnit): number {
 // limitsFormToPayload 把表单值转为后端期望的 APIKeyLimits。
 // 空字符串或 0 在后端被视为 "未配置";所以不一一过滤,直接把全部字段都发出去。
 // (sanitizeAPIKeyLimits 在后端会把负值与空白清理掉)
-function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
+function limitsFormToPayload(form: LimitsFormState, t: Translator): APIKeyLimits {
   const num = (s: string) => {
     const n = Number(s.trim());
     return Number.isFinite(n) && n > 0 ? n : 0;
@@ -2558,7 +2958,10 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
   return {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
-    plan_allow: form.planAllow.map((p) => p.trim()).filter(Boolean),
+    plan_allow: prunePlanAllow(
+      form.planAllow.map((p) => p.trim()).filter(Boolean),
+      form.upstreamChannel,
+    ),
     no_affinity_group_ids: form.noAffinityGroupIds,
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
@@ -2566,9 +2969,11 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
     cost_limit_30d: num(form.costLimit30d),
+    cost_limit_daily: num(form.costLimitDaily),
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
+    token_limit_daily: parseTokenLimit(form.tokenLimitDaily, form.tokenLimitDailyUnit),
     image_generation_policy:
       form.imageGenerationPolicy === "allow"
         ? undefined
@@ -2576,8 +2981,10 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     // 兼容旧字段：block 时同步置位，其余留空由后端按 policy 归一。
     disable_image_generation:
       form.imageGenerationPolicy === "block" || undefined,
+    allow_live: form.upstreamChannel === "codex" && form.allowLive,
     upstream_channel:
       form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
+    model_request_limits: modelRequestLimitsToPayload(form.modelRequestLimits, t),
     scope_limits: form.scopeLimits
       .filter((row) => Number(row.scopeId.trim()) > 0)
       .filter(scopeLimitRowHasLimit)
@@ -2611,6 +3018,9 @@ function toDateTimeLocalValue(value?: string | null) {
 }
 
 function getAPIKeyStatus(keyRow: APIKeyRow): APIKeyStatus {
+  if (keyRow.enabled === false || keyRow.status === "disabled") {
+    return "disabled";
+  }
   if (keyRow.status === "expired" || keyRow.status === "quota_exhausted") {
     return keyRow.status;
   }
@@ -2626,10 +3036,24 @@ function getAPIKeyStatus(keyRow: APIKeyRow): APIKeyStatus {
   return "active";
 }
 
+function resetAPIKeyQuotaUsage(keyRow: APIKeyRow): APIKeyRow {
+  return {
+    ...keyRow,
+    quota_used: 0,
+    window_usage: keyRow.window_usage
+      ? {
+          ...keyRow.window_usage,
+          cost_5h: 0,
+          cost_7d: 0,
+        }
+      : keyRow.window_usage,
+  };
+}
+
 function usageToneClass(pct: number) {
-  if (pct >= 90) return "bg-destructive";
-  if (pct >= 70) return "bg-[hsl(var(--warning))]";
-  return "bg-[hsl(var(--success))]";
+  if (pct >= 90) return "bg-rose-500 shadow-2xs";
+  if (pct >= 70) return "bg-amber-500 shadow-2xs";
+  return "bg-emerald-500 shadow-2xs";
 }
 
 function UsageBar({
@@ -2646,16 +3070,19 @@ function UsageBar({
   if (!limit || limit <= 0) return null;
   const pct = Math.min(100, Math.max(0, (used / limit) * 100));
   return (
-    <div className={cn("space-y-1", className)}>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+    <div className={cn("space-y-1.5", className)}>
+      <div className="h-2 w-full overflow-hidden rounded-full bg-muted/80 shadow-inner">
         <div
-          className={cn("h-full rounded-full transition-all", usageToneClass(pct))}
+          className={cn("h-full rounded-full transition-all duration-300", usageToneClass(pct))}
           style={{ width: `${pct}%` }}
         />
       </div>
       {showPercent ? (
-        <div className="text-[10px] font-medium tabular-nums text-muted-foreground">
-          {pct.toFixed(0)}%
+        <div className="flex items-center justify-between text-[10px] font-semibold tabular-nums text-muted-foreground">
+          <span>用量比例</span>
+          <span className={cn(pct >= 90 ? "text-rose-500 font-bold" : pct >= 70 ? "text-amber-500 font-bold" : "text-emerald-600 dark:text-emerald-400 font-bold")}>
+            {pct.toFixed(0)}%
+          </span>
         </div>
       ) : null}
     </div>
@@ -2671,24 +3098,29 @@ function KeyStatusBadge({
 }) {
   const config = {
     active: {
-      dot: "bg-[hsl(var(--success))]",
+      dot: "bg-emerald-500 animate-pulse",
       className:
-        "border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]",
+        "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
     },
     expired: {
       dot: "bg-muted-foreground",
       className: "border-transparent bg-muted text-muted-foreground",
     },
     quota_exhausted: {
-      dot: "bg-destructive",
-      className: "border-transparent bg-destructive/10 text-destructive",
+      dot: "bg-rose-500 animate-pulse",
+      className: "border-rose-500/20 bg-rose-500/10 text-rose-600 dark:text-rose-400",
+    },
+    disabled: {
+      dot: "bg-amber-500",
+      className:
+        "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300",
     },
   }[status];
 
   return (
     <Badge
       variant="outline"
-      className={cn("gap-1.5 px-1.5 py-0 text-[11px] font-semibold", config.className)}
+      className={cn("gap-1.5 px-2 py-0.5 text-[11px] font-semibold rounded-full shadow-2xs", config.className)}
     >
       <span className={cn("size-1.5 rounded-full", config.dot)} />
       {t(`apiKeys.status.${status}`)}
@@ -2760,6 +3192,18 @@ function KeyChannelBadge({
       </Badge>
     );
   }
+  if (channel === "antigravity") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelAntigravity")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="antigravity" size={12} />
+        Antigravity
+      </Badge>
+    );
+  }
   if (channel === "codex") {
     return (
       <Badge
@@ -2769,6 +3213,18 @@ function KeyChannelBadge({
       >
         <ChannelLogo channel="codex" size={12} />
         Codex
+      </Badge>
+    );
+  }
+  if (channel === "claude") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelClaude")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="claude" size={12} />
+        Claude
       </Badge>
     );
   }
@@ -2782,6 +3238,54 @@ function KeyChannelBadge({
       <Waypoints className="size-3" />
       {t("apiKeys.limits.upstreamChannelAutoTab")}
     </Badge>
+  );
+}
+
+// APIKeyPromptPolicyBadge separates the effective Prompt policy from the
+// optional NewAPI identity binding. An unbound key still follows the global
+// Prompt Filter; the badge makes that explicit instead of implying bypass.
+function APIKeyPromptPolicyBadge({
+  binding,
+}: {
+  binding?: PromptFilterNewAPIBinding;
+}) {
+  const { t } = useTranslation();
+  const scope = binding?.prompt_filter_scope ?? "inherit";
+  const scopeLabel =
+    scope === "off"
+      ? t("apiKeys.promptFilterScopeOff")
+      : scope === "local_only"
+        ? t("apiKeys.promptFilterScopeLocal")
+        : t("apiKeys.promptFilterScopeGlobal");
+  const identityLabel = binding
+    ? binding.require_signed_identity
+      ? t("apiKeys.promptFilterIdentityRequired")
+      : t("apiKeys.promptFilterIdentityBound")
+    : t("apiKeys.promptFilterIdentityUnbound");
+  return (
+    <span className="inline-flex max-w-full flex-wrap items-center gap-1">
+      <Badge
+        variant="outline"
+        className={cn(
+          "max-w-full truncate border-transparent bg-sky-500/10 px-1.5 py-0 text-[10px] font-semibold text-sky-700 dark:text-sky-300",
+          scope === "off" && "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+          scope === "local_only" && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        )}
+        title={scopeLabel}
+      >
+        {scopeLabel}
+      </Badge>
+      <Badge
+        variant="outline"
+        className={cn(
+          "max-w-full truncate border-transparent bg-muted/70 px-1.5 py-0 text-[10px] font-medium text-muted-foreground",
+          !binding && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        )}
+        title={identityLabel}
+      >
+        {identityLabel}
+      </Badge>
+    </span>
   );
 }
 
@@ -2824,6 +3328,13 @@ function WindowCostBars({
   usage: APIKeyWindowUsage;
 }) {
   const bars: { label: string; used: number; limit: number }[] = [];
+  if (limits.cost_limit_daily && limits.cost_limit_daily > 0) {
+    bars.push({
+      label: "1D",
+      used: usage.cost_today ?? 0,
+      limit: limits.cost_limit_daily,
+    });
+  }
   if (limits.cost_limit_5h && limits.cost_limit_5h > 0) {
     bars.push({ label: "5h", used: usage.cost_5h, limit: limits.cost_limit_5h });
   }
@@ -2839,24 +3350,24 @@ function WindowCostBars({
   }
   if (bars.length === 0) return null;
   return (
-    <div className="mt-1.5 space-y-1">
+    <div className="mt-2 rounded-lg border border-border/60 bg-muted/20 p-2 space-y-1.5">
       {bars.map((bar) => {
         const pct = Math.min(100, Math.max(0, (bar.used / bar.limit) * 100));
         return (
-          <div key={bar.label} className="flex items-center gap-1.5">
-            <span className="w-6 text-[10px] font-medium text-muted-foreground">
+          <div key={bar.label} className="flex items-center justify-between gap-2 text-[10px]">
+            <span className="w-6 font-semibold font-mono text-muted-foreground">
               {bar.label}
             </span>
-            <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted shadow-inner">
               <div
                 className={cn(
-                  "h-full rounded-full transition-all",
+                  "h-full rounded-full transition-all duration-300",
                   usageToneClass(pct),
                 )}
                 style={{ width: `${pct}%` }}
               />
             </div>
-            <span className="text-[10px] tabular-nums text-muted-foreground">
+            <span className="font-mono tabular-nums font-semibold text-muted-foreground shrink-0">
               {formatUSD(bar.used)}/{formatUSD(bar.limit)}
             </span>
           </div>
@@ -3017,10 +3528,13 @@ function LimitsEditor({
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
     value.costLimit30d !== "" ||
+    value.costLimitDaily !== "" ||
     value.tokenLimit5h !== "" ||
     value.tokenLimit7d !== "" ||
     value.tokenLimit30d !== "" ||
+    value.tokenLimitDaily !== "" ||
     value.scopeLimits.length > 0 ||
+    value.modelRequestLimits.length > 0 ||
     value.imageGenerationPolicy !== "allow";
   const [open, setOpen] = useState(hasAny || !!expanded);
   const tokenUnitOptions = useMemo(
@@ -3088,6 +3602,7 @@ function LimitsEditor({
             <PlanMultiSelect
               value={value.planAllow}
               onChange={(planAllow) => patch({ planAllow })}
+              options={planOptionsForChannel(value.upstreamChannel)}
               allLabel={t("apiKeys.limits.planAllowAll")}
             />
             <p className="text-[10px] text-muted-foreground">
@@ -3157,11 +3672,22 @@ function LimitsEditor({
       </LimitSection>
 
       <LimitSection
+        icon={<CalendarClock className="size-3.5" />}
+        title={t("modelRequests.title")}
+        description={t("modelRequests.description")}
+      >
+        <APIKeyModelRequestLimitsEditor
+          value={value.modelRequestLimits}
+          onChange={(modelRequestLimits) => patch({ modelRequestLimits })}
+        />
+      </LimitSection>
+
+      <LimitSection
         icon={<CircleDollarSign className="size-3.5" />}
         title={t("apiKeys.limits.sectionCost")}
         description={t("apiKeys.limits.sectionCostDesc")}
       >
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <LimitNumberField
             label={t("apiKeys.limits.cost5h")}
             value={value.costLimit5h}
@@ -3183,7 +3709,17 @@ function LimitsEditor({
             suffix="$"
             step="0.01"
           />
+          <LimitNumberField
+            label={t("apiKeys.limits.costDaily")}
+            value={value.costLimitDaily}
+            onChange={(costLimitDaily) => patch({ costLimitDaily })}
+            suffix="$"
+            step="0.01"
+          />
         </div>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          {t("apiKeys.limits.dailyHint")}
+        </p>
       </LimitSection>
 
       <LimitSection
@@ -3215,6 +3751,14 @@ function LimitsEditor({
             unitOptions={tokenUnitOptions}
             onValueChange={(tokenLimit30d) => patch({ tokenLimit30d })}
             onUnitChange={(tokenLimit30dUnit) => patch({ tokenLimit30dUnit })}
+          />
+          <TokenLimitField
+            label={t("apiKeys.limits.tokensDaily")}
+            value={value.tokenLimitDaily}
+            unit={value.tokenLimitDailyUnit}
+            unitOptions={tokenUnitOptions}
+            onValueChange={(tokenLimitDaily) => patch({ tokenLimitDaily })}
+            onUnitChange={(tokenLimitDailyUnit) => patch({ tokenLimitDailyUnit })}
           />
         </div>
       </LimitSection>
@@ -3274,16 +3818,16 @@ function LimitSection({
   children: ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-border/80 bg-muted/15 p-3">
-      <div className="mb-3 flex items-start gap-2.5">
-        <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-background text-primary shadow-sm ring-1 ring-border/70">
+    <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3">
+      <div className="flex items-start gap-3 border-b border-border/50 pb-2.5">
+        <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary ring-1 ring-primary/20">
           {icon}
         </div>
         <div className="min-w-0">
-          <div className="text-xs font-semibold uppercase tracking-wide text-foreground">
+          <div className="text-xs font-bold uppercase tracking-wider text-foreground">
             {title}
           </div>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground/90">
             {description}
           </p>
         </div>
@@ -3361,8 +3905,9 @@ function APIKeysSkeleton() {
   );
 }
 
-// PLAN_FILTER_OPTIONS 与后端 cleanPlanAllow 的白名单保持一致(pro 与 prolite 相互独立)。
-const PLAN_FILTER_OPTIONS = [
+// 套餐选项与后端 cleanPlanAllow 白名单保持一致(pro 与 prolite 相互独立)。
+// Codex / Grok 分列，自动渠道再合并；切渠道时只保留当前渠道能调度的套餐。
+const CODEX_PLAN_FILTER_OPTIONS = [
   "free",
   "plus",
   "pro",
@@ -3372,14 +3917,73 @@ const PLAN_FILTER_OPTIONS = [
   "go",
 ] as const;
 
+const GROK_PLAN_FILTER_OPTIONS = [
+  "free",
+  "api",
+  "supergrok",
+  "x_basic",
+  "x_premium",
+  "x_premium_plus",
+  "supergrok_heavy",
+  "supergrok_lite",
+  "supergrok_plus",
+] as const;
+
+// Claude OAuth profiles expose these normalized plan keys. Keep them
+// separate from the Codex/Grok plan allowlist so a Claude-bound API key
+// cannot accidentally be configured with an unrelated plan.
+const CLAUDE_PLAN_FILTER_OPTIONS = [
+  "claude",
+  "free",
+  "pro",
+  "max",
+  "max-5x",
+  "max-20x",
+  "team",
+  "enterprise",
+  "business",
+] as const;
+
+const PLAN_FILTER_OPTIONS = [
+  ...CODEX_PLAN_FILTER_OPTIONS,
+  ...GROK_PLAN_FILTER_OPTIONS.filter(
+    (plan) => !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
+  ),
+  ...CLAUDE_PLAN_FILTER_OPTIONS.filter(
+    (plan) =>
+      !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan) &&
+      !(GROK_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
+  ),
+];
+
+function planOptionsForChannel(channel: UpstreamChannel): readonly string[] {
+  if (channel === "codex") return CODEX_PLAN_FILTER_OPTIONS;
+  if (channel === "grok") return GROK_PLAN_FILTER_OPTIONS;
+  if (channel === "claude") return CLAUDE_PLAN_FILTER_OPTIONS;
+  return PLAN_FILTER_OPTIONS;
+}
+
+function prunePlanAllow(
+  plans: string[],
+  channel: UpstreamChannel,
+): string[] {
+  if (channel === "auto") return plans;
+  const allowed = new Set(
+    planOptionsForChannel(channel).map((plan) => plan.toLowerCase()),
+  );
+  return plans.filter((plan) => allowed.has(plan.toLowerCase()));
+}
+
 // PlanMultiSelect 让 API Key 选择只调度哪些账号套餐。空表示不限套餐。
 function PlanMultiSelect({
   value,
   onChange,
+  options,
   allLabel,
 }: {
   value: string[];
   onChange: (value: string[]) => void;
+  options: readonly string[];
   allLabel: string;
 }) {
   return (
@@ -3396,7 +4000,7 @@ function PlanMultiSelect({
         >
           {allLabel}
         </button>
-        {PLAN_FILTER_OPTIONS.map((plan) => {
+        {options.map((plan) => {
           const active = value.includes(plan);
           return (
             <button

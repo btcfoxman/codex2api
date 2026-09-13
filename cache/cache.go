@@ -9,14 +9,63 @@ import (
 // PoolStats 统一的缓存连接池状态表示。
 // 对于内存缓存，这些值用于向管理后台暴露一致的观测接口。
 type PoolStats struct {
-	TotalConns uint32
-	IdleConns  uint32
-	StaleConns uint32
+	TotalConns      uint32
+	IdleConns       uint32
+	StaleConns      uint32
+	WaitCount       uint32
+	WaitDurationNs  int64
+	Timeouts        uint32
+	PendingRequests uint32
+}
+
+// InUse excludes idle connections. StaleConns is a cumulative removal counter,
+// not a subset of the current pool, and must not be subtracted here.
+func (s PoolStats) InUse() uint32 {
+	if s.IdleConns >= s.TotalConns {
+		return 0
+	}
+	return s.TotalConns - s.IdleConns
 }
 
 type SessionAffinityBinding struct {
 	AccountID int64  `json:"account_id"`
 	ProxyURL  string `json:"proxy_url,omitempty"`
+}
+
+// ResponseContextReadStatus classifies a bounded shared-backend lookup without
+// changing the TokenCache compatibility interface.
+type ResponseContextReadStatus uint8
+
+const (
+	ResponseContextReadMiss ResponseContextReadStatus = iota
+	ResponseContextReadFound
+	ResponseContextReadTooLarge
+	ResponseContextReadCorrupt
+)
+
+// ResponseContextReadResult is returned by optional bounded response-context
+// readers. Transport failures remain ordinary errors.
+type ResponseContextReadResult struct {
+	Status ResponseContextReadStatus
+	Items  []json.RawMessage
+}
+
+// BoundedResponseContextReader is an additive capability for shared backends.
+// Implementations may reject oversized wire values before deserialization.
+// TokenCache implementations that do not provide it remain supported through
+// GetResponseContext followed by a logical-size check in the proxy.
+type BoundedResponseContextReader interface {
+	GetResponseContextBounded(ctx context.Context, responseID string, maxWireBytes int64) (ResponseContextReadResult, error)
+}
+
+// RuntimeOwnerStore is an optional atomic ownership capability used by
+// cross-instance coordinators. Claim replaces the current owner and returns
+// the previous value; refresh and delete are compare-and-act operations so a
+// stale cleanup can never remove a newer owner.
+type RuntimeOwnerStore interface {
+	ClaimRuntimeOwner(ctx context.Context, namespace, key string, owner []byte, ttl time.Duration) ([]byte, error)
+	CompareAndRefreshRuntimeOwner(ctx context.Context, namespace, key string, expected []byte, ttl time.Duration) (bool, error)
+	CompareAndDeleteRuntimeOwner(ctx context.Context, namespace, key string, expected []byte) (bool, error)
 }
 
 // TokenCache 统一的 token 缓存、刷新锁与短期运行态缓存接口。

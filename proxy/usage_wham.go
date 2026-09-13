@@ -64,6 +64,10 @@ type WhamUsage struct {
 		SecondaryWindow *WhamUsageWindow `json:"secondary_window"`
 	} `json:"rate_limit"`
 
+	// AdditionalRateLimits 是独立于主 5h/7d 的额外窗口（例如 spark）。
+	AdditionalRateLimits    []WhamAdditionalRateLimit `json:"additional_rate_limits,omitempty"`
+	AdditionalRateLimitsAlt []WhamAdditionalRateLimit `json:"additionalRateLimits,omitempty"`
+
 	Credits *struct {
 		HasCredits          bool   `json:"has_credits"`
 		Unlimited           bool   `json:"unlimited"`
@@ -154,6 +158,181 @@ type WhamUsageWindow struct {
 	ResetAt            int64   `json:"reset_at"`
 }
 
+func (w *WhamUsageWindow) UnmarshalJSON(data []byte) error {
+	type windowAlias struct {
+		UsedPercent           flexibleFloat `json:"used_percent"`
+		UsedPercentAlt        flexibleFloat `json:"usedPercent"`
+		LimitWindowSeconds    flexibleInt64 `json:"limit_window_seconds"`
+		LimitWindowSecondsAlt flexibleInt64 `json:"limitWindowSeconds"`
+		ResetAfterSeconds     flexibleInt64 `json:"reset_after_seconds"`
+		ResetAfterSecondsAlt  flexibleInt64 `json:"resetAfterSeconds"`
+		ResetAt               flexibleInt64 `json:"reset_at"`
+		ResetAtAlt            flexibleInt64 `json:"resetAt"`
+	}
+	var raw windowAlias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	w.UsedPercent = raw.UsedPercent.or(raw.UsedPercentAlt)
+	w.LimitWindowSeconds = raw.LimitWindowSeconds.or(raw.LimitWindowSecondsAlt)
+	w.ResetAfterSeconds = raw.ResetAfterSeconds.or(raw.ResetAfterSecondsAlt)
+	w.ResetAt = raw.ResetAt.or(raw.ResetAtAlt)
+	return nil
+}
+
+type flexibleFloat float64
+
+func (f *flexibleFloat) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
+		*f = 0
+		return nil
+	}
+	var n float64
+	if err := json.Unmarshal(trimmed, &n); err == nil {
+		*f = flexibleFloat(n)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return err
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return err
+	}
+	*f = flexibleFloat(parsed)
+	return nil
+}
+
+func (f flexibleFloat) or(alt flexibleFloat) float64 {
+	if f != 0 {
+		return float64(f)
+	}
+	return float64(alt)
+}
+
+type flexibleInt64 int64
+
+func (n *flexibleInt64) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
+		*n = 0
+		return nil
+	}
+	var v int64
+	if err := json.Unmarshal(trimmed, &v); err == nil {
+		*n = flexibleInt64(v)
+		return nil
+	}
+	var f float64
+	if err := json.Unmarshal(trimmed, &f); err == nil {
+		*n = flexibleInt64(int64(f))
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return err
+	}
+	parsed, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return err
+	}
+	*n = flexibleInt64(parsed)
+	return nil
+}
+
+func (n flexibleInt64) or(alt flexibleInt64) int64 {
+	if n != 0 {
+		return int64(n)
+	}
+	return int64(alt)
+}
+
+// WhamRateLimitInfo 是 WHAM 里一段 primary/secondary 窗口。
+type WhamRateLimitInfo struct {
+	Allowed            bool             `json:"allowed"`
+	LimitReached       bool             `json:"limit_reached"`
+	LimitReachedAlt    bool             `json:"limitReached"`
+	PrimaryWindow      *WhamUsageWindow `json:"primary_window"`
+	PrimaryWindowAlt   *WhamUsageWindow `json:"primaryWindow"`
+	SecondaryWindow    *WhamUsageWindow `json:"secondary_window"`
+	SecondaryWindowAlt *WhamUsageWindow `json:"secondaryWindow"`
+}
+
+func (r *WhamRateLimitInfo) primaryWindow() *WhamUsageWindow {
+	if r == nil {
+		return nil
+	}
+	if r.PrimaryWindow != nil {
+		return r.PrimaryWindow
+	}
+	return r.PrimaryWindowAlt
+}
+
+// WhamAdditionalRateLimit 是 WHAM additional_rate_limits 里的一条独立额度。
+type WhamAdditionalRateLimit struct {
+	LimitName      string             `json:"limit_name,omitempty"`
+	LimitNameAlt   string             `json:"limitName,omitempty"`
+	MeteredFeature string             `json:"metered_feature,omitempty"`
+	MeteredAlt     string             `json:"meteredFeature,omitempty"`
+	RateLimit      *WhamRateLimitInfo `json:"rate_limit,omitempty"`
+	RateLimitAlt   *WhamRateLimitInfo `json:"rateLimit,omitempty"`
+}
+
+func (u *WhamUsage) additionalRateLimits() []WhamAdditionalRateLimit {
+	if u == nil {
+		return nil
+	}
+	if len(u.AdditionalRateLimits) > 0 {
+		return u.AdditionalRateLimits
+	}
+	return u.AdditionalRateLimitsAlt
+}
+
+func (l WhamAdditionalRateLimit) name() string {
+	for _, raw := range []string{l.LimitName, l.LimitNameAlt, l.MeteredFeature, l.MeteredAlt} {
+		if name := strings.TrimSpace(raw); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func (l WhamAdditionalRateLimit) primaryWindow() *WhamUsageWindow {
+	if window := l.RateLimit.primaryWindow(); window != nil {
+		return window
+	}
+	return l.RateLimitAlt.primaryWindow()
+}
+
+func isSparkWhamLimitName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return false
+	}
+	n = strings.NewReplacer("_", "-", " ", "-").Replace(n)
+	return n == "spark" || strings.HasPrefix(n, "spark-") || strings.HasSuffix(n, "-spark") || strings.Contains(n, "-spark-")
+}
+
+func pickSparkWhamWindow(limits []WhamAdditionalRateLimit) *WhamUsageWindow {
+	for i := range limits {
+		if !isSparkWhamLimitName(limits[i].name()) {
+			continue
+		}
+		window := limits[i].primaryWindow()
+		if !usableWhamWindow(window) {
+			continue
+		}
+		// 这次只认 spark 的 5h 条；周窗/月窗留给后续，避免误写入独立 5h 快照。
+		if window.LimitWindowSeconds == whamWindow7dSeconds || auth.IsMonthlyWindowSeconds(window.LimitWindowSeconds) {
+			continue
+		}
+		return window
+	}
+	return nil
+}
+
 // QueryWhamUsage 调用 /backend-api/wham/usage 获取账号当前用量。
 // 该调用不消耗任何 token 额度——比发送最小 /responses 请求更便宜。
 func QueryWhamUsage(ctx context.Context, account *auth.Account, proxyURL string) (*WhamUsage, *http.Response, error) {
@@ -195,7 +374,7 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
 	req.Header.Set("Originator", Originator)
 	// 用 EffectiveAccountID:自定义头覆盖了工作区 ID 时,额度必须查覆盖后的空间,
 	// 否则进度条/自动暂停/智能配速统计的是与实际流量不同的空间。
@@ -309,7 +488,7 @@ func queryWhamResetCreditsWithURL(ctx context.Context, account *auth.Account, pr
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
 	req.Header.Set("Originator", Originator)
 	// 与 wham 查询一致,重置券按自定义头覆盖后的空间查询。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
@@ -396,7 +575,7 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
 	req.Header.Set("Originator", Originator)
 	// 与 wham 查询一致,重置额度也作用于自定义头覆盖后的空间。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
@@ -469,12 +648,17 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 
 	// 记录 credits 积分余额快照（wham 的 credits 对象，零额度成本）。
 	if usage.Credits != nil {
-		account.SetCreditBalance(
+		// 走 store 落库版本：积分只有 wham 能刷，只留在内存的话重启后就归零。
+		store.PersistCreditBalance(
+			account,
 			usage.Credits.Balance,
 			usage.Credits.HasCredits,
 			usage.Credits.Unlimited,
 			usage.Credits.OverageLimitReached,
 		)
+		// 余额刚被充上（此前为 0 而账号已背着用量窗口判罚）时立刻放回调度，
+		// 不必等窗口重置。非本地用量判罚的冷却不受影响。
+		store.ReleaseUsageWindowCooldownForCredits(account)
 	}
 
 	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, observedAt)
@@ -540,6 +724,23 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		} else {
 			result.Premium5hRateLimited = true
 		}
+	}
+
+	// spark 是独立窗口：写入独立快照，绝不驱动账号级 5h 限流。
+	sparkWindow := pickSparkWhamWindow(usage.additionalRateLimits())
+	sparkFresh := usageApplied
+	if !hasAuthoritativeWindow && sparkWindow != nil {
+		sparkFresh = account.ApplyUsageObservation(observedAt, func() {})
+	}
+	if sparkWindow != nil && sparkFresh {
+		resetAt := whamWindowResetAt(sparkWindow, observedAt)
+		account.SetUsageSnapshotSparkAt(sparkWindow.UsedPercent, resetAt, observedAt)
+		if store != nil {
+			store.PersistUsageSnapshotSpark(account)
+			store.WakeBoundaryProbe(resetAt)
+		}
+	} else if hasAuthoritativeWindow && usageApplied {
+		store.ClearAbsentUsageSnapshotSparkAt(account, observedAt)
 	}
 
 	return result

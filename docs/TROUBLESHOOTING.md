@@ -8,6 +8,7 @@
 - [数据库问题](#数据库问题)
 - [账号池问题](#账号池问题)
 - [API 请求问题](#api-请求问题)
+  - [Responses 上下文连续请求](#症状-409-response_context_unavailable)
 - [性能问题](#性能问题)
 - [网络/代理问题](#网络代理问题)
 - [日志分析](#日志分析)
@@ -162,7 +163,7 @@ curl http://localhost:8080/health
 | cooldown | 触发限流/错误冷却 | 等待冷却结束或手动清理 |
 | banned | 401 未授权 | 检查账号是否被封禁 |
 
-如果刷新账号时报 `unsupported_country_region_territory` 或 `Country, region, or territory not supported`，通常是刷新请求没有从支持地区出口发出。请检查账号自身 `proxy_url`、代理池和全局 `ProxyURL`，内部刷新链路按 `账号 proxy_url > 账号 ID 粘性代理池 > 全局 ProxyURL > 直连` 生效。
+如果刷新账号时报 `unsupported_country_region_territory` 或 `Country, region, or territory not supported`，通常是刷新请求没有从支持地区出口发出。请检查账号自身 `proxy_url`、代理池和全局 `ProxyURL`。内部刷新链路按 `账号 proxy_url > 分组代理 > 账号 ID 粘性代理池 > 全局 ProxyURL` 生效；**开启代理池后不会直连**，绑定到已禁用托管代理的账号会拒绝刷新直到该代理重新启用。
 
 **批量刷新脚本:**
 
@@ -212,7 +213,7 @@ curl -s -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/accounts |
 # 1. 检查是否配置了 API Key
 curl -s -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/keys
 
-# 2. 如果没有配置，请求不需要认证
+# 2. 默认仍要求认证；只有未配置任何 Key 且显式开启 CODEX_ALLOW_ANONYMOUS=true 才允许普通公共接口匿名访问
 # 3. 如果配置了，确认请求头格式
 curl -H "Authorization: Bearer sk-your-key" http://localhost:8080/v1/models
 ```
@@ -271,6 +272,54 @@ curl -s -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/accounts |
 2. 清理冷却状态的账号
 3. 等待冷却结束
 
+### 症状: 409 response_context_unavailable
+
+该错误表示 `previous_response_id` 所需上下文已经确定无法在当前路径重建。常见原因包括 Memory 模式下单条上下文超过 L1 准入预算、依赖上下文已被条数/字节 LRU 淘汰、必需上下文普通缺失或已经过期，或 Redis 值损坏、超过重建上限。
+
+```bash
+# 查看当前预算、逻辑占用、淘汰和不可用计数
+curl -s -H "X-Admin-Key: your-secret" \
+  http://localhost:8080/api/admin/ops/overview |
+  jq '.response_cache | {
+    effective_config,
+    applied_config,
+    entries,
+    max_entries,
+    current_bytes,
+    max_bytes,
+    count_evictions,
+    byte_evictions,
+    oversize_bypasses,
+    oversize_rejections,
+    known_unavailable_errors,
+    last_config_sync_at,
+    last_config_sync_error
+  }'
+```
+
+**处理建议:**
+
+1. 不要对同一个已确定不可用的 `previous_response_id` 做无条件重试；重新发送完整必需上下文或开始新的响应链。
+2. Memory 模式重点查看 `oversize_rejections`、`count_evictions` 和 `byte_evictions`。可在设置页调整本地总量/单条准入，但总量不是 RSS 硬上限。
+3. Redis 模式重点查看 `last_config_sync_error`、Redis 健康状态和 `reconstruct_max_bytes`。共享值在重建上限内但超过 L1 准入时会计入 `oversize_bypasses`，仍能服务请求，不需要仅为该计数扩大 L1。
+
+### 症状: previous response context backend 返回 503
+
+当请求确实依赖上一响应的工具调用上下文，而共享 response-context 后端暂时不可用且没有可用 relay 后备时，会返回 HTTP 503、错误码 `service_unavailable`。
+
+```bash
+curl -s -H "X-Admin-Key: your-secret" \
+  http://localhost:8080/api/admin/ops/overview |
+  jq '{redis: .redis, response_cache: {
+    remote_hits: .response_cache.remote_hits,
+    remote_misses: .response_cache.remote_misses,
+    last_config_sync_at: .response_cache.last_config_sync_at,
+    last_config_sync_error: .response_cache.last_config_sync_error
+  }}'
+```
+
+先检查 Redis 网络、TLS、认证和连接池，再按退避策略重试。后端传输错误不会计入 `remote_misses`，因为它不是明确的缓存未命中。
+
 ---
 
 ## 性能问题
@@ -299,31 +348,108 @@ PgMaxConns: 100
 RedisPoolSize: 50
 ```
 
-2. **启用快速调度器**
+2. **切换索引调度器**
 ```bash
-FAST_SCHEDULER_ENABLED=true
+CODEX_SCHEDULER_ENGINE=indexed
 ```
 
 3. **优化代理配置**
 - 使用更近的代理节点
 - 启用代理池
 
+### 症状: RPM 不变，但账号越多 CPU 越高或直接满核
+
+先查看调度热路径，而不是只看总 RPM：
+
+```bash
+curl -s -H "X-Admin-Key: your-secret" \
+  http://localhost:8080/api/admin/ops/overview |
+  jq '.scheduler | {
+    engine,
+    selection_total,
+    selection_fast_hit,
+    selection_slow_hit,
+    slow_scanned_accounts,
+    waiters,
+    wait_wakeups,
+    routing_cache_entries,
+    routing_cache_accounts,
+    shadow_checks,
+    shadow_mismatches,
+    outbox_backlog,
+    outbox_lag_ms,
+    outbox_errors
+  }'
+```
+
+判断方法：
+
+- `engine=legacy` 且 `slow_scanned_accounts` 随请求快速增长，说明 CPU 主要消耗在每次选号的 O(N) 全池过滤/评分。
+- `engine=indexed` 时 `selection_slow_hit` 或 `slow_scanned_accounts` 仍增长，检查是否启用了 lazy fallback，或是否存在尚未迁移的调用路径。
+- `routing_cache_entries=0` 不一定异常；只有候选比例不超过全池约 1/4 的稀疏 API Key 才建立子池，密集规则复用全局索引。
+- `outbox_backlog` 持续增长、`outbox_lag_ms > 5000` 或错误数增加，说明跨实例内存投影落后，应先检查数据库连接、触发器和实例日志。
+- `waiters` 高但 `wait_wakeups` 不增长，检查是否所有账号都被永久禁用；正常的并发释放或冷却恢复应产生事件唤醒。
+
+生产切换建议先在管理后台设为 `shadow`，观察一段真实流量下 `shadow_mismatches` 是否保持为 0 或能由瞬时并发竞争解释，再切到 `indexed`。如出现选号异常，可立即切回 `legacy`；数据库 outbox 和维护任务表可以保留，不需要回滚 schema。环境变量 `CODEX_SCHEDULER_ENGINE` 的优先级高于管理后台，若页面切换不生效，请先检查容器环境。
+
+### 调度 outbox 的版本要求与回滚
+
+- **PostgreSQL 最低版本为 11**：outbox 触发器使用 `CREATE TRIGGER ... EXECUTE FUNCTION` 语法（PG 10 及更早只认 `EXECUTE PROCEDURE`），且 `accounts` 表新增的 `credential_generation NOT NULL DEFAULT` 列在 PG 11+ 才是元数据级变更。自管 PG ≤ 10 的部署升级前需先升级数据库。官方 compose 使用的 PostgreSQL 版本不受影响。
+- **回滚到旧版本二进制**：触发器会留在数据库里继续向 `scheduler_outbox` 写事件，而旧版本没有消费者和清理任务，表会持续增长。短期回滚可以不处理（重新升级后自动消费并清理，也可直接 `TRUNCATE scheduler_outbox`）；长期回滚请执行以下清理（PostgreSQL）：
+
+```sql
+DROP TRIGGER IF EXISTS scheduler_outbox_accounts_insert ON accounts;
+DROP TRIGGER IF EXISTS scheduler_outbox_accounts_update ON accounts;
+DROP TRIGGER IF EXISTS scheduler_outbox_accounts_delete ON accounts;
+DROP TRIGGER IF EXISTS scheduler_outbox_api_keys_insert ON api_keys;
+DROP TRIGGER IF EXISTS scheduler_outbox_api_keys_update ON api_keys;
+DROP TRIGGER IF EXISTS scheduler_outbox_api_keys_delete ON api_keys;
+DROP TRIGGER IF EXISTS scheduler_outbox_groups_insert ON account_groups;
+DROP TRIGGER IF EXISTS scheduler_outbox_groups_update ON account_groups;
+DROP TRIGGER IF EXISTS scheduler_outbox_groups_delete ON account_groups;
+DROP TRIGGER IF EXISTS scheduler_outbox_members_insert ON account_group_members;
+DROP TRIGGER IF EXISTS scheduler_outbox_members_delete ON account_group_members;
+DROP TRIGGER IF EXISTS scheduler_outbox_cooldowns_insert ON account_model_cooldowns;
+DROP TRIGGER IF EXISTS scheduler_outbox_cooldowns_update ON account_model_cooldowns;
+DROP TRIGGER IF EXISTS scheduler_outbox_cooldowns_delete ON account_model_cooldowns;
+DROP TRIGGER IF EXISTS scheduler_outbox_proxies_insert ON proxies;
+DROP TRIGGER IF EXISTS scheduler_outbox_proxies_update ON proxies;
+DROP TRIGGER IF EXISTS scheduler_outbox_proxies_delete ON proxies;
+DROP TRIGGER IF EXISTS scheduler_outbox_settings_update ON system_settings;
+DROP TRIGGER IF EXISTS grok_maintenance_accounts_insert ON accounts;
+DROP TRIGGER IF EXISTS grok_maintenance_accounts_update ON accounts;
+DROP TRIGGER IF EXISTS grok_maintenance_accounts_delete ON accounts;
+DROP FUNCTION IF EXISTS codex2api_scheduler_outbox_row();
+DROP FUNCTION IF EXISTS codex2api_grok_maintenance_account();
+DROP TABLE IF EXISTS scheduler_outbox;
+DROP TABLE IF EXISTS maintenance_jobs;
+```
+
+SQLite 部署执行对应的 `DROP TRIGGER IF EXISTS <同名触发器>;` 与 `DROP TABLE IF EXISTS scheduler_outbox; DROP TABLE IF EXISTS maintenance_jobs;` 即可。
+
 ### 症状: 内存占用高
 
 **排查:**
 
 ```bash
-# 查看内存使用
+# 查看容器内存
 docker stats codex2api --no-stream
+
+# 对照进程 RSS、Go heap/GC 和 response-context 逻辑字节
+curl -s -H "X-Admin-Key: your-secret" \
+  http://localhost:8080/api/admin/ops/overview |
+  jq '{memory: .memory, response_cache: .response_cache}'
 
 # 查看 Go 内存分析（如启用 pprof）
 curl http://localhost:8080/debug/pprof/heap > heap.prof
 ```
 
+`response_cache.current_bytes`、`high_water_bytes` 和 `largest_entry_bytes` 是 JSON payload 的逻辑字节，不包含 Go 对象、切片、LRU、allocator 或容器开销，不能与 RSS 直接相加，也不能作为进程内存硬上限。Linux/Docker 的 `memory.process_bytes` 是进程 RSS；非 Linux 回退为 Go `Sys`。结合 `heap_alloc_bytes`、`heap_inuse_bytes`、`heap_released_bytes` 和 `num_gc` 判断堆增长与回收情况。
+
 **优化:**
 
 1. 限制日志保留时间
-2. 调整缓存过期时间
+2. 如果 L1 逻辑占用和高水位持续接近上限，可在设置页降低 `response_cache_local_max_bytes`；降低后会立即淘汰超出新预算的条目，并可能增加 Memory 模式的 409
 3. 减少并发连接数
 
 ---
@@ -493,7 +619,7 @@ echo "Redis: $cache_status"
 echo ""
 
 echo "[5/6] 系统资源..."
-curl -sf -H "X-Admin-Key: $ADMIN_KEY" "$BASE_URL/api/admin/ops/overview" 2>/dev/null | jq '{cpu: .cpu, memory: .memory}'
+curl -sf -H "X-Admin-Key: $ADMIN_KEY" "$BASE_URL/api/admin/ops/overview" 2>/dev/null | jq '{cpu: .cpu, memory: .memory, response_cache: .response_cache}'
 echo ""
 
 echo "[6/6] 最近错误..."
@@ -547,3 +673,17 @@ curl -X POST -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/accou
   -H "Content-Type: application/json" \
   -d '{"ids": [1, 2, 3], "concurrency": 3}'
 ```
+
+### Codex Token 刷新与授权失效
+
+普通模式默认每 2 分钟巡检一次，在 Access Token 剩余有效期不足 5 分钟时使用 Refresh Token 续期。额度冷却中的 Codex 账号仍会续期，但续期不会解除 5h/7d 冷却，也不会发送生成请求。禁用、人工暂停和明确授权失效的账号不会被此机制强行恢复。
+
+惰性模式默认不主动续期。在「设置 → Codex → 探针调度」开启「惰性模式下保持 Codex 授权」，可以单独保留 Codex 凭据续期，仍不启用真实 responses 探针。账号详情显示最近 Token 续期时间及续期失败提示。上游返回的 `expires_in` 是 AT 有效期，不能当作 RT 的固定有效期。
+
+刷新会先登记持久化保护记录，再交换 Token，并在同一数据库事务中更新使用同一 RT 的工作区凭据。只有保存成功后才发布到内存与缓存；短暂写库故障只重试保存，不重新消费 RT。开始交换后，关闭管理页面不会取消关键步骤。
+
+- `refresh_token_expired` / `refresh_token_revoked` / `refresh_token_invalidated`：授权已失效，需要重新登录并导入最新凭据；这不等同于账号被封禁。
+- `refresh_token_reused`：先检查是否有其他实例或客户端轮换了同一份凭据。项目内并发刷新会读取并复用已保存的新凭据；外部程序之间不会自动同步。
+- 「上一次 Token 刷新结果未确认」或「新 Token 保存失败」：上游可能已消费旧 RT，但本地未能确认保存完成。保护记录会跨重启保留，不会因锁超时或重置账号状态而允许再次消费旧 RT。请重新授权后导入新凭据，不要删除保护记录来强制重试。
+
+上游 OAuth 与本地数据库不能组成一个事务；进程崩溃或网络中断发生在交换与保存之间时，仍可能需要人工重新授权。多实例升级时应统一升级后再启用刷新，旧版本不识别新的持久化保护记录。

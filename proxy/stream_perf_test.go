@@ -60,7 +60,7 @@ func TestStreamTranslatorTranslateParsedMatchesTranslate(t *testing.T) {
 }
 
 func TestUpstreamErrorConsoleBodyTruncatesLargePayload(t *testing.T) {
-	body := []byte(strings.Repeat("x", consoleUpstreamErrorLogMaxBytes+128))
+	body := []byte(`{"error":{"message":"` + strings.Repeat("x", consoleUpstreamErrorLogMaxBytes+128) + `"}}`)
 	got := upstreamErrorConsoleBody(body)
 	if !strings.Contains(got, "[truncated]") {
 		t.Fatalf("expected truncation marker, got %q", got)
@@ -71,13 +71,25 @@ func TestUpstreamErrorConsoleBodyTruncatesLargePayload(t *testing.T) {
 }
 
 func TestUpstreamErrorFileLogBodyTruncatesLargePayload(t *testing.T) {
-	body := []byte(strings.Repeat("x", upstreamErrorLogBodyMaxBytes+128))
+	body := []byte(`{"error":{"message":"` + strings.Repeat("x", upstreamErrorLogBodyMaxBytes+128) + `"}}`)
 	got := upstreamErrorLogBody(body)
 	if !strings.Contains(got, "[truncated]") {
 		t.Fatalf("expected truncation marker, got %q", got)
 	}
 	if len(got) > 5000+len(" ... [truncated]") {
 		t.Fatalf("truncated file log body too large: %d", len(got))
+	}
+}
+
+func TestUpstreamErrorLogsOmitUnstructuredBodies(t *testing.T) {
+	body := []byte("<html>private upstream diagnostics</html>")
+	for name, got := range map[string]string{
+		"console": upstreamErrorConsoleBody(body),
+		"file":    upstreamErrorLogBody(body),
+	} {
+		if strings.Contains(got, "private upstream diagnostics") || !strings.Contains(got, "omitted") {
+			t.Fatalf("%s log body = %q", name, got)
+		}
 	}
 }
 
@@ -194,6 +206,24 @@ func BenchmarkStreamFlushWriterWriteSSEData(b *testing.B) {
 		var buf bytes.Buffer
 		writer := &streamFlushWriter{writer: &buf}
 		if err := writer.WriteSSEData(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReadSSEStream(b *testing.B) {
+	var input bytes.Buffer
+	for i := 0; i < 1024; i++ {
+		input.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+	}
+	input.WriteString("data: [DONE]\n\n")
+	payload := input.Bytes()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ReadSSEStream(bytes.NewReader(payload), func([]byte) bool { return true }); err != nil {
 			b.Fatal(err)
 		}
 	}

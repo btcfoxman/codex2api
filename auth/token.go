@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -90,17 +91,21 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("刷新请求失败: %w", err)
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" {
+			return nil, nil, fmt.Errorf("刷新连接失败: %w", err)
+		}
+		return nil, nil, &oauthRefreshUncertainError{fmt.Errorf("刷新请求结果未知: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取响应失败: %w", err)
+		return nil, nil, &oauthRefreshUncertainError{fmt.Errorf("读取刷新响应失败: %w", err)}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("刷新失败 (status %d): %s", resp.StatusCode, string(body))
+		return nil, nil, newOAuthRefreshHTTPError(resp.StatusCode, body, refreshToken)
 	}
 
 	var tokenResp struct {
@@ -110,13 +115,13 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 		ExpiresIn    int64  `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, nil, fmt.Errorf("解析响应失败: %w", err)
+		return nil, nil, &oauthRefreshUncertainError{fmt.Errorf("解析刷新响应失败: %w", err)}
 	}
 	tokenResp.AccessToken = strings.TrimSpace(tokenResp.AccessToken)
 	tokenResp.RefreshToken = strings.TrimSpace(tokenResp.RefreshToken)
 	tokenResp.IDToken = strings.TrimSpace(tokenResp.IDToken)
 	if tokenResp.AccessToken == "" {
-		return nil, nil, fmt.Errorf("刷新响应缺少 access_token")
+		return nil, nil, &oauthRefreshUncertainError{fmt.Errorf("刷新响应缺少 access_token")}
 	}
 	if tokenResp.ExpiresIn <= 0 {
 		tokenResp.ExpiresIn = 3600
@@ -181,7 +186,7 @@ func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string,
 		}
 
 		// 不可重试错误直接返回
-		if isNonRetryable(err) {
+		if isNonRetryable(err) || isOAuthRefreshUncertain(err) {
 			return nil, nil, err
 		}
 		lastErr = err
@@ -315,13 +320,83 @@ func parseSessionExpiresAt(raw string) time.Time {
 	return time.Time{}
 }
 
+// IsPermanentRefreshFailure 判断 RT/session 刷新是否已经不可恢复。
+// 这类错误再试也换不出 AT，账号应标未授权，不能停在「刷新中」。
+func IsPermanentRefreshFailure(err error) bool {
+	return isNonRetryable(err)
+}
+
+type permanentRefreshFailureClassifier interface {
+	PermanentRefreshFailure() bool
+}
+
+type oauthRefreshUncertainError struct{ err error }
+
+func (e *oauthRefreshUncertainError) Error() string { return e.err.Error() }
+func (e *oauthRefreshUncertainError) Unwrap() error { return e.err }
+
+func isOAuthRefreshUncertain(err error) bool {
+	var uncertain *oauthRefreshUncertainError
+	return errors.As(err, &uncertain)
+}
+
+type oauthRefreshHTTPError struct {
+	status int
+	code   string
+	body   string
+}
+
+func newOAuthRefreshHTTPError(status int, body []byte, rt string) error {
+	var payload struct {
+		Error json.RawMessage `json:"error"`
+	}
+	var code string
+	if json.Unmarshal(body, &payload) == nil {
+		if json.Unmarshal(payload.Error, &code) != nil {
+			var detail struct {
+				Code string `json:"code"`
+			}
+			if json.Unmarshal(payload.Error, &detail) == nil {
+				code = detail.Code
+			}
+		}
+	}
+	return &oauthRefreshHTTPError{status: status, code: strings.ToLower(strings.TrimSpace(code)), body: strings.ReplaceAll(string(body), rt, "[REDACTED]")}
+}
+
+func (e *oauthRefreshHTTPError) Error() string {
+	return fmt.Sprintf("刷新失败 (status %d): %s", e.status, e.body)
+}
+func (e *oauthRefreshHTTPError) PermanentRefreshFailure() bool {
+	if e.code != "" {
+		return permanentOAuthRefreshCode(e.code)
+	}
+	return isNonRetryable(errors.New(e.body))
+}
+
+func permanentOAuthRefreshCode(code string) bool {
+	switch code {
+	case "invalid_grant", "invalid_client", "unauthorized_client", "access_denied", "refresh_token_reused", "refresh_token_invalidated", "refresh_token_expired", "refresh_token_revoked", "token_invalidated":
+		return true
+	}
+	return false
+}
+
 // isNonRetryable 判断是否不可重试的认证错误
 func isNonRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
+	var classified permanentRefreshFailureClassifier
+	if errors.As(err, &classified) {
+		return classified.PermanentRefreshFailure()
+	}
 	msg := strings.ToLower(err.Error())
-	for _, needle := range []string{"invalid_grant", "invalid_client", "unauthorized_client", "access_denied", "refresh_token_reused"} {
+	for _, needle := range []string{
+		"invalid_grant", "invalid_client", "unauthorized_client", "access_denied",
+		"refresh_token_reused", "refresh_token_invalidated", "refresh_token_expired", "refresh_token_revoked", "token_invalidated",
+		"session has ended",
+	} {
 		if strings.Contains(msg, needle) {
 			return true
 		}
@@ -517,10 +592,27 @@ func evictExpiredAuthClients() {
 
 // buildHTTPClient 构建支持代理的 HTTP 客户端（连接池复用，带 TTL 清理）
 func buildHTTPClient(proxyURL string) *http.Client {
+	client, _ := buildHTTPClientChecked(proxyURL, false)
+	return client
+}
+
+// buildHTTPClientChecked constructs a pooled auth client. When strict is true,
+// an invalid proxy configuration is returned to the caller instead of silently
+// falling back to a direct connection. Existing callers retain the historical
+// best-effort behavior through buildHTTPClient.
+func buildHTTPClientChecked(proxyURL string, strict bool) (*http.Client, error) {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if strict && proxyURL != "" {
+		probe := &http.Transport{}
+		if err := ConfigureTransportProxy(probe, proxyURL, &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}); err != nil {
+			return nil, fmt.Errorf("configure proxy: %w", err)
+		}
+		probe.CloseIdleConnections()
+	}
 	if v, ok := authClientPool.Load(proxyURL); ok {
 		entry := v.(*authPoolEntry)
 		entry.touch()
-		return entry.client
+		return entry.client, nil
 	}
 
 	transport := &http.Transport{
@@ -534,6 +626,9 @@ func buildHTTPClient(proxyURL string) *http.Client {
 	transport.DialContext = baseDialer.DialContext
 	if proxyURL != "" {
 		if err := ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
+			if strict {
+				return nil, fmt.Errorf("configure proxy: %w", err)
+			}
 			transport.Proxy = nil
 			transport.DialContext = baseDialer.DialContext
 		}
@@ -550,14 +645,20 @@ func buildHTTPClient(proxyURL string) *http.Client {
 	if v, loaded := authClientPool.LoadOrStore(proxyURL, entry); loaded {
 		e := v.(*authPoolEntry)
 		e.touch()
-		return e.client
+		return e.client, nil
 	}
-	return client
+	return client, nil
 }
 
 // BuildHTTPClient builds a proxy-aware HTTP client (exported for admin OAuth flow).
 func BuildHTTPClient(proxyURL string) *http.Client {
 	return buildHTTPClient(proxyURL)
+}
+
+// BuildHTTPClientChecked is the strict variant used by protocol adapters that
+// must never silently bypass a configured account proxy.
+func BuildHTTPClientChecked(proxyURL string) (*http.Client, error) {
+	return buildHTTPClientChecked(proxyURL, true)
 }
 
 // ParseIDToken parses a JWT id_token payload (exported for admin OAuth flow).

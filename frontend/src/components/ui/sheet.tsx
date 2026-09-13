@@ -7,6 +7,14 @@ import { Dialog as DialogPrimitive } from "radix-ui"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 
+// Portaled dropdowns (select / group picker / proxy pool) close themselves on
+// Escape from a bubble-phase document listener, but Radix dismisses the layer in
+// the capture phase first. While one is open, keep the modal and let the
+// dropdown consume the key.
+function hasOpenPortalDropdown() {
+  return typeof document !== "undefined" && document.querySelector('[data-select-dropdown="true"]') !== null
+}
+
 function isInteractivePortalTarget(target: EventTarget | null) {
   return (
     target instanceof Element &&
@@ -57,6 +65,7 @@ function SheetContent({
   children,
   side = "right",
   showCloseButton = true,
+  onEscapeKeyDown,
   onInteractOutside,
   onPointerDownOutside,
   onFocusOutside,
@@ -73,14 +82,20 @@ function SheetContent({
         className={cn(
           // Floating inset panel: breathing room from viewport edges
           // instead of full-bleed against browser chrome.
-          "fixed z-50 flex h-auto w-[min(calc(100%-1.5rem),440px)] max-w-[min(calc(100%-1.5rem),440px)] flex-col gap-0 overflow-hidden rounded-2xl border bg-background shadow-2xl outline-none duration-200 data-[state=closed]:animate-out data-[state=open]:animate-in sm:w-[min(calc(100%-2rem),440px)] sm:max-w-[min(calc(100%-2rem),440px)]",
+          "fixed z-50 flex h-auto w-[min(calc(100%-1.5rem),440px)] max-w-[min(calc(100%-1.5rem),440px)] flex-col gap-0 overflow-hidden rounded-2xl border bg-background shadow-2xl outline-none transition-all duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] data-[state=closed]:animate-out data-[state=open]:animate-in sm:w-[min(calc(100%-2rem),440px)] sm:max-w-[min(calc(100%-2rem),440px)]",
           "top-[max(0.75rem,env(safe-area-inset-top))] bottom-[max(0.75rem,env(safe-area-inset-bottom))] max-h-[calc(100dvh-1.5rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] sm:top-[max(1rem,env(safe-area-inset-top))] sm:bottom-[max(1rem,env(safe-area-inset-bottom))] sm:max-h-[calc(100dvh-2rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))]",
           side === "right" &&
-            "right-[max(0.75rem,env(safe-area-inset-right))] sm:right-[max(1rem,env(safe-area-inset-right))] data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right",
+            "right-[max(0.75rem,env(safe-area-inset-right))] sm:right-[max(1rem,env(safe-area-inset-right))] data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0",
           side === "left" &&
-            "left-[max(0.75rem,env(safe-area-inset-left))] sm:left-[max(1rem,env(safe-area-inset-left))] data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left",
+            "left-[max(0.75rem,env(safe-area-inset-left))] sm:left-[max(1rem,env(safe-area-inset-left))] data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0",
           className,
         )}
+        onEscapeKeyDown={(event) => {
+          onEscapeKeyDown?.(event)
+          if (hasOpenPortalDropdown()) {
+            event.preventDefault()
+          }
+        }}
         onInteractOutside={(event) => {
           onInteractOutside?.(event)
           if (isInteractivePortalTarget(event.target)) {

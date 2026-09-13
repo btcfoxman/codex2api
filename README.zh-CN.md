@@ -69,39 +69,7 @@
 
 ---
 
-## 赞助商
 
-> 想出现在这里？请到 GitHub 提交 Issue 联系。
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://www.fastaitoken.com/register"><img src="assets/fastaitoken-logo.jpg" width="90" alt="FastAIToken"></a></td>
-<td valign="middle"><b><a href="https://www.fastaitoken.com/register">FastAIToken</a></b> 是面向开发者的 AI API 聚合平台，支持 OpenAI、Claude、Gemini 等主流大模型，兼容 OpenAI API 协议，可无缝接入 Claude Code、Codex、Gemini CLI、Cherry Studio、Cline、Continue 等开发工具。采用充值 1:1（1 元 = 1 美元 API 额度），分组覆盖 0.02× OpenAI 福利（限时）到 1.2× Claude Max，并提供公开状态页与 7×24 小时真人技术支持。支持企业开票，提供 99% SLA 企业级稳定号池。</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
-<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> 提供高性价比 AI 模型 API 接入服务，支持 OpenAI、Claude、Gemini 等主流模型。充值比例仅 0.2 元 = 1 美元额度，调用成本低至官方价格 1 折以内。套餐 ¥25/28 天起，其中尊享套餐 ¥129/28 天，包含约 $4752 模型额度（套餐仅支持 OpenAI 模型），支持高并发请求及 95%+ SLA 稳定保障。</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
-<td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex/Claude Code，价格大约是官方的 1 折不到！通过链接注册，使用优惠码 <code>CODEX2API</code> 即可获得 3$ 测试额度。</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://ai.centos.hk"><b>星辰·AI</b></a></td>
-<td valign="middle"><b><a href="https://ai.centos.hk">星辰·AI</a></b> 提供稳定、高速的 Claude Code / Codex / Gemini 中转服务，面向个人开发者与团队均适用。</td>
-</tr>
-</table>
-
----
 
 ## 目录
 
@@ -246,11 +214,17 @@ docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
 
 ---
 
+## Antigravity 渠道（API Key 路径为实验性）
+
+Antigravity 作为独立 Google 渠道管理，支持浏览器/导入 OAuth 凭据以及 Google API Key 账号。管理端提供含密钥的 JSON/ZIP 凭据导出、脱敏状态读取、显式控制面同步与有界能力探测。OAuth 请求使用 Cloud Code `v1internal` 适配器。API Key 请求指向 Generative Language `v1beta/interactions`，但普通调度默认关闭，只有显式设置 `ANTIGRAVITY_ENABLE_EXPERIMENTAL_INTERACTIONS=true` 才会放行。当前环境尚未成功运行真实上游集成测试，因此 API Key 路径仍为实验性，不能宣称已具备生产可用性。运行方法、安全风险与认证清单见 [docs/ANTIGRAVITY.md](docs/ANTIGRAVITY.md)。
+
 ## 完整文档
 
 | 文档 | 说明 | 路径 |
 |------|------|------|
 | [API 文档](docs/API.md) | 所有 API 端点、请求/响应示例、错误码说明 | `docs/API.md` |
+| [使用指南](docs/USAGE.md) | 客户端接入、SDK 示例、媒体任务与常见错误排查 | `docs/USAGE.md` |
+| [Antigravity 接入](docs/ANTIGRAVITY.md) | Google OAuth、实验性 API Key 渠道、模型、风险与协议验证状态 | `docs/ANTIGRAVITY.md` |
 | [部署文档](docs/DEPLOYMENT.md) | 各种部署模式、升级指南、备份恢复 | `docs/DEPLOYMENT.md` |
 | [配置文档](docs/CONFIGURATION.md) | 环境变量、系统设置、配置优先级 | `docs/CONFIGURATION.md` |
 | [架构文档](docs/ARCHITECTURE.md) | 系统架构、调度算法、存储设计 | `docs/ARCHITECTURE.md` |
@@ -342,6 +316,22 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 首次启动时程序会自动写入默认设置。
 
+#### Responses 上下文缓存
+
+使用 `previous_response_id` 并在本地重建的 HTTP Responses 连续请求由每个进程内的有界 L1 缓存保护。默认保存 64 MiB 逻辑 JSON payload，单条 L1 准入上限为 8 MiB，最多 2,000 条，绝对 TTL 为 10 分钟，每条最多保留 200 个 raw item。
+
+设置页提供三个持久化的整数 MiB 预算：
+
+| 预算 | 默认值 | 可选范围 |
+| --- | --- | --- |
+| 本地 L1 总量 | 64 MiB | 8-4096 MiB |
+| 本地 L1 单条准入 | 8 MiB | 1-256 MiB，且不能超过总量 |
+| 后端重建 | 64 MiB | 8-512 MiB |
+
+Redis 模式下，共享上下文只要没有超过重建上限，即使大于 L1 准入预算也能直接服务本次请求，但不会提升到本地缓存。Memory 模式没有共享 response context 后备；依赖上下文被判定为超限或已淘汰时，连续请求可能返回 HTTP `409 response_context_unavailable`。共享后端暂时故障且没有可保留 `previous_response_id` 的 relay 后备账号时，依赖上下文的连续请求可能返回 HTTP `503`。
+
+每次成功修改预算都会生成只读 generation，各实例每 5 秒轮询一次并应用更新。运维页展示 effective/applied generation、同步状态、缓存逻辑字节与计数器、进程内存、Go heap 和 GC 次数。缓存逻辑字节不包含 Go/容器开销，也不是 RSS 或进程内存硬上限。滚动升级期间，新前端会兼容尚未返回这些设置或运维字段的旧后端。
+
 ### API Key 与管理密钥
 
 - **对外 API Key**：以数据库中的 API Keys 为准。如果没有配置任何 Key，则 `/v1/*` 跳过鉴权。
@@ -354,14 +344,14 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 ## 对外接口
 
-| 接口 | 说明 |
-| --- | --- |
-| `POST /v1/chat/completions` | Chat Completions 风格入口 |
-| `POST /v1/responses` | Responses 风格入口 |
-| `POST /v1/images/generations` | OpenAI Images 生成入口 |
-| `POST /v1/images/edits` | OpenAI Images 编辑入口 |
-| `GET /v1/models` | 返回可用模型列表（含 gpt-5.5、gpt-5.4、gpt-5.4-mini、gpt-5.3-codex、gpt-image-2 等） |
-| `GET /health` | 健康检查 |
+| 接口                          | 说明                                                                                                     |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `POST /v1/chat/completions`   | Chat Completions 风格入口                                                                                |
+| `POST /v1/responses`          | Responses 风格入口                                                                                       |
+| `POST /v1/images/generations` | OpenAI Images 生成入口                                                                                   |
+| `POST /v1/images/edits`       | OpenAI Images 编辑入口                                                                                   |
+| `GET /v1/models`              | 返回可用模型列表（含 gpt-6-astra、gpt-5.6-sol/terra/luna、gpt-5.5、gpt-5.3-codex-spark、gpt-image-2 等） |
+| `GET /health`                 | 健康检查                                                                                                 |
 
 > **计费提示**：gpt-5.5 标准 tier 计费为 $5.00/M 输入 / $30.00/M 输出，priority tier 为 $12.50/M 输入 / $75.00/M 输出。其他模型按 billing 引擎规则计费。
 
@@ -464,9 +454,9 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | 生图门户（非管理） | `/image-studio` | 用 API Key 登录的独立生图页，不进入管理后台；可在 API 密钥页开关 |
 | Prompt 检查 | `/admin/prompt-filter/overview` | Prompt 规则、触发日志、测试和处理模式配置 |
 | 使用统计 | `/admin/usage` | 请求日志、统计卡片、图表、日志清空 |
-| 运维概览 | `/admin/ops` | 运行态监控与系统概览 |
+| 运维概览 | `/admin/ops` | 运行态概览、上下文缓存逻辑指标、进程内存、Go heap 与 GC |
 | 调度看板 | `/admin/ops/scheduler` | 调度健康度、惩罚项和评分拆解 |
-| 系统设置 | `/admin/settings` | 业务运行参数与后台密钥配置 |
+| 系统设置 | `/admin/settings` | 业务运行参数、Responses 上下文缓存预算与后台密钥配置 |
 | 使用文档 | `/admin/docs` | Codex CLI / Claude Code 接入示例 |
 | API 文档 | `/admin/api-reference` | OpenAI 风格接口与管理接口参考 |
 
@@ -555,6 +545,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | --- | --- |
 | `round_robin`（默认） | 按健康层级轮询可用账号，权重按调度分排序 |
 | `remaining_quota` | 优先使用用量较低的账号；用量相同时轮询 |
+| `fill_first` | 持续集中使用剩余额度最少的账号，耗尽或限流后再切换到下一个（A → B → C） |
 
 **信用账号**（单账号标记）：
 
@@ -591,8 +582,8 @@ codex2api/
    └─ vite.config.js            # Vite 配置
 ```
 
----
 
+---
 
 ## 常见注意事项
 
@@ -623,11 +614,13 @@ codex2api/
 
 ## Star History
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
-  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-</picture>
+<a href="https://star-history.dera.page/#james-6-23/codex2api&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+  </picture>
+</a>
 
 ---
 

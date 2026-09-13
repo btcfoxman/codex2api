@@ -53,7 +53,7 @@ func TestGetModelPricingUsesSub2APIClaudeFamilies(t *testing.T) {
 		{model: "claude-opus-4-7-20260401", wantInput: 5.0, wantOutput: 25.0},
 		{model: "claude-opus-4-20250514", wantInput: 15.0, wantOutput: 75.0},
 		{model: "claude-sonnet-4-5-20250929", wantInput: 3.0, wantOutput: 15.0},
-		{model: "claude-3-5-haiku-20241022", wantInput: 1.0, wantOutput: 5.0},
+		{model: "claude-3-5-haiku-20241022", wantInput: 0.8, wantOutput: 4.0},
 		{model: "claude-unknown-model", wantInput: 3.0, wantOutput: 15.0},
 	}
 
@@ -177,7 +177,7 @@ func TestGPT55PricingDoesNotMatchGPT54(t *testing.T) {
 }
 
 // gpt-5.6 三个变体官方定价各不相同（developers.openai.com/api/docs/pricing）：
-// sol $5/$30、terra $2.5/$15、luna $1/$6（standard）；priority 均为 2× standard。
+// sol $5/$30、terra $2/$12、luna $0.20/$1.20（standard）；priority 均为 2× standard。
 func TestGPT56VariantPricing(t *testing.T) {
 	cases := []struct {
 		model                   string
@@ -185,9 +185,14 @@ func TestGPT56VariantPricing(t *testing.T) {
 		priorityIn, priorityOut float64
 	}{
 		{"gpt-5.6-sol", 5.0, 30.0, 0.5, 10.0, 60.0},
-		{"gpt-5.6-terra", 2.5, 15.0, 0.25, 5.0, 30.0},
-		{"gpt-5.6-luna", 1.0, 6.0, 0.1, 2.0, 12.0},
+		{"gpt-5.6-terra", 2.0, 12.0, 0.2, 4.0, 24.0},
+		{"gpt-5.6-luna", 0.2, 1.2, 0.02, 0.4, 2.4},
 		{"gpt-5.6-sol-high", 5.0, 30.0, 0.5, 10.0, 60.0},
+		// Trusted Access for Cyber 稳定别名（issue #624）：blue 即 sol，red 即
+		// 5.6-cyber（无公开定价）——都按 sol 计，绝不能掉进 $1/$2 默认价。
+		{"gpt-daybreak-blue-latest", 5.0, 30.0, 0.5, 10.0, 60.0},
+		{"gpt-daybreak-red-latest", 5.0, 30.0, 0.5, 10.0, 60.0},
+		{"gpt-5.6-cyber", 5.0, 30.0, 0.5, 10.0, 60.0},
 	}
 	for _, c := range cases {
 		p := GetModelPricing(c.model)
@@ -200,6 +205,47 @@ func TestGPT56VariantPricing(t *testing.T) {
 		got := CalculateCost(n, n, 0, c.model, "fast")
 		want := (c.priorityIn + c.priorityOut) * float64(n) / 1_000_000.0
 		assertFloatEqual(t, got, want)
+	}
+}
+
+// gpt-6-astra 在 Codex 中不收长上下文溢价：跨过 272K 后仍使用同一组单价。
+// standard $10/$50、缓存 $1；保留现有 fast 2× 倍率。
+// 变体后缀 / 思考强度别名同价；未知 gpt-6 变体按 astra 兜底，绝不能掉进默认价。
+func TestGPT6AstraPricing(t *testing.T) {
+	for _, model := range []string{"gpt-6-astra", "gpt-6-astra-high", "gpt-6-astra(xhigh)", "GPT-6-Astra", "gpt-6", "gpt-6-nova"} {
+		if got := CanonicalBillingModelKey(model); got != "gpt-6-astra" {
+			t.Fatalf("CanonicalBillingModelKey(%q) = %q, want gpt-6-astra", model, got)
+		}
+		p := GetModelPricing(model)
+		assertFloatEqual(t, p.InputPricePerMToken, 10.0)
+		assertFloatEqual(t, p.OutputPricePerMToken, 50.0)
+		assertFloatEqual(t, p.CacheReadPricePerMToken, 1.0)
+		assertFloatEqual(t, p.LongInputPricePerMToken, 0)
+		assertFloatEqual(t, p.LongOutputPricePerMToken, 0)
+		assertFloatEqual(t, p.LongCacheReadPricePerMToken, 0)
+	}
+
+	for _, input := range []int{100_000, 271_999, 272_000, 272_001, 1_000_000} {
+		for _, tier := range []struct {
+			name       string
+			multiplier float64
+		}{{"", 1}, {"fast", 2}, {"priority", 2}, {"flex", 0.5}} {
+			const cached, output = 100_000, 1_000
+			got := CalculateCostBreakdown(input, output, cached, "gpt-6-astra", tier.name)
+			if got.LongContext {
+				t.Fatalf("Astra applied long-context pricing at input=%d tier=%q: %+v", input, tier.name, got)
+			}
+			assertFloatEqual(t, got.InputPricePerMToken, 10*tier.multiplier)
+			assertFloatEqual(t, got.CacheReadPricePerMToken, tier.multiplier)
+			assertFloatEqual(t, got.OutputPricePerMToken, 50*tier.multiplier)
+			want := (float64(input-cached)*10 + cached + output*50) / 1_000_000 * tier.multiplier
+			assertFloatEqual(t, got.TotalCost, want)
+		}
+	}
+
+	// gpt-5.6 家族不得被 gpt-6 前缀误伤。
+	if got := CanonicalBillingModelKey("gpt-5.6-sol"); got != "gpt-5.6-sol" {
+		t.Fatalf("CanonicalBillingModelKey(gpt-5.6-sol) = %q, want gpt-5.6-sol", got)
 	}
 }
 
@@ -280,14 +326,14 @@ func TestProModelsHaveCorrectPricing(t *testing.T) {
 	}
 }
 
-func TestLongContextPricingTriggersAbove272KTokens(t *testing.T) {
+func TestLongContextPricingTriggersAt272KTokens(t *testing.T) {
 	// Below threshold: standard pricing.
-	std := CalculateCostBreakdown(272000, 1000, 0, "gpt-5.4", "")
+	std := CalculateCostBreakdown(271999, 1000, 0, "gpt-5.4", "")
 	assertFloatEqual(t, std.InputPricePerMToken, 2.5)
 	assertFloatEqual(t, std.OutputPricePerMToken, 15.0)
 
-	// Above threshold: long context premium pricing.
-	long := CalculateCostBreakdown(272001, 1000, 0, "gpt-5.4", "")
+	// Official table says <272K is short, so the 272K boundary is long pricing.
+	long := CalculateCostBreakdown(272000, 1000, 0, "gpt-5.4", "")
 	assertFloatEqual(t, long.InputPricePerMToken, 5.0)
 	assertFloatEqual(t, long.OutputPricePerMToken, 22.5)
 	if !long.LongContext {
@@ -395,6 +441,8 @@ func TestGrokPricingUsesXAIRates(t *testing.T) {
 		wantOutput float64
 		wantCache  float64
 	}{
+		{model: "grok-4.6", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.5},
+		{model: "grok-4.6-beta", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.5},
 		{model: "grok-4.5", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.3},
 		{model: "grok-4.3", wantInput: 1.25, wantOutput: 2.5, wantCache: 0.2},
 		{model: "grok-4-fast", wantInput: 0.2, wantOutput: 0.5, wantCache: 0.05},
@@ -417,9 +465,32 @@ func TestGrokPricingUsesXAIRates(t *testing.T) {
 	}
 }
 
-// grok-4.5 更专用的规则必须压过 grok-4，否则 $2/$6 会被当成 $3/$15。
+// grok-4.6 / grok-4.5 更专用的规则必须压过 grok-4，否则 $2/$6 会被当成 $3/$15。
+func TestAntigravityGeminiEstimatedPricing(t *testing.T) {
+	tests := []struct {
+		model      string
+		wantInput  float64
+		wantOutput float64
+		wantCache  float64
+	}{
+		{model: "gemini-3-pro-preview", wantInput: 2.0, wantOutput: 12.0, wantCache: 0.2},
+		{model: "gemini-2.5-pro", wantInput: 1.25, wantOutput: 10.0, wantCache: 0.125},
+		{model: "gemini-2.5-flash", wantInput: 0.3, wantOutput: 2.5, wantCache: 0.03},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			got := GetModelPricing(tt.model)
+			assertPricing(t, got, tt.wantInput, tt.wantOutput)
+			assertFloatEqual(t, got.CacheReadPricePerMToken, tt.wantCache)
+		})
+	}
+}
+
 func TestGrokMoreSpecificRuleWinsOverShorterPrefix(t *testing.T) {
+	assertPricing(t, GetModelPricing("grok-4.6"), 2.0, 6.0)
+	assertFloatEqual(t, GetModelPricing("grok-4.6").CacheReadPricePerMToken, 0.5)
 	assertPricing(t, GetModelPricing("grok-4.5"), 2.0, 6.0)
+	assertFloatEqual(t, GetModelPricing("grok-4.5").CacheReadPricePerMToken, 0.3)
 	assertPricing(t, GetModelPricing("grok-4"), 3.0, 15.0)
 	assertPricing(t, GetModelPricing("grok-3-fast"), 5.0, 25.0)
 	assertPricing(t, GetModelPricing("grok-3"), 3.0, 15.0)
@@ -427,14 +498,14 @@ func TestGrokMoreSpecificRuleWinsOverShorterPrefix(t *testing.T) {
 
 // Grok 的长上下文分档线是 200K，不是 OpenAI 的 272K。
 func TestGrokLongContextThresholdIs200K(t *testing.T) {
-	std := CalculateCostBreakdown(200000, 1000, 0, "grok-4.5", "")
+	std := CalculateCostBreakdown(199999, 1000, 0, "grok-4.5", "")
 	assertFloatEqual(t, std.InputPricePerMToken, 2.0)
 	assertFloatEqual(t, std.OutputPricePerMToken, 6.0)
 	if std.LongContext {
-		t.Fatal("LongContext = true at 200K for grok-4.5, want false")
+		t.Fatal("LongContext = true below 200K for grok-4.5, want false")
 	}
 
-	long := CalculateCostBreakdown(200001, 1000, 500, "grok-4.5", "")
+	long := CalculateCostBreakdown(200000, 1000, 500, "grok-4.5", "")
 	assertFloatEqual(t, long.InputPricePerMToken, 4.0)
 	assertFloatEqual(t, long.OutputPricePerMToken, 12.0)
 	assertFloatEqual(t, long.CacheReadPricePerMToken, 1.0)
@@ -445,12 +516,75 @@ func TestGrokLongContextThresholdIs200K(t *testing.T) {
 		t.Fatalf("LongContextThreshold = %d, want 200000", long.LongContextThreshold)
 	}
 
-	// Codex 模型不受影响，仍是 272K。
-	codex := CalculateCostBreakdown(272000, 1000, 0, "gpt-5.4", "")
+	// grok-4.6 同分档线；缓存短档 $0.50、长档 $1.00（与 grok-4.5 的 $0.30 不同）。
+	std46 := CalculateCostBreakdown(199999, 1000, 500, "grok-4.6", "")
+	assertFloatEqual(t, std46.InputPricePerMToken, 2.0)
+	assertFloatEqual(t, std46.CacheReadPricePerMToken, 0.5)
+	if std46.LongContext {
+		t.Fatal("LongContext = true below 200K for grok-4.6, want false")
+	}
+	long46 := CalculateCostBreakdown(200000, 1000, 500, "grok-4.6", "")
+	assertFloatEqual(t, long46.InputPricePerMToken, 4.0)
+	assertFloatEqual(t, long46.OutputPricePerMToken, 12.0)
+	assertFloatEqual(t, long46.CacheReadPricePerMToken, 1.0)
+	if !long46.LongContext {
+		t.Fatal("LongContext = false at 200K for grok-4.6, want true")
+	}
+
+	// Codex 模型不受影响，仍是 272K（官方短档为 <272K）。
+	codex := CalculateCostBreakdown(271999, 1000, 0, "gpt-5.4", "")
 	if codex.LongContext {
-		t.Fatal("gpt-5.4 LongContext = true at 272K, want false")
+		t.Fatal("gpt-5.4 LongContext = true below 272K, want false")
 	}
 	if codex.LongContextThreshold != longContextThreshold {
 		t.Fatalf("gpt-5.4 LongContextThreshold = %d, want %d", codex.LongContextThreshold, longContextThreshold)
+	}
+}
+
+func TestGrok46OfficialPricingAndLongContextThreshold(t *testing.T) {
+	pricing := GetModelPricing("grok-4.6")
+	if pricing.InputPricePerMToken != 2 || pricing.CacheReadPricePerMToken != 0.5 || pricing.OutputPricePerMToken != 6 {
+		t.Fatalf("grok-4.6 short pricing = %+v", pricing)
+	}
+	if pricing.LongInputPricePerMToken != 4 || pricing.LongCacheReadPricePerMToken != 1 || pricing.LongOutputPricePerMToken != 12 {
+		t.Fatalf("grok-4.6 long pricing = %+v", pricing)
+	}
+	if pricing.LongContextThresholdTokens != 200000 {
+		t.Fatalf("grok-4.6 long threshold = %d, want 200000", pricing.LongContextThresholdTokens)
+	}
+
+	breakdown := CalculateCostBreakdown(200001, 1000000, 0, "grok-4.6", "")
+	if !breakdown.LongContext || breakdown.LongContextThreshold != 200000 {
+		t.Fatalf("grok-4.6 should enter long pricing above 200K: %+v", breakdown)
+	}
+}
+
+func TestClaudeFablePricingUsesOfficialCacheReadRates(t *testing.T) {
+	fable51 := GetModelPricing("claude-fable-5.1")
+	assertPricing(t, fable51, 10, 50)
+	assertFloatEqual(t, fable51.CacheReadPricePerMToken, 0.25)
+	if fable51.CacheWrite5mPricePerMToken != 12.5 || fable51.CacheWrite1hPricePerMToken != 20 {
+		t.Fatalf("Fable 5.1 cache-write pricing = %+v", fable51)
+	}
+	fable5 := GetModelPricing("claude-fable-5")
+	assertPricing(t, fable5, 10, 50)
+	assertFloatEqual(t, fable5.CacheReadPricePerMToken, 1)
+	if fable5.CacheWrite5mPricePerMToken != 12.5 || fable5.CacheWrite1hPricePerMToken != 20 {
+		t.Fatalf("Fable 5 cache-write pricing = %+v", fable5)
+	}
+}
+
+func TestCanonicalBillingModelKeyDaybreakAliases(t *testing.T) {
+	for _, model := range []string{"gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "GPT-Daybreak-Blue-Latest"} {
+		if got := CanonicalBillingModelKey(model); got != "gpt-5.6-sol" {
+			t.Fatalf("CanonicalBillingModelKey(%q) = %q, want gpt-5.6-sol", model, got)
+		}
+	}
+	// 只认 gpt-daybreak- 前缀：带版本号的 ID 仍按自身版本计费，无关模型不沾光。
+	if got := CanonicalBillingModelKey("gpt-5.4-daybreak"); got != "gpt-5.4" {
+		t.Fatalf("CanonicalBillingModelKey(gpt-5.4-daybreak) = %q, want gpt-5.4", got)
+	}
+	if got := CanonicalBillingModelKey("daybreak-blue"); got == "gpt-5.6-sol" {
+		t.Fatal("bare daybreak-blue must not resolve to gpt-5.6-sol")
 	}
 }

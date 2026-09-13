@@ -37,7 +37,7 @@ func TestCodexUserAgentConfigBuildsOfficialCLIShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
 	}
-	userAgent, version, ok := codexUserAgentFromConfig(normalized, "")
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "")
 	if !ok {
 		t.Fatal("codexUserAgentFromConfig() ok = false")
 	}
@@ -56,7 +56,7 @@ func TestCodexUserAgentConfigRaisesStructuredVersionToFloor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
 	}
-	userAgent, version, ok := codexUserAgentFromConfig(normalized, "0.150.0")
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "0.150.0")
 	if !ok {
 		t.Fatal("codexUserAgentFromConfig() ok = false")
 	}
@@ -74,7 +74,7 @@ func TestCodexUserAgentConfigRaisesPrereleaseVersionToStableFloor(t *testing.T) 
 	if err != nil {
 		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
 	}
-	userAgent, version, ok := codexUserAgentFromConfig(normalized, "0.142.0")
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "0.142.0")
 	if !ok {
 		t.Fatal("codexUserAgentFromConfig() ok = false")
 	}
@@ -108,7 +108,7 @@ func TestCodexUserAgentConfigRawOverrideWithoutVersionDoesNotSynthesizeVersion(t
 	if err != nil {
 		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
 	}
-	userAgent, version, ok := codexUserAgentFromConfig(normalized, "0.150.0")
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "0.150.0")
 	if !ok {
 		t.Fatal("codexUserAgentFromConfig() ok = false")
 	}
@@ -117,6 +117,100 @@ func TestCodexUserAgentConfigRawOverrideWithoutVersionDoesNotSynthesizeVersion(t
 	}
 	if version != "" {
 		t.Fatalf("version = %q, want empty", version)
+	}
+}
+
+// raw UA 只贡献指纹形状:可解析的版本段出站前重建为当前生效版本(前缀与尾部标识组两处)。
+func TestCodexUserAgentConfigRawOverrideRebuildsVersionSegments(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = ""
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/0.100.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.100.0)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != latestCodexCLIVersion {
+		t.Fatalf("version = %q, want builtin %q", version, latestCodexCLIVersion)
+	}
+	want := "codex-tui/" + latestCodexCLIVersion + " (Linux Unknown; x86_64) xterm-256color (codex-tui; " + latestCodexCLIVersion + ")"
+	if userAgent != want {
+		t.Fatalf("User-Agent = %q, want both version segments rebuilt: %q", userAgent, want)
+	}
+}
+
+// 远端同步到更高版本后,raw UA 的版本段跟随同步值。
+func TestCodexUserAgentConfigRawOverrideFollowsSyncedVersion(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = "0.200.0"
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/0.144.1 (Mac OS 15.5.0; arm64) xterm-256color (codex-tui; 0.144.1)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != "0.200.0" {
+		t.Fatalf("version = %q, want synced 0.200.0", version)
+	}
+	if !strings.Contains(userAgent, "codex-tui/0.200.0 ") || !strings.Contains(userAgent, "(codex-tui; 0.200.0)") {
+		t.Fatalf("User-Agent = %q, want synced version in both markers", userAgent)
+	}
+}
+
+// raw UA 钉了高于生效版本的版本号时保留(版本抬升绝不降级)。
+func TestCodexUserAgentConfigRawOverrideKeepsAheadPin(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = ""
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/9.999.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 9.999.0)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != "9.999.0" {
+		t.Fatalf("version = %q, want ahead pin 9.999.0 preserved", version)
+	}
+	if !strings.Contains(userAgent, "codex-tui/9.999.0 ") {
+		t.Fatalf("User-Agent = %q, want ahead pin preserved", userAgent)
+	}
+}
+
+// raw UA 分支同样叠加最低版本门槛(floor 高于生效版本时以 floor 为准)。
+func TestCodexUserAgentConfigRawOverrideAppliesVersionFloor(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = ""
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/0.100.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.100.0)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	_, version, ok := codexUserAgentFromConfig(normalized, 0, "0.160.0")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != "0.160.0" {
+		t.Fatalf("version = %q, want floor 0.160.0", version)
 	}
 }
 
@@ -178,5 +272,81 @@ func TestIsCodexStrictOfficialClientByHeaders(t *testing.T) {
 				t.Fatalf("IsCodexStrictOfficialClientByHeaders() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCodexUserAgentConfigAllowsSpacedClientName(t *testing.T) {
+	// issue #653：ChatGPT 桌面端的 originator 是 "Codex Desktop"，客户端名必须允许空格；
+	// 首尾空白与内部连续空白折叠成单个空格。手填的名字会推断为桌面端形态，
+	// 末尾标记按目录把 CLI 0.153.3 配到桌面端构建号 26.901.41123，与真实桌面端一致。
+	raw := `{"client_name":"  Codex \t  Desktop ","client_version":"0.153.3","os_name":"Windows","os_version":"10.0.26100","arch":"x86_64","terminal":"unknown"}`
+	normalized, err := NormalizeCodexUserAgentConfigJSON(raw)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	if !strings.Contains(normalized, `"client_name":"Codex Desktop"`) {
+		t.Fatalf("normalized = %s, want collapsed client_name \"Codex Desktop\"", normalized)
+	}
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, 0, "")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	wantUA := "Codex Desktop/0.153.3 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.901.41123)"
+	if userAgent != wantUA {
+		t.Fatalf("User-Agent = %q, want %q", userAgent, wantUA)
+	}
+	if version != "0.153.3" {
+		t.Fatalf("version = %q, want 0.153.3", version)
+	}
+	if !IsCodexOfficialClientByHeaders(userAgent, "") || !IsCodexStrictOfficialClientByHeaders(userAgent, "") {
+		t.Fatalf("generated desktop User-Agent %q should be recognized as an official Codex client", userAgent)
+	}
+	if _, rawVersion, parsed := parseCodexClientVersionDetails(userAgent); !parsed || rawVersion != "0.153.3" {
+		t.Fatalf("parseCodexClientVersionDetails(%q) = %q, %v; want 0.153.3, true", userAgent, rawVersion, parsed)
+	}
+}
+
+func TestCodexUserAgentConfigRejectsStructuralCharacters(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"client_name paren", `{"client_name":"Codex (Desktop)"}`},
+		{"client_name semicolon", `{"client_name":"Codex;Desktop"}`},
+		{"client_name control", `{"client_name":"Codex\u0001Desktop"}`},
+		// arch/terminal 仍是单 token：真实值（x86_64、WindowsTerminal、vscode/1.100.0）从不含空格。
+		{"arch space", `{"arch":"x86 64"}`},
+		{"terminal space", `{"terminal":"Windows Terminal"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NormalizeCodexUserAgentConfigJSON(tc.raw); err == nil {
+				t.Fatalf("NormalizeCodexUserAgentConfigJSON(%s) error = nil, want rejection", tc.raw)
+			}
+		})
+	}
+}
+
+func TestCodexOriginatorForGeneratedUserAgent(t *testing.T) {
+	cases := []struct {
+		userAgent string
+		want      string
+	}{
+		{"Codex Desktop/0.153.3 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.901.41123)", "Codex Desktop"},
+		{"Codex Desktop/0.153.3 (Mac OS 26.4.0; arm64) dumb (codex_exec; 0.153.3)", "Codex Desktop"},
+		{"codex-tui/0.153.3 (Mac OS 15.5.0; arm64) xterm-256color (codex-tui; 0.153.3)", "codex-tui"},
+		{"codex_cli_rs/0.150.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464", "codex_cli_rs"},
+		{"opencode/1.2.3 (Linux Unknown; x86_64) xterm-256color", "opencode"},
+		// 非官方前缀 / 无法识别的形状回退到默认 Originator。
+		{"my-router", Originator},
+		{"my-router/1.0 (custom)", Originator},
+		{"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", Originator},
+		{"", Originator},
+		{"/0.153.3", Originator},
+	}
+	for _, tc := range cases {
+		if got := CodexOriginatorForGeneratedUserAgent(tc.userAgent); got != tc.want {
+			t.Errorf("CodexOriginatorForGeneratedUserAgent(%q) = %q, want %q", tc.userAgent, got, tc.want)
+		}
 	}
 }

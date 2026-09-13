@@ -2,61 +2,363 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
-// CodexModelsManifestHandler 向 Codex 客户端透传模型清单。
+// CodexModelsManifestHandler 向 Codex 客户端提供模型清单。
 //
-// 用一个可调度的 ChatGPT OAuth 账号的凭据实时转发，响应体与 ETag 原样透传。
-// 上游失败时 fast-fail 返回错误、不伪造列表——Codex 客户端自身会回落本地缓存。
+// 有可调度的 ChatGPT OAuth 账号时，凭据实时转发官方清单（响应体与 ETag 原样透传）。
+// Antigravity / 仅中转号池没有 ChatGPT 账号：把与 Cockpit 相同的 /v1/models
+// 目录改写成 Codex 期望的 {"models":[{"slug":...}]}，避免客户端 503 后静默
+// 冻结在本地缓存（选单不全、模型信息联不通）。
 func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
-	apiKeyID := requestAPIKeyID(c)
-	// 清单端点只存在于 ChatGPT 后端,relay/Grok 账号无从代答。
-	account := h.store.NextExcludingWithFilter(apiKeyID, nil, func(a *auth.Account) bool {
-		return !a.IsRelayStyle()
-	})
-	if account == nil {
-		api.SendError(c, api.ErrServiceUnavailable)
+	row := apiKeyRowFromContext(c)
+	if h.preferScopedCodexManifest(c) {
+		if !h.serveScopedCodexManifest(c, row) {
+			api.SendError(c, api.ErrServiceUnavailable)
+		}
 		return
 	}
-	defer h.store.Release(account)
+	account := h.scopedCodexManifestAccount(row)
+	if account == nil {
+		if !h.serveScopedCodexManifest(c, row) {
+			api.SendError(c, api.ErrServiceUnavailable)
+		}
+		return
+	}
+	restrictManifest := codexManifestNeedsFiltering(row, account)
+	extraModels := h.extraRelayManifestModels(c.Request.Context(), row)
+	ifNoneMatch := c.GetHeader("If-None-Match")
+	if restrictManifest || len(extraModels) > 0 {
+		// Restricted responses use a gateway ETag derived from the filtered
+		// or locally merged representation. It is not an upstream validator, and
+		// forwarding it can produce a body-less 304 that cannot be rebuilt safely.
+		ifNoneMatch = ""
+	}
 
 	manifest, err := FetchCodexModelsManifest(
 		c.Request.Context(),
 		account,
 		h.store.ResolveProxyForAccount(account),
 		c.Query("client_version"),
-		c.GetHeader("If-None-Match"),
+		ifNoneMatch,
 	)
 	if err != nil {
+		if h.serveScopedCodexManifest(c, row) {
+			return
+		}
 		api.SendErrorWithStatus(c,
 			api.NewAPIError(api.ErrCodeUpstreamError, fmt.Sprintf("codex models manifest: %v", err), api.ErrorTypeUpstream),
 			http.StatusBadGateway)
 		return
 	}
 
-	if manifest.ETag != "" {
-		c.Header("ETag", manifest.ETag)
+	if restrictManifest {
+		if manifest.NotModified {
+			api.SendErrorWithStatus(c,
+				api.NewAPIError(api.ErrCodeUpstreamError, "codex models manifest returned an unusable 304", api.ErrorTypeUpstream),
+				http.StatusBadGateway)
+			return
+		}
+		body, _, filterErr := filterCodexManifest(manifest.Body, manifest.ETag, func(slug string) bool {
+			return codexManifestModelAllowed(row, account, slug)
+		})
+		if filterErr != nil {
+			api.SendErrorWithStatus(c,
+				api.NewAPIError(api.ErrCodeUpstreamError, fmt.Sprintf("codex models manifest: %v", filterErr), api.ErrorTypeUpstream),
+				http.StatusBadGateway)
+			return
+		}
+		h.learnManifestModelsAsync(manifest.Body, account)
+		h.writeMergedCodexManifest(c, body, "", extraModels)
+		return
 	}
+
 	if manifest.NotModified {
+		if manifest.ETag != "" {
+			c.Header("ETag", manifest.ETag)
+		}
 		c.Status(http.StatusNotModified)
 		return
 	}
 	// 顺手把清单里注册表不认识的新模型学习进注册表（只增不改不删），
 	// 让选单里出现的新模型立即通过请求侧模型校验，无需等手动同步。
-	h.learnManifestModelsAsync(manifest.Body)
-	c.Data(http.StatusOK, "application/json", manifest.Body)
+	h.learnManifestModelsAsync(manifest.Body, account)
+	h.writeMergedCodexManifest(c, manifest.Body, manifest.ETag, extraModels)
+}
+
+func (h *Handler) preferScopedCodexManifest(c *gin.Context) bool {
+	return requestUpstreamChannel(c) == database.UpstreamChannelAntigravity
+}
+
+func (h *Handler) serveScopedCodexManifest(c *gin.Context, row *database.APIKeyRow) bool {
+	if h == nil || c == nil || row == nil {
+		return false
+	}
+	models := h.scopedModels(c.Request.Context(), row)
+	if len(models) == 0 {
+		return false
+	}
+	body, err := buildScopedCodexManifest(models)
+	if err != nil {
+		log.Printf("build scoped Codex manifest: %v", err)
+		return false
+	}
+	body = h.applyStoredModelCapabilities(c.Request.Context(), row, body)
+	h.writeCodexManifest(c, body, "")
+	return true
+}
+
+func (h *Handler) writeMergedCodexManifest(c *gin.Context, body []byte, upstreamETag string, extras []api.Model) {
+	merged := body
+	if len(extras) > 0 {
+		next, err := mergeCodexManifestModels(body, extras)
+		if err != nil {
+			log.Printf("merge relay models into Codex manifest: %v", err)
+		} else {
+			merged = next
+		}
+	}
+	etag := upstreamETag
+	if etag == "" || string(merged) != string(body) {
+		etag = ""
+	}
+	h.writeCodexManifest(c, merged, etag)
+}
+
+func (h *Handler) extraRelayManifestModels(ctx context.Context, row *database.APIKeyRow) []api.Model {
+	if h == nil || row == nil {
+		return nil
+	}
+	records := h.scopedModelRecords(ctx, row)
+	extras := make([]api.Model, 0, len(records))
+	for _, record := range records {
+		if record == nil {
+			continue
+		}
+		if record.backing&(modelBackingRelay|modelBackingGrok|modelBackingAntigravity) == 0 {
+			continue
+		}
+		extras = append(extras, api.Model{ID: record.id, Object: "model", OwnedBy: scopedModelOwner(record)})
+	}
+	sort.Slice(extras, func(i, j int) bool {
+		return strings.ToLower(extras[i].ID) < strings.ToLower(extras[j].ID)
+	})
+	return extras
+}
+
+func (h *Handler) writeCodexManifest(c *gin.Context, body []byte, etag string) {
+	if etag == "" {
+		etag = scopedCodexManifestETag(body)
+	}
+	c.Header("ETag", etag)
+	if etagHeaderMatches(c.GetHeader("If-None-Match"), etag) {
+		c.Status(http.StatusNotModified)
+		return
+	}
+	c.Data(http.StatusOK, "application/json", body)
+}
+
+type codexReasoningLevel = api.ModelReasoningLevel
+
+type scopedCodexManifestItem struct {
+	ServiceTiers               []map[string]string   `json:"service_tiers,omitempty"`
+	Slug                       string                `json:"slug"`
+	DisplayName                string                `json:"display_name"`
+	Hidden                     bool                  `json:"hidden"`
+	Availability               string                `json:"availability"`
+	SupportedInAPI             bool                  `json:"supported_in_api"`
+	PreferWebsockets           bool                  `json:"prefer_websockets"`
+	UseResponsesLite           bool                  `json:"use_responses_lite"`
+	InputModalities            []string              `json:"input_modalities,omitempty"`
+	SupportedReasoningLevels   []codexReasoningLevel `json:"supported_reasoning_levels"`
+	DefaultReasoningLevel      string                `json:"default_reasoning_level"`
+	Description                string                `json:"description"`
+	ShellType                  string                `json:"shell_type"`
+	Visibility                 string                `json:"visibility"`
+	Priority                   int                   `json:"priority"`
+	BaseInstructions           string                `json:"base_instructions"`
+	SupportsReasoningSummaries bool                  `json:"supports_reasoning_summaries"`
+	SupportVerbosity           bool                  `json:"support_verbosity"`
+	SupportsParallelToolCalls  bool                  `json:"supports_parallel_tool_calls"`
+	ExperimentalSupportedTools []string              `json:"experimental_supported_tools"`
+	TruncationPolicy           map[string]any        `json:"truncation_policy"`
+	ContextWindow              int                   `json:"context_window,omitempty"`
+}
+
+func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
+	fold, levels := antigravityModelChoiceGroups(models)
+	items := make([]scopedCodexManifestItem, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		slug := strings.TrimSpace(model.ID)
+		if base, ok := fold[strings.ToLower(slug)]; ok {
+			slug = base
+		}
+		if slug == "" {
+			continue
+		}
+		key := strings.ToLower(slug)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		item := scopedCodexManifestItem{
+			Slug:                     slug,
+			DisplayName:              slug,
+			Availability:             "available",
+			SupportedInAPI:           true,
+			PreferWebsockets:         false,
+			UseResponsesLite:         false,
+			InputModalities:          []string{"text"},
+			SupportedReasoningLevels: []codexReasoningLevel{},
+			DefaultReasoningLevel:    "none",
+			Description:              "Gateway model: " + slug,
+			ShellType:                "shell_command", Visibility: "list",
+			BaseInstructions:           "You are a helpful coding assistant.",
+			ExperimentalSupportedTools: []string{},
+			TruncationPolicy:           map[string]any{"mode": "tokens", "limit": 10000},
+		}
+		if strings.Contains(key, "image") {
+			item.InputModalities = []string{"text", "image"}
+		}
+		// Antigravity's reasoning metadata is provider-specific. Never infer
+		// levels from names such as "thinking" or "reason": Claude Opus
+		// `*-thinking` is not a Gemini reasoning-control model.
+		if available := levels[slug]; len(available) > 0 {
+			for _, level := range available {
+				item.SupportedReasoningLevels = append(item.SupportedReasoningLevels, codexReasoningLevel{Effort: level, Description: "Antigravity " + level + " reasoning"})
+			}
+			item.DefaultReasoningLevel = available[0]
+			item.SupportsReasoningSummaries = true
+		}
+		if slug == "gemini-3.8-flash" {
+			item.ContextWindow = 1048576
+			// The current OAuth adapter accepts text parts only, even though the
+			// upstream model itself has vision. Advertise the gateway contract.
+			item.InputModalities = []string{"text"}
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return strings.ToLower(items[i].Slug) < strings.ToLower(items[j].Slug)
+	})
+	return json.Marshal(struct {
+		Models []scopedCodexManifestItem `json:"models"`
+	}{Models: items})
+}
+
+func mergeCodexManifestModels(body []byte, extras []api.Model) ([]byte, error) {
+	if len(extras) == 0 {
+		return body, nil
+	}
+	extraBody, err := buildScopedCodexManifest(extras)
+	if err != nil {
+		return nil, err
+	}
+	var extraRoot struct {
+		Models []json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(extraBody, &extraRoot); err != nil {
+		return nil, err
+	}
+	if len(extraRoot.Models) == 0 {
+		return body, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, err
+	}
+	rawModels, ok := root["models"]
+	if !ok {
+		return nil, fmt.Errorf("unsupported codex manifest schema: models is missing")
+	}
+	var models []json.RawMessage
+	if err := json.Unmarshal(rawModels, &models); err != nil {
+		return nil, err
+	}
+	// Locally routed Antigravity variants are authoritative for their base
+	// model. An upstream manifest can contain stale capabilities or fixed
+	// effort aliases; keeping those by slug would discard the current scoped
+	// contract (including a key restricted to a single effort).
+	_, localLevels := antigravityModelChoiceGroups(extras)
+	replacedSlugs := make(map[string]bool)
+	for _, definition := range antigravityLogicalCompatibilityCatalog {
+		if len(localLevels[definition.id]) == 0 {
+			continue
+		}
+		replacedSlugs[definition.id] = true
+		for _, variant := range definition.variants {
+			replacedSlugs[definition.id+"-"+variant.level] = true
+		}
+	}
+	retained := models[:0]
+	for _, raw := range models {
+		var item struct {
+			Slug string `json:"slug"`
+		}
+		if json.Unmarshal(raw, &item) == nil && replacedSlugs[strings.ToLower(strings.TrimSpace(item.Slug))] {
+			continue
+		}
+		retained = append(retained, raw)
+	}
+	models = retained
+	seen := make(map[string]struct{}, len(models)+len(extraRoot.Models))
+	for _, raw := range models {
+		var item struct {
+			Slug string `json:"slug"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if slug := strings.ToLower(strings.TrimSpace(item.Slug)); slug != "" {
+			seen[slug] = struct{}{}
+		}
+	}
+	for _, raw := range extraRoot.Models {
+		var item struct {
+			Slug string `json:"slug"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		slug := strings.ToLower(strings.TrimSpace(item.Slug))
+		if slug == "" {
+			continue
+		}
+		if _, dup := seen[slug]; dup {
+			continue
+		}
+		seen[slug] = struct{}{}
+		models = append(models, raw)
+	}
+	encoded, err := json.Marshal(models)
+	if err != nil {
+		return nil, err
+	}
+	root["models"] = encoded
+	return json.Marshal(root)
+}
+
+func scopedCodexManifestETag(body []byte) string {
+	sum := sha256.Sum256(append([]byte("codex2api-scoped-manifest-v1\x00"), body...))
+	return `"codex2api-` + hex.EncodeToString(sum[:]) + `"`
 }
 
 // manifestLearnKnown 缓存已确认在注册表里的模型 slug（小写），避免客户端每次
@@ -71,8 +373,17 @@ const manifestLearnCacheTTL = 10 * time.Minute
 
 // learnManifestModelsAsync 判断清单里是否有缓存未见过的 slug，有则后台学习。
 // 学习失败只记日志，绝不影响清单透传本身。
-func (h *Handler) learnManifestModelsAsync(manifestBody []byte) {
-	if h == nil || h.db == nil || len(manifestBody) == 0 {
+func (h *Handler) learnManifestModelsAsync(manifestBody []byte, accounts ...*auth.Account) {
+	for _, account := range accounts {
+		h.learnModelCapabilitiesAsync(account, manifestBody)
+	}
+	if len(manifestBody) == 0 {
+		return
+	}
+	// lite 能力学习不依赖 DB：清单每次透传都刷新 use_responses_lite 真值，
+	// 供发出前剥离"非 lite 模型 + lite 信号"的必死组合。
+	RecordResponsesLiteSupportFromManifest(manifestBody)
+	if h == nil || h.db == nil {
 		return
 	}
 	slugs := ExtractManifestModelSlugs(manifestBody)
@@ -129,9 +440,6 @@ const CodexModelsManifestURL = "https://chatgpt.com/backend-api/codex/models"
 // codexModelsManifestURLForTest 允许测试替换默认 URL。生产代码不要赋值。
 var codexModelsManifestURLForTest = ""
 
-// manifest 响应体上限。清单是结构化 JSON，正常远小于该值，仅作读取护栏。
-const codexModelsManifestBodyLimit int64 = 8 << 20
-
 // CodexModelsManifest 承载上游清单原文与缓存元数据，供 handler 原样透传给客户端。
 type CodexModelsManifest struct {
 	Body        []byte
@@ -175,7 +483,9 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	// UA 版本段与 Version 头、client_version query 三者保持同一版本，
+	// 避免出站身份自相矛盾（UA 钉内置常量、Version 跟随同步值）。
+	req.Header.Set("User-Agent", replaceCodexUserAgentVersion(defaultCodexCLIUserAgent, clientVersion))
 	req.Header.Set("Originator", Originator)
 	req.Header.Set("Version", clientVersion)
 	if ifNoneMatch = strings.TrimSpace(ifNoneMatch); ifNoneMatch != "" {
@@ -209,7 +519,7 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 		return nil, fmt.Errorf("codex models upstream status %d: %s", resp.StatusCode, message)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, codexModelsManifestBodyLimit))
+	body, err := ReadModelsListBody(resp.Body, CurrentRuntimeSettings().ModelsListReadMaxBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read codex models response: %w", err)
 	}

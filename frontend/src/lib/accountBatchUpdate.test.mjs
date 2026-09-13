@@ -26,6 +26,44 @@ test("buildBatchMetadataUpdate includes enabled scheduler fields", () => {
   });
 });
 
+test("buildBatchMetadataUpdate omits the fingerprint mode unless explicitly enabled", () => {
+  const untouched = buildBatchMetadataUpdate({
+    ids: [1],
+    updateTags: false,
+    tags: [],
+    updateGroups: false,
+    groupIds: [],
+    updateScoreBias: false,
+    scoreBias: null,
+    updateBaseConcurrency: false,
+    baseConcurrency: null,
+    updateSchedulerPriority: false,
+    schedulerPriority: null,
+    updateCodexFingerprintMode: false,
+    codexFingerprintMode: "session",
+  });
+
+  assert.deepEqual(untouched, { ids: [1] });
+
+  const applied = buildBatchMetadataUpdate({
+    ids: [1],
+    updateTags: false,
+    tags: [],
+    updateGroups: false,
+    groupIds: [],
+    updateScoreBias: false,
+    scoreBias: null,
+    updateBaseConcurrency: false,
+    baseConcurrency: null,
+    updateSchedulerPriority: false,
+    schedulerPriority: null,
+    updateCodexFingerprintMode: true,
+    codexFingerprintMode: "session",
+  });
+
+  assert.deepEqual(applied, { ids: [1], codex_fingerprint_mode: "session" });
+});
+
 test("buildBatchMetadataUpdate sends null only for enabled reset fields", () => {
   const payload = buildBatchMetadataUpdate({
     ids: [5],
@@ -46,4 +84,32 @@ test("buildBatchMetadataUpdate sends null only for enabled reset fields", () => 
     score_bias_override: null,
     scheduler_priority: null,
   });
+});
+
+test("buildBatchMetadataUpdate binds a trimmed timezone only when enabled", () => {
+  const base = {
+    ids: [1],
+    updateTags: false,
+    tags: [],
+    updateGroups: false,
+    groupIds: [],
+    updateScoreBias: false,
+    scoreBias: null,
+    updateBaseConcurrency: false,
+    baseConcurrency: null,
+    updateSchedulerPriority: false,
+    schedulerPriority: null,
+  };
+  assert.deepEqual(
+    buildBatchMetadataUpdate({ ...base, updateTimezone: true, timezone: " America/New_York " }),
+    { ids: [1], timezone: "America/New_York" },
+  );
+  assert.deepEqual(
+    buildBatchMetadataUpdate({ ...base, updateTimezone: true, timezone: "" }),
+    { ids: [1], timezone: "" },
+  );
+  assert.deepEqual(
+    buildBatchMetadataUpdate({ ...base, updateTimezone: false, timezone: "Asia/Tokyo" }),
+    { ids: [1] },
+  );
 });

@@ -16,6 +16,18 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+type maxChunkReader struct {
+	reader io.Reader
+	size   int
+}
+
+func (r *maxChunkReader) Read(p []byte) (int, error) {
+	if len(p) > r.size {
+		p = p[:r.size]
+	}
+	return r.reader.Read(p)
+}
+
 func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	input := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\n" +
 		"data: \"delta\":\"hello\"}\n\n" +
@@ -35,6 +47,54 @@ func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	want := "{\"type\":\"response.output_text.delta\",\n\"delta\":\"hello\"}"
 	if events[0] != want {
 		t.Fatalf("unexpected merged event: got %q want %q", events[0], want)
+	}
+}
+
+func TestReadSSEStreamWithEventPreservesEventName(t *testing.T) {
+	input := strings.NewReader("event: error\n" +
+		"data: {\"error\":{\"status_code\":403,\"code\":\"forbidden\"}}\n\n")
+
+	var gotEvent string
+	var gotData string
+	err := ReadSSEStreamWithEvent(input, func(event string, data []byte) bool {
+		gotEvent = event
+		gotData = string(data)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadSSEStreamWithEvent returned error: %v", err)
+	}
+	if gotEvent != "error" {
+		t.Fatalf("event = %q, want error", gotEvent)
+	}
+	if gotData != `{"error":{"status_code":403,"code":"forbidden"}}` {
+		t.Fatalf("data = %q", gotData)
+	}
+}
+
+func TestReadSSEStreamPreservesEventsAcrossReadBoundaries(t *testing.T) {
+	const eventCount = 2048
+
+	var input strings.Builder
+	for i := 0; i < eventCount; i++ {
+		input.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+	}
+	input.WriteString("data: [DONE]\n\n")
+
+	got := 0
+	reader := &maxChunkReader{reader: strings.NewReader(input.String()), size: 37}
+	err := ReadSSEStream(reader, func(data []byte) bool {
+		if string(data) != `{"type":"response.output_text.delta","delta":"hello"}` {
+			t.Fatalf("unexpected event %d: %q", got, data)
+		}
+		got++
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadSSEStream returned error: %v", err)
+	}
+	if got != eventCount {
+		t.Fatalf("event count = %d, want %d", got, eventCount)
 	}
 }
 
@@ -213,6 +273,38 @@ func TestClassifyResponseFailedOutcomeContextLengthExceeded(t *testing.T) {
 	}
 }
 
+// 中转上游把超窗回成 code:null / type:"upstream_error"，只有 message 说明了真实
+// 原因。仅匹配 code/type 会落进 default 500，把号池挨个试一遍并惩罚每个健康账号。
+func TestClassifyResponseFailedOutcomeContextLengthExceededMessageOnly(t *testing.T) {
+	for name, payload := range map[string][]byte{
+		"nested null code": []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":null,"type":"upstream_error","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}`),
+		"top-level error":  []byte(`{"type":"error","error":{"type":"upstream_error","message":"Your input exceeds the context window of this model."}}`),
+		"status details":   []byte(`{"type":"response.failed","response":{"status":"failed","status_details":{"error":{"message":"maximum context length exceeded"}}}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			outcome := classifyResponseFailedOutcome(payload)
+			if outcome.logStatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusBadRequest)
+			}
+			if outcome.penalize {
+				t.Fatal("context window overflow must not penalize the account")
+			}
+			if shouldTransparentRetryStream(outcome, 0, 2, false, nil, nil) {
+				t.Fatal("context window overflow must not trigger transparent account-rotation retry")
+			}
+		})
+	}
+}
+
+// 回显的请求内容不得改变判定：只有固定的 error 字段是权威的。
+func TestClassifyResponseFailedOutcomeIgnoresEchoedContextWindowText(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","type":"upstream_error","message":"boom"},"echo":"my prompt explains that input exceeds the context window"}}`)
+
+	if got := classifyResponseFailedOutcome(payload).logStatusCode; got != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", got, http.StatusInternalServerError)
+	}
+}
+
 func TestClassifyResponseFailedOutcomeDeterministicClientErrors(t *testing.T) {
 	for _, code := range []string{"context_window_exceeded", "string_above_max_length", "model_not_found", "unsupported_parameter"} {
 		payload := []byte(`{"type":"response.failed","response":{"error":{"code":"` + code + `","message":"boom"}}}`)
@@ -222,6 +314,22 @@ func TestClassifyResponseFailedOutcomeDeterministicClientErrors(t *testing.T) {
 		}
 		if outcome.penalize {
 			t.Errorf("code %s: deterministic client error must not penalize", code)
+		}
+	}
+}
+
+func TestClassifyResponseFailedOutcomeAnthropicAuthAndPermissionErrors(t *testing.T) {
+	for _, tc := range []struct {
+		typ  string
+		want int
+	}{
+		{typ: "authentication_error", want: http.StatusUnauthorized},
+		{typ: "invalid_token", want: http.StatusUnauthorized},
+		{typ: "permission_error", want: http.StatusForbidden},
+	} {
+		payload := []byte(`{"type":"error","error":{"type":"` + tc.typ + `","message":"failure"}}`)
+		if got := classifyResponseFailedOutcome(payload).logStatusCode; got != tc.want {
+			t.Errorf("error type %s: status = %d, want %d", tc.typ, got, tc.want)
 		}
 	}
 }
@@ -312,8 +420,19 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 	if got := req.Header.Get("Authorization"); got != "Bearer token-123" {
 		t.Fatalf("Authorization = %q", got)
 	}
-	if got := req.Header.Get("Session_id"); got != "cache-key-1" {
-		t.Fatalf("Session_id = %q", got)
+	// 真实客户端发 session-id / thread-id（连字符），不发下划线写法，也不发
+	// Conversation_id。单线程会话里 thread-id 与 session-id 同值。
+	if got := req.Header.Get("Session-Id"); got != "cache-key-1" {
+		t.Fatalf("Session-Id = %q", got)
+	}
+	if got := req.Header.Get("Thread-Id"); got != "cache-key-1" {
+		t.Fatalf("Thread-Id = %q, want 与 session 同值", got)
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got != "cache-key-1" {
+		t.Fatalf("X-Client-Request-Id = %q, want 等于 thread id", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty（下划线写法不属于真实形态）", got)
 	}
 	if got := req.Header.Get("Conversation_id"); got != "" {
 		t.Fatalf("Conversation_id = %q, want empty", got)
@@ -487,6 +606,22 @@ func TestPrepareCodexResponsesLiteTransportBridgesRequestScopedSignal(t *testing
 	if marker := gjson.GetBytes(nonLiteBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
 		t.Fatalf("HTTP body retained false WS-only Lite metadata: %s", nonLiteBody)
 	}
+
+	// 模型门禁剥离信号后（enabled=false），WS 路径必须清掉下游带来的体内标记，
+	// 否则非 lite 模型仍会把标记带上 WS 上游触发 400。
+	gatedWSBody := []byte(`{"model":"gpt-5.5","client_metadata":{"other":"kept","ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`)
+	gatedWSHeaders := make(http.Header)
+	gatedWSHeaders.Set(codexResponsesLiteHeader, "true")
+	gatedWSBody, gatedWSHeaders = prepareCodexResponsesLiteTransport(gatedWSBody, gatedWSHeaders, true, false)
+	if marker := gjson.GetBytes(gatedWSBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("WS body retained Lite metadata after gate disabled it: %s", gatedWSBody)
+	}
+	if got := gjson.GetBytes(gatedWSBody, "client_metadata.other").String(); got != "kept" {
+		t.Fatalf("unrelated client metadata = %q, want kept; body=%s", got, gatedWSBody)
+	}
+	if got := gatedWSHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("WS handshake Lite header = %q, want empty after gate disabled it", got)
+	}
 }
 
 func TestNormalizeCodexResponsesLiteBodyEnforcesUpstreamConstraints(t *testing.T) {
@@ -541,6 +676,68 @@ func TestNormalizeCodexResponsesLiteBodyStripsImageOnlyToolSet(t *testing.T) {
 	}
 	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "" {
 		t.Fatalf("HTTP instructions = %q, want empty after bridge removal", instructions)
+	}
+}
+
+func TestExecuteRequestWebsocketSendsCompactionTriggerLast(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+
+	var seenBody []byte
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		seenBody = append([]byte(nil), requestBody...)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_test"}`)),
+		}, nil
+	}
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, body, "session-1", "", "sk-local", nil, http.Header{}, true)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final websocket body must end with compaction_trigger: %s", seenBody)
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestSendsCompactionTriggerLast(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody = readUpstreamRequestBody(r)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", nil)
+	if err != nil {
+		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final relay body must end with compaction_trigger: %s", seenBody)
 	}
 }
 
@@ -615,6 +812,83 @@ func TestApplyCodexRequestHeadersUsesCustomGeneratedUserAgentConfig(t *testing.T
 	}
 	if got := req.Header.Get("Version"); got != "0.142.0-alpha.10" {
 		t.Fatalf("Version = %q, want 0.142.0-alpha.10", got)
+	}
+}
+
+func TestApplyCodexRequestHeadersGeneratedDesktopClientSendsMatchingOriginator(t *testing.T) {
+	// issue #653：强制模拟 ChatGPT 桌面端时，Originator 必须跟随生成的 UA 前缀，
+	// 而不是照旧发 codex-tui——真实客户端两者恒为同一标识。
+	prev := CurrentRuntimeSettings()
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"client_name":"Codex Desktop","client_version":"0.153.3","os_name":"Windows","os_version":"10.0.26100","arch":"x86_64","terminal":"unknown"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	ApplyRuntimeSettings(RuntimeSettings{
+		ClientCompatMode:     ClientCompatModeForce,
+		CodexUserAgentConfig: normalized,
+	})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	downstreamHeaders := http.Header{
+		"User-Agent": []string{"codex-tui/0.153.3 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.153.3)"},
+		"Originator": []string{"codex-tui"},
+	}
+
+	applyCodexRequestHeaders(req, &auth.Account{DBID: 42}, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+	wantUA := "Codex Desktop/0.153.3 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.901.41123)"
+	if got := req.Header.Get("User-Agent"); got != wantUA {
+		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
+	}
+	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
+		t.Fatalf("Originator = %q, want Codex Desktop to match generated User-Agent", got)
+	}
+	if got := req.Header.Get("Version"); got != "0.153.3" {
+		t.Fatalf("Version = %q, want 0.153.3", got)
+	}
+}
+
+func TestApplyCodexRequestHeadersRawUserAgentOriginatorFollowsOfficialPrefix(t *testing.T) {
+	cases := []struct {
+		name           string
+		rawUserAgent   string
+		wantOriginator string
+	}{
+		{"desktop raw override", "Codex Desktop/0.153.3 (Mac OS 26.4.0; arm64) dumb (codex_exec; 0.153.3)", "Codex Desktop"},
+		{"unofficial raw override keeps default", "my-router", Originator},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := CurrentRuntimeSettings()
+			normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"` + tc.rawUserAgent + `"}`)
+			if err != nil {
+				t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+			}
+			ApplyRuntimeSettings(RuntimeSettings{
+				ClientCompatMode:     ClientCompatModeForce,
+				CodexUserAgentConfig: normalized,
+			})
+			t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
+			req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+			if err != nil {
+				t.Fatalf("http.NewRequest() error = %v", err)
+			}
+			downstreamHeaders := http.Header{"Originator": []string{"codex-tui"}}
+
+			applyCodexRequestHeaders(req, &auth.Account{DBID: 42}, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+			if got := req.Header.Get("User-Agent"); got != tc.rawUserAgent {
+				t.Fatalf("User-Agent = %q, want %q", got, tc.rawUserAgent)
+			}
+			if got := req.Header.Get("Originator"); got != tc.wantOriginator {
+				t.Fatalf("Originator = %q, want %q", got, tc.wantOriginator)
+			}
+		})
 	}
 }
 
@@ -729,6 +1003,67 @@ func TestApplyCodexRequestHeadersPreservesOfficialClientHeaders(t *testing.T) {
 		if got := req.Header.Get(name); got != downstreamHeaders.Get(name) {
 			t.Fatalf("%s = %q, want %q", name, got, downstreamHeaders.Get(name))
 		}
+	}
+}
+
+func TestApplyCodexRequestHeadersAutoDerivesVersionFromDesktopUserAgent(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	ApplyRuntimeSettings(RuntimeSettings{
+		ClientCompatMode:   ClientCompatModeAuto,
+		CodexMinCLIVersion: "0.153.3",
+	})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	desktopUserAgent := "Codex Desktop/0.153.3 (Mac OS 26.4.0; arm64) dumb (codex_exec; 0.153.3)"
+	downstreamHeaders := http.Header{
+		"User-Agent": []string{desktopUserAgent},
+		"Originator": []string{"Codex Desktop"},
+	}
+
+	applyCodexRequestHeaders(req, &auth.Account{DBID: 42}, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+	if got := req.Header.Get("User-Agent"); got != desktopUserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, desktopUserAgent)
+	}
+	if got := req.Header.Get("Originator"); got != "Codex Desktop" {
+		t.Fatalf("Originator = %q, want Codex Desktop", got)
+	}
+	if got := req.Header.Get("Version"); got != "0.153.3" {
+		t.Fatalf("Version = %q, want 0.153.3 derived from desktop User-Agent", got)
+	}
+}
+
+func TestApplyCodexRequestHeadersAutoUpgradesOldDesktopClient(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	ApplyRuntimeSettings(RuntimeSettings{
+		ClientCompatMode:   ClientCompatModeAuto,
+		CodexMinCLIVersion: "0.153.3",
+	})
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	downstreamHeaders := http.Header{
+		"User-Agent": []string{"Codex Desktop/0.152.0 (Mac OS 26.4.0; arm64) dumb (codex_exec; 0.152.0)"},
+		"Originator": []string{"Codex Desktop"},
+	}
+
+	applyCodexRequestHeaders(req, &auth.Account{DBID: 42}, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+	if got := req.Header.Get("User-Agent"); got == downstreamHeaders.Get("User-Agent") {
+		t.Fatalf("User-Agent preserved old desktop UA %q", got)
+	}
+	if got := req.Header.Get("Originator"); got != Originator {
+		t.Fatalf("Originator = %q, want generated client originator %q", got, Originator)
+	}
+	if got := req.Header.Get("Version"); got != "0.153.3" {
+		t.Fatalf("Version = %q, want auto minimum 0.153.3", got)
 	}
 }
 
@@ -857,6 +1192,12 @@ func TestApplyOpenAIResponsesRequestHeadersSetsCodexUserAgent(t *testing.T) {
 	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
 		t.Fatalf("Version = %q, want %q", got, latestCodexCLIVersion)
 	}
+	if got := req.Header.Get("Originator"); got != Originator {
+		t.Fatalf("Originator = %q, want %q", got, Originator)
+	}
+	if got := req.Header.Get("X-Codex-App-Version"); got != latestCodexCLIVersion {
+		t.Fatalf("X-Codex-App-Version = %q, want %q", got, latestCodexCLIVersion)
+	}
 	if got := req.Header.Get("Authorization"); got != "Bearer relay-token" {
 		t.Fatalf("Authorization = %q", got)
 	}
@@ -865,6 +1206,99 @@ func TestApplyOpenAIResponsesRequestHeadersSetsCodexUserAgent(t *testing.T) {
 	}
 	if got := req.Header.Get("Idempotency-Key"); got != "idem-123" {
 		t.Fatalf("Idempotency-Key = %q", got)
+	}
+}
+
+func TestApplyOpenAIResponsesRequestHeadersPassthroughAutoPreservesOfficialIdentity(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://relay.example/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	downstreamUA := "codex-tui/0.150.0 (Mac OS 15.5.0; arm64) xterm-256color (codex-tui; 0.150.0)"
+	headers := http.Header{
+		"User-Agent":            []string{downstreamUA},
+		"Originator":            []string{"codex-tui"},
+		"Version":               []string{"0.150.0"},
+		"Session-Id":            []string{"sess-123"},
+		"Thread-Id":             []string{"thread-456"},
+		"X-Codex-Turn-State":    []string{"t-state"},
+		"X-Codex-Beta-Features": []string{"remote_compaction_v2"},
+	}
+	account := &auth.Account{DBID: 42, CodexPassthroughMode: auth.CodexPassthroughModeAuto}
+
+	applyOpenAIResponsesRequestHeaders(req, account, "relay-token", headers)
+
+	if got := req.Header.Get("User-Agent"); got != downstreamUA {
+		t.Fatalf("User-Agent = %q, want downstream official UA %q", got, downstreamUA)
+	}
+	if got := req.Header.Get("Version"); got != "0.150.0" {
+		t.Fatalf("Version = %q, want 0.150.0", got)
+	}
+	if got := req.Header.Get("Originator"); got != "codex-tui" {
+		t.Fatalf("Originator = %q, want codex-tui", got)
+	}
+	if got := req.Header.Get("Session-Id"); got != "sess-123" {
+		t.Fatalf("Session-Id = %q, want sess-123", got)
+	}
+	if got := req.Header.Get("Thread-Id"); got != "thread-456" {
+		t.Fatalf("Thread-Id = %q, want thread-456", got)
+	}
+	if got := req.Header.Get("X-Codex-Turn-State"); got != "t-state" {
+		t.Fatalf("X-Codex-Turn-State = %q, want t-state", got)
+	}
+	if got := req.Header.Get("X-Codex-Beta-Features"); got != "remote_compaction_v2" {
+		t.Fatalf("X-Codex-Beta-Features = %q, want remote_compaction_v2", got)
+	}
+}
+
+func TestApplyOpenAIResponsesRequestHeadersPassthroughAlwaysForwardsAnyDownstream(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://relay.example/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	headers := http.Header{
+		"User-Agent": []string{"claude-cli/2.0.0"},
+		"Session-Id": []string{"sess-xyz"},
+	}
+	account := &auth.Account{DBID: 42, CodexPassthroughMode: auth.CodexPassthroughModeAlways}
+
+	applyOpenAIResponsesRequestHeaders(req, account, "relay-token", headers)
+
+	if got := req.Header.Get("User-Agent"); got != "claude-cli/2.0.0" {
+		t.Fatalf("User-Agent = %q, want downstream claude-cli/2.0.0", got)
+	}
+	if got := req.Header.Get("Session-Id"); got != "sess-xyz" {
+		t.Fatalf("Session-Id = %q, want sess-xyz", got)
+	}
+}
+
+func TestApplyOpenAIResponsesRequestHeadersPassthroughOffKeepsGeneratedIdentity(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://relay.example/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	headers := http.Header{
+		"User-Agent":            []string{"codex-tui/0.150.0 (Mac OS 15.5.0; arm64) xterm-256color (codex-tui; 0.150.0)"},
+		"Originator":            []string{"codex-tui"},
+		"Session-Id":            []string{"sess-123"},
+		"Thread-Id":             []string{"thread-456"},
+		"X-Codex-Turn-State":    []string{"t-state"},
+		"X-Codex-Beta-Features": []string{"remote_compaction_v2"},
+	}
+	account := &auth.Account{DBID: 42, CodexPassthroughMode: auth.CodexPassthroughModeOff}
+
+	applyOpenAIResponsesRequestHeaders(req, account, "relay-token", headers)
+
+	// off 保持旧行为：UA 随官方客户端透传（resolveCodexOutboundClientHeaders 的
+	// 官方 UA 分支），但 Originator 与会话/x-codex-* 头不转发。
+	if got := req.Header.Get("Originator"); got != Originator {
+		t.Fatalf("Originator = %q, want default %q", got, Originator)
+	}
+	if got := req.Header.Get("Session-Id"); got != "" {
+		t.Fatalf("Session-Id = %q, want dropped in off mode", got)
+	}
+	if got := req.Header.Get("X-Codex-Turn-State"); got != "" {
+		t.Fatalf("X-Codex-Turn-State = %q, want dropped in off mode", got)
 	}
 }
 
@@ -880,7 +1314,7 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 	}
 	results := make(chan result, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		_ = r.Body.Close()
 		results <- result{
 			path:    r.URL.Path,
@@ -907,13 +1341,13 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 	downstreamHeaders.Set("User-Agent", "curl/8.0")
 	downstreamHeaders.Set(codexResponsesLiteHeader, "true")
 
-	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.6-sol"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
 	}
 	resp.Body.Close()
 
-	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
+	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.6-sol"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesCompactRequest() error = %v", err)
 	}
@@ -957,7 +1391,7 @@ func TestExecuteOpenAIResponsesRequestLearnsCodexClientMetadataRequirement(t *te
 	requestCount := 0
 	installationIDs := make([]string, 0, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		_ = r.Body.Close()
 		installationID := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
 
@@ -1039,7 +1473,7 @@ func TestExecuteOpenAIResponsesRequestHonorsCodexClientMetadataMode(t *testing.T
 			requestCount := 0
 			installationID := ""
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, _ := io.ReadAll(r.Body)
+				body := readUpstreamRequestBody(r)
 				_ = r.Body.Close()
 				gotInstallationID := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
 				mu.Lock()
@@ -1097,7 +1531,7 @@ func TestExecuteOpenAIResponsesRequestPreservesClientInstallationIDWithoutLearni
 	var mu sync.Mutex
 	installationIDs := make([]string, 0, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		_ = r.Body.Close()
 		installationID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String()
 		mu.Lock()
@@ -1172,6 +1606,72 @@ func TestExecuteOpenAIResponsesRequestDoesNotRetryUnrelatedForbidden(t *testing.
 	mu.Unlock()
 	if gotCount != 1 {
 		t.Fatalf("upstream requests = %d, want 1", gotCount)
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestRetriesForbiddenErrorOfficialClients(t *testing.T) {
+	var mu sync.Mutex
+	requestCount := 0
+	installationIDs := make([]string, 0, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readUpstreamRequestBody(r)
+		_ = r.Body.Close()
+		installationID := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
+
+		mu.Lock()
+		requestCount++
+		installationIDs = append(installationIDs, installationID)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if installationID == "" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"message":"This account only allows Codex official clients","type":"forbidden_error"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42004,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	headers := http.Header{
+		"Authorization": []string{"Bearer downstream-api-key"},
+		"User-Agent":    []string{"curl/8.0"},
+	}
+	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
+
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", headers)
+	if err != nil {
+		t.Fatalf("first ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first response status = %d, want 200 after metadata retry", resp.StatusCode)
+	}
+
+	resp, err = ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", headers)
+	if err != nil {
+		t.Fatalf("second ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second response status = %d, want 200 from cached requirement", resp.StatusCode)
+	}
+
+	mu.Lock()
+	gotCount := requestCount
+	gotIDs := append([]string(nil), installationIDs...)
+	mu.Unlock()
+	if gotCount != 3 {
+		t.Fatalf("upstream requests = %d, want initial rejection + retry + cached request", gotCount)
+	}
+	if len(gotIDs) != 3 || gotIDs[0] != "" || gotIDs[1] == "" || gotIDs[2] != gotIDs[1] {
+		t.Fatalf("installation IDs = %#v, want empty then one stable generated ID", gotIDs)
 	}
 }
 
@@ -1346,7 +1846,9 @@ func TestLocalAffinityPreservesExplicitAndAPIKeyUpstreamSeeds(t *testing.T) {
 		headers := http.Header{"Authorization": []string{"Bearer shared-key"}}
 		headers.Set("X-Codex2API-Affinity-Key", "user-a")
 		identity := resolveRequestSessionIdentity(headers, []byte(`{}`))
-		wantSeed := uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:prompt-cache:shared-key")).String()
+		// 与 deterministicPromptCacheKey 共享种子与派生：两处算出不同值，会让同一个
+		// API Key 在 HTTP 与 WS 路径上得到两个互不相干的上游身份。
+		wantSeed := DeriveStableSessionUUIDv7("codex2api:prompt-cache:shared-key")
 		if identity.upstreamSeed != wantSeed || identity.explicitUpstreamID != "" {
 			t.Fatalf("API-key upstream fallback changed: seed=%q explicit=%q want=%q", identity.upstreamSeed, identity.explicitUpstreamID, wantSeed)
 		}
@@ -1540,5 +2042,45 @@ func TestResolveUpstreamSessionID(t *testing.T) {
 		if want := IsolateCodexSessionID(7, "sess-xyz"); got != want {
 			t.Fatalf("explicit session mode=%s: got %q, want %q", mode, got, want)
 		}
+	}
+}
+
+// HTTP 出站收口必须兜底剥离 WS 事件信封的顶层 type，即使上层 prepare 被绕过
+// （native WS ingress 的 1009 降级 / 生图强制 HTTP / Agent Identity 强制 HTTP
+// 都会带信封 body 走到这里）；嵌套 type 不受影响 (issue #548)。
+func TestExecuteRequestHTTPStripsTopLevelEnvelopeType(t *testing.T) {
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+
+	bodyCh := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readUpstreamRequestBody(r)
+		bodyCh <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	raw := []byte(`{"type":"response.create","model":"gpt-5.4","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, raw, "", "", "sk-local", nil, http.Header{}, false)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-bodyCh:
+		if gjson.GetBytes(got, "type").Exists() {
+			t.Fatalf("top-level type should be stripped before HTTP upstream: %s", got)
+		}
+		if it := gjson.GetBytes(got, "input.0.type").String(); it != "message" {
+			t.Fatalf("nested input type = %q, want message; body=%s", it, got)
+		}
+		if ct := gjson.GetBytes(got, "input.0.content.0.type").String(); ct != "input_text" {
+			t.Fatalf("nested content type = %q, want input_text; body=%s", ct, got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream request")
 	}
 }

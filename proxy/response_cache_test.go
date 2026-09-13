@@ -1,20 +1,16 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/codex2api/cache"
 	"github.com/tidwall/gjson"
 )
 
 func resetResponseCacheForTest() {
-	respCache.mu.Lock()
-	respCache.store = make(map[string]*responseCacheEntry)
-	respCache.runtimeCache = nil
-	respCache.mu.Unlock()
+	resetResponseCacheStateForTest(defaultResponseCacheConfig())
 }
 
 func TestCacheCompletedResponseCachesCodexNativeToolCalls(t *testing.T) {
@@ -67,6 +63,55 @@ func TestCacheCompletedResponseUsesOutputItemDoneFallback(t *testing.T) {
 	}
 	if gjson.GetBytes(got, "previous_response_id").Exists() {
 		t.Fatalf("previous_response_id should be removed after expansion: %s", got)
+	}
+}
+
+func TestCacheCompletedResponseRejectsMalformedOrdinaryFunctionCall(t *testing.T) {
+	resetResponseCacheForTest()
+
+	cacheCompletedResponse("key:1",
+		[]byte(`[{"type":"message","role":"user","content":"run"}]`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_bad","output":[{"type":"function_call","call_id":"call_bad","name":"exec","arguments":"{\"cmd\":"}]}}`),
+	)
+
+	if cached := getResponseCache("key:1", "resp_bad"); cached != nil {
+		t.Fatalf("malformed ordinary function call must not enter replay cache: %s", cached)
+	}
+}
+
+func TestCacheCompletedResponseKeepsCustomFreeFormToolCall(t *testing.T) {
+	resetResponseCacheForTest()
+
+	cacheCompletedResponse("key:1",
+		[]byte(`[{"type":"message","role":"user","content":"run"}]`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_custom","output":[{"type":"custom_tool_call","call_id":"call_custom","name":"raw","input":"not-json"}]}}`),
+	)
+
+	cached := getResponseCache("key:1", "resp_custom")
+	if len(cached) != 2 || gjson.GetBytes(cached[1], "input").String() != "not-json" {
+		t.Fatalf("custom free-form tool call should remain replayable: %s", cached)
+	}
+}
+
+func TestCacheCompletedResponseDropsMalformedInputCallAndMatchingOutput(t *testing.T) {
+	resetResponseCacheForTest()
+
+	expandedInput := []byte(`[
+		{"type":"function_call","call_id":"old_bad","name":"exec","arguments":"{\"cmd\":"},
+		{"type":"function_call_output","call_id":"old_bad","output":"poison"},
+		{"type":"message","role":"user","content":"continue"}
+	]`)
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_clean","output":[{"type":"function_call","call_id":"call_ok","name":"noop","arguments":"{}"}]}}`)
+
+	cacheCompletedResponse("key:1", expandedInput, completed)
+	cached := getResponseCache("key:1", "resp_clean")
+	if len(cached) != 2 {
+		t.Fatalf("cached item count = %d, want clean message + current call; items=%s", len(cached), cached)
+	}
+	for _, item := range cached {
+		if strings.Contains(string(item), "old_bad") || strings.Contains(string(item), "poison") {
+			t.Fatalf("malformed historical pair survived cache sanitization: %s", cached)
+		}
 	}
 }
 
@@ -129,21 +174,18 @@ func TestExpandPreviousResponseCachesShellAndApplyPatchCalls(t *testing.T) {
 
 func TestExpandPreviousResponseUsesRuntimeCacheAfterLocalMiss(t *testing.T) {
 	resetResponseCacheForTest()
-	tc := cache.NewMemory(10)
+	tc := newRecordingResponseContextBackend(true)
 	SetResponseContextCache(tc)
 	t.Cleanup(func() {
 		SetResponseContextCache(nil)
-		_ = tc.Close()
+		_ = tc.TokenCache.Close()
 	})
 
-	ctx := context.Background()
 	items := []json.RawMessage{
 		json.RawMessage(`{"type":"message","role":"user","content":"run mcp tool"}`),
 		json.RawMessage(`{"type":"mcp_tool_call","call_id":"call_mcp","name":"read","arguments":"{}"}`),
 	}
-	if err := tc.SetResponseContext(ctx, responseCacheStoreKey("key:1", "resp_remote"), items, time.Minute); err != nil {
-		t.Fatalf("SetResponseContext: %v", err)
-	}
+	tc.bounded = cache.ResponseContextReadResult{Status: cache.ResponseContextReadFound, Items: items}
 
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_remote","input":[{"type":"mcp_tool_call_output","call_id":"call_mcp","output":"ok"}]}`)
 	got, prevID := expandPreviousResponse(body, "key:1")

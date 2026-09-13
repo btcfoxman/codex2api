@@ -26,6 +26,13 @@ import (
 const (
 	reasoningTruncationStep    = 518
 	continueThinkingMarkerText = "Continue thinking..."
+
+	// 隐藏续想轮的下游保活间隔与内容。隐藏轮期间(开轮握手、续想轮无可转发
+	// reasoning)下游可能长时间收不到任何字节,反代的空闲读超时(常见 60~125s)
+	// 会拦腰掐断连接并诱发客户端整轮重试循环(issue #458)。SSE 注释行是标准
+	// 协议内容,客户端解析器一律忽略,但能刷新链路上每一跳的空闲计时器。
+	continueKeepaliveInterval = 15 * time.Second
+	continueKeepaliveComment  = ": keepalive\n\n"
 )
 
 // isReasoningTruncationTokens 判断 reasoning token 数是否命中截断指纹（518*n - 2）。
@@ -45,7 +52,7 @@ func continueKeepAllEncrypted() bool {
 }
 
 // stripReasoningEncryptedContent 删除 reasoning item 的 encrypted_content 字段
-//（保留 summary 文本），非 reasoning item 原样返回。
+// （保留 summary 文本），非 reasoning item 原样返回。
 func stripReasoningEncryptedContent(item json.RawMessage) json.RawMessage {
 	if gjson.GetBytes(item, "type").String() != "reasoning" {
 		return item
@@ -72,6 +79,7 @@ const (
 
 // continueRoundStat 记录一轮上游请求的真实消耗，供逐轮 usage 记账。
 type continueRoundStat struct {
+	Trace      upstreamTraceSnapshot
 	Usage      *UsageInfo
 	StatusCode int
 	DurationMs int
@@ -95,6 +103,7 @@ type continueFoldResult struct {
 
 // continueFold 是折叠状态机的外部依赖与配置。
 type continueFold struct {
+	trace     func() upstreamTraceSnapshot
 	baseBody  []byte // 本 attempt 实际发出的上游请求体（已过 prepare 管线）
 	maxRounds int    // 最大轮数（含首轮）
 
@@ -102,6 +111,21 @@ type continueFold struct {
 	observe    func(data []byte)                         // 对被缓冲（未转发）的事件做旁路观察（TTFT 等）
 	openRound  func(body []byte) (*http.Response, error) // 用同一账号/通道开续想轮
 	clientGone func() bool                               // 客户端是否已断开
+
+	// keepalive 隐藏轮期间向下游写 SSE 注释保活,返回 false 表示下游已死、停止
+	// 保活(折叠本身继续,由 clientGone 语义收尾)。nil 关闭保活。回调运行在独立
+	// goroutine,与 forward 并发,由调用方负责写路径互斥;首个真实字节写出前
+	// 是否跳过也由回调自行判断(提前写会提交 200 header)。
+	keepalive func() bool
+	// keepaliveInterval 保活间隔;<=0 用 continueKeepaliveInterval。测试用。
+	keepaliveInterval time.Duration
+}
+
+func (f *continueFold) snapshotTrace() upstreamTraceSnapshot {
+	if f.trace != nil {
+		return f.trace()
+	}
+	return upstreamTraceSnapshot{}
 }
 
 // bufferedOutputItem 缓冲一个非 reasoning output item 的完整事件序列。
@@ -189,7 +213,7 @@ func buildContinuationBody(baseBody []byte, replayTail []json.RawMessage) ([]byt
 // 保留完整 encrypted_content，更早各轮的 reasoning 剥离该字段。续想把每轮
 // reasoning 全量累加进 finalOutput（正常单响应只含 1 份）；不收敛会让客户端把
 // N 份账号绑定的加密载荷回传，逐轮把上下文顶爆窗口、并在跨账号换号时成批被拒
-//（issue #353）。早期各轮的加密上下文已在折叠时经 replayTail 回放并产出最终答案，
+// （issue #353）。早期各轮的加密上下文已在折叠时经 replayTail 回放并产出最终答案，
 // 使命已尽，无需再让客户端驱动一遍。逃生阀见 continueKeepAllEncrypted。
 func (st *foldState) clientFacingOutput() []json.RawMessage {
 	start := st.lastRoundReasoningStart
@@ -460,6 +484,43 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 	st := &foldState{}
 	var result continueFoldResult
 
+	// 保活循环只在确认进入隐藏续想后启动(首轮命中指纹、决定续想的那一刻),
+	// 单纯透传的首轮不启动——正常路径零变化。停止时同步等 goroutine 退出,
+	// 保证 fold 返回后不会再有保活回调与收尾 flush 并发。
+	var keepaliveStop, keepaliveDone chan struct{}
+	startKeepalive := func() {
+		if f.keepalive == nil || keepaliveStop != nil {
+			return
+		}
+		interval := f.keepaliveInterval
+		if interval <= 0 {
+			interval = continueKeepaliveInterval
+		}
+		keepaliveStop = make(chan struct{})
+		keepaliveDone = make(chan struct{})
+		go func() {
+			defer close(keepaliveDone)
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if !f.keepalive() {
+						return
+					}
+				case <-keepaliveStop:
+					return
+				}
+			}
+		}()
+	}
+	defer func() {
+		if keepaliveStop != nil {
+			close(keepaliveStop)
+			<-keepaliveDone
+		}
+	}()
+
 	resp := firstResp
 	roundNo := 0
 	for {
@@ -482,6 +543,7 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 			}
 		}
 		stat := continueRoundStat{
+			Trace:      f.snapshotTrace(),
 			Usage:      outcome.usage,
 			StatusCode: statusCode,
 			DurationMs: int(time.Since(roundStart).Milliseconds()),
@@ -542,6 +604,9 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 			return result
 		}
 
+		// 续想确认:从现在起进入隐藏轮,启动下游保活(幂等,多轮只启一次)。
+		startKeepalive()
+
 		// 续想：本轮 reasoning 剥 id 后连同 marker 追加到回放尾巴。
 		for _, ritem := range outcome.roundReasoning {
 			if stripped, ok := stripResponseItemID(ritem); ok {
@@ -552,14 +617,14 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 
 		nextBody, err := buildContinuationBody(f.baseBody, st.replayTail)
 		if err != nil {
-			result.FailedContinuation = &continueRoundStat{ErrMessage: err.Error()}
+			result.FailedContinuation = &continueRoundStat{ErrMessage: err.Error(), Trace: upstreamTraceSnapshot{RequestID: f.snapshotTrace().RequestID}}
 			f.forward(st.syntheticIncompleteEvent("upstream_error", outcome.usage))
 			result.StopReason = continueStopRoundError
 			return result
 		}
 		nextResp, err := f.openRound(nextBody)
 		if err != nil {
-			result.FailedContinuation = &continueRoundStat{ErrMessage: err.Error()}
+			result.FailedContinuation = &continueRoundStat{ErrMessage: err.Error(), Trace: f.snapshotTrace()}
 			f.forward(st.syntheticIncompleteEvent("upstream_error", outcome.usage))
 			result.StopReason = continueStopRoundError
 			return result
@@ -568,6 +633,7 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 			errBody, _ := io.ReadAll(io.LimitReader(nextResp.Body, 2048))
 			nextResp.Body.Close()
 			result.FailedContinuation = &continueRoundStat{
+				Trace:      f.snapshotTrace(),
 				StatusCode: nextResp.StatusCode,
 				ErrMessage: fmt.Sprintf("continuation round rejected: %s", upstreamErrorConsoleBody(errBody)),
 			}

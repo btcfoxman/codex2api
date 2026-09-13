@@ -142,11 +142,12 @@ type Handler struct {
 
 ```go
 type Store struct {
-    accounts      []*Account        // 账号列表
-    idx           uint64            // 轮询索引
-    maxConcurrency int              // 最大并发
-    globalRPM     int               // 全局 RPM
-    // ... 其他配置
+    accounts          []*Account                    // 写侧账号列表
+    accountSnapshot   atomic.Pointer[accountListSnapshot] // 请求只读快照
+    fastScheduler     atomic.Pointer[FastScheduler] // 分优先级/健康层索引
+    schedulerEngine   atomic.Value                  // legacy/shadow/indexed
+    availability      atomic.Pointer[availabilityHub]
+    maxConcurrency    int64
 }
 
 type Account struct {
@@ -197,7 +198,7 @@ type Account struct {
 │     • 排除已达并发上限的账号                                 │
 │     • 先按调度优先级排序                                     │
 │     • 同优先级按健康层级和调度分数排序                       │
-│     • 15% 概率随机打散                                       │
+│     • Indexed 在最高优先级/健康层内使用游标或亲和哈希         │
 └─────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -209,6 +210,18 @@ type Account struct {
 │     • 报告成功/失败                                          │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**大号池执行模型：**
+
+1. 账号集合在写侧变更后发布不可变指针快照；请求读快照不再复制 `[]*Account`。
+2. `indexed` 按调度优先级和健康层分桶，稳态通常只检查一个候选；稀疏 API Key/分组规则按需建立有界子池缓存，密集规则直接复用全局索引。
+3. 账号并发释放、冷却恢复、outbox 变更通过 generation channel 广播。等待账号的请求订阅事件并重试，不使用固定间隔轮询全池。
+4. 数据库触发器把会改变路由的账号、API Key、分组、代理和设置写入 `scheduler_outbox`。每个实例按水位批量合并并增量更新内存投影，选号 miss 不再触发请求级全库 reconcile。
+5. Grok 事实/目录维护使用 `maintenance_jobs(job_kind, due_at, lease_until)`；工作进程只 claim 到期行。PostgreSQL 使用 `SKIP LOCKED`，SQLite 使用事务写门，替代每 30 秒扫描全账号并解析多份 JSON。
+
+`legacy` 保留旧扫描实现；`shadow` 由旧路径实际选号并对索引做 1/64 可用性抽样；`indexed` 才让索引结果成为权威。三个模式可在运行时切换，不改变 `/v1/*` 协议。
+
+运维接口 `/api/admin/ops/overview` 的 `scheduler` 对象暴露选号耗时累计值、旧路径扫描账号数、等待/唤醒、路由子池缓存、shadow 差异，以及 outbox 水位、积压、延迟和错误数。
 
 ### 3. 请求执行器 (proxy.Executor)
 
@@ -242,7 +255,7 @@ func TranslateStreamChunk(data []byte, model, chunkID string) ([]byte, bool)
 - `messages` → `input`
 - `max_tokens/temperature` → 删除（Codex 不支持）
 - `reasoning_effort` → `reasoning.effort`
-- Anthropic `/v1/messages` 的 `speed:"fast"` → Codex `service_tier:"priority"`（Anthropic 入参 `service_tier` 为 Priority Tier，不参与 fast mode 映射）
+- Anthropic `/v1/messages` 在无可用 Claude OAuth 账号时的 `speed:"fast"` → Codex `service_tier:"priority"`（Anthropic 入参 `service_tier` 为 Priority Tier，不参与 fast mode 映射）；Claude OAuth 账号优先走原生 Anthropic Messages 透传，不进入 Codex 转换链
 - SSE 事件类型转换
 
 ---
@@ -452,6 +465,10 @@ CREATE TABLE system_settings (
     proxy_url VARCHAR(500),
     pg_max_conns INTEGER DEFAULT 50,
     redis_pool_size INTEGER DEFAULT 30,
+    response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
+    response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
+    response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
+    response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
     auto_clean_unauthorized BOOLEAN DEFAULT FALSE,
     auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
     admin_secret VARCHAR(255)
@@ -488,30 +505,58 @@ CREATE TABLE account_events (
 
 ### 缓存策略
 
-```go
-// Redis 缓存结构
-const (
-    // 限流计数器
-    KeyRateLimit = "ratelimit:{window}"
+| 数据 | 缓存策略 |
+| --- | --- |
+| API Key 鉴权配置 | 默认 L1 15 秒 / Redis L2 5 分钟，按数据库作用域和事务修订号隔离；关闭两级缓存后使用旧 `api-key` 策略 |
+| API Key 请求数、费用、Token 窗口统计 | 数据库聚合后写入 `api-key-limits`，TTL 60 秒；多个窗口批量读取 |
+| Key × 账号的共享用量增量 | `api-key-scope-delta` 分钟桶，TTL 5 分钟；最近三个桶共用 5 秒本地读取快照 |
+| Access Token | 专用 Token 缓存；写入 TTL 根据凭证有效期确定 |
+| 会话亲和关系 | 本地绑定及共享缓存；受会话 TTL 和账号可用性控制 |
+| 账号、模型冷却 | 运行态缓存；TTL 与冷却结束时间对应 |
 
-    // 会话缓存
-    KeySession = "session:{session_id}"
+运行态 Redis key 使用命名空间和摘要构造，业务 key 不直接作为 Redis key 输出。API Key 的 RPM/RPD 当前读取用量聚合快照；严格模型周预算由数据库事务和请求幂等记录控制。
 
-    // 用量统计缓存
-    KeyUsageStats = "usage:stats:{date}"
+API Key 运行态读取提供两个可选批量接口：`RuntimeBatchReader` 用于 JSON 窗口快照（Redis `MGET`），`RuntimeCounterBatchReader` 用于共享用量哈希（Redis Pipeline `HGETALL`）。每个 Redis 批次最多 128 个键；旧 `TokenCache` 适配器可以继续使用逐项读取。Memory 驱动在锁内复制快照，调用方不会拿到可修改底层缓存的引用。
 
-    // 账号 Token 缓存
-    KeyAccessToken = "token:{account_id}"
-)
+鉴权配置读取先复核数据库修订号（每进程最多复用 250 毫秒），再依次查询 L1、Redis L2 和数据库。配置回源按 Key/本地代际合并；L1 结果给每个调用者复制可变字段。累计 `quota_used` 不进入快照，有累计额度的 Key 仍逐次查询数据库；模型周预算保留转发前的权威事务。
 
-// 缓存 TTL
-type CacheTTL struct {
-    RateLimit    time.Duration = 1 * time.Minute
-    Session      time.Duration = 1 * time.Hour
-    UsageStats   time.Duration = 5 * time.Minute
-    AccessToken  time.Duration = 30 * time.Minute
-}
+`api_key_auth_cache_state` 的全局修订号与 Key 配置变更在同一事务提交，使用行更新保证提交顺序；不以可能乱序提交的 outbox 自增 ID 最大值作为版本。用量更新不推进版本。Redis key 包含数据库作用域、修订号和 Key 摘要，旧请求延迟回填只能写入旧版本。本地代际在失效时同步推进，阻止在途查询重新放入 L1。管理操作同步失效并发送 Pub/Sub；定期复核持久修订号覆盖通知断连、丢失和旧版本写入。
+
+L1 受 4,096 条、16 MiB 逻辑 JSON 字节和单条 64 KiB 预算限制；大条目仍可从数据库服务当前请求，但不入缓存。Memory 模式不复制第二份 L2。配置回源与修订查询都可由服务关闭取消并等待退出；单个请求取消不会中断其他调用者共享的读取。鉴权 Redis 读写有 300 毫秒 socket/上下文预算，故障回源数据库；无法复核数据库修订号时返回 503。
+
+分组/账号预算使用独立的回源合并，同一批读取不因首个调用者取消而中断其他请求；共享读取仍有两秒上限。后台共享增量写入限制为 16 个槽位，饱和时同步回退。
+
+#### Responses 上下文缓存
+
+`previous_response_id` 连续请求使用一层每进程独立的有界 L1。完成响应时先按完整 call/output 组保留尾部最多 200 个 raw item，再写入 L1；默认总量 64 MiB、单条准入 8 MiB、最多 2,000 条、绝对 TTL 10 分钟。LRU 同时受条数和逻辑字节预算约束，命中不会延长绝对 TTL。
+
+```text
+完成响应
+   │
+   ├─ pair-safe 尾部裁剪（最多 200 items）
+   │
+   ├─ 本进程 L1（64 MiB total / 8 MiB entry / 2,000 entries / 10m）
+   │
+   └─ Redis 共享 response context（仅 Redis 模式）
+
+previous_response_id 连续请求
+   │
+   ├─ L1 命中 ───────────────────────────────▶ 重建上下文
+   │
+   └─ L1 未命中
+       ├─ Redis 有界读取 → 规范化 → 重建上限校验
+       │    ├─ 符合 L1 准入 → 服务请求并提升到 L1
+       │    └─ 超 L1、未超重建上限 → 仅服务本次请求，不提升
+       └─ Memory 模式 → 无共享 response context 后备
 ```
+
+三个数据库预算分别控制 L1 总量、L1 单条准入和共享后端重建上限。只有预算实际变化的事务提交才分配递增 generation，并立即应用到写入实例；同值或空更新不递增。其他实例每 5 秒读取一次，单次最多等待 3 秒，只应用更新的 generation。读取失败时保留最后一次有效配置，并记录同步错误供运维页展示。
+
+Memory 模式只有 L1。已知超限/淘汰，或依赖的必需上下文缺失/过期且没有 relay 后备时，Responses/Compact 连续请求可返回 HTTP `409 response_context_unavailable`。Redis 值损坏或超过重建上限且没有 relay 后备时同样返回 409；共享后端传输故障且请求确实依赖该上下文时可返回 HTTP `503`。Redis 中未超过重建上限的上下文不会仅因超过 L1 准入预算而失败。
+
+客户端原生 Responses WebSocket 入口不执行本地 response-cache 查找，保留 `previous_response_id` 交给上游。上述预算和 409/503 语义适用于本地重建的 HTTP Responses/Compact 路径。
+
+`GET /api/admin/ops/overview` 的 `response_cache` 从一个锁内快照返回 effective/applied generation、当前/上限/高水位/最大观测条目的逻辑字节，以及本地/远程命中与未命中、过期、条数/字节淘汰、超限旁路、Memory 超限拒绝和最终 409 计数。这里的字节是保留 JSON payload 长度之和，不包含 Go 对象、LRU、allocator 或容器开销，不是 RSS 硬上限。进程内存需要结合 Linux/Docker RSS、Go `HeapAlloc` / `HeapInuse` / `HeapReleased` 和 `NumGC` 判断。
 
 ---
 

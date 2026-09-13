@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -14,14 +15,21 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imageproc"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/imageupscale"
+	"github.com/codex2api/security"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -29,11 +37,26 @@ import (
 )
 
 const (
-	defaultImagesMainModel = "gpt-5.4-mini"
+	// defaultImagesMainModel 是生图链路里驱动 image_generation 工具调用的主模型
+	// (图像本身由 tools[0].model 决定,主模型只负责发起工具调用,token 开销极小)。
+	// 2026-09 起 ChatGPT 账号的 Codex manifest 已不含 gpt-5.4-mini,上游对它直接回
+	// 400 "The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT
+	// account",整条生图链路随之全断;free/plus/pro 三档 manifest 均含 gpt-5.6-luna,
+	// 故改用它。系统生图设置或 CODEX_IMAGES_MAIN_MODEL 可覆盖;上游再次下线时,
+	// imagesMainModelFallbacks 会在同一账号上按序换驱动重试,不会把 400 记到生图模型头上。
+	defaultImagesMainModel = "gpt-5.6-luna"
 	defaultImagesToolModel = "gpt-image-2"
 
 	imageModel2KAlias = "gpt-image-2-2k"
 	imageModel4KAlias = "gpt-image-2-4k"
+
+	// imageModel2KSuffix / imageModel4KSuffix 是分辨率档位别名后缀:任意
+	// gpt-image-* 模型都可以带 -2k / -4k(如 gpt-image-2-4k),网关剥掉后缀
+	// 作为 tools[0].model 发上游,并按档位补默认尺寸与超分计划。
+	imageModel2KSuffix = "-2k"
+	imageModel4KSuffix = "-4k"
+
+	imagesMainModelEnv = "CODEX_IMAGES_MAIN_MODEL"
 
 	defaultImages1KSize = "1024x1024"
 	defaultImages2KSize = "2048x2048"
@@ -49,8 +72,8 @@ const (
 
 	maxGPTImage2Pixels = 8294400
 
-	// maxImageAttempts caps the total number of upstream attempts for image
-	// generation requests, including retries across different accounts.
+	// maxImageAttempts caps ordinary finite image retries. A failure selected by
+	// continuous retry bypasses it until the client disconnects.
 	maxImageAttempts = 5
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
@@ -63,9 +86,80 @@ const (
 
 	// imageCloudURLTTL 控制 response_format=url 时返回的预签名云直链有效期。
 	imageCloudURLTTL = time.Hour
+
+	imageOAuthUnavailableCooldown = 30 * time.Minute
+	imageModelTextMaxBytes        = 600
 )
 
 var imageStreamKeepaliveInterval = 15 * time.Second
+
+// imagesMainModelFallbacks 是驱动主模型被上游按"不支持"拒绝时的候选序列,
+// 按 free/plus/pro 三档 manifest 的交集从便宜到贵排列。
+var imagesMainModelFallbacks = []string{"gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"}
+
+// ImagesDefaultMainModel 返回未配置系统生图设置时的文本驱动，供后台展示。
+func ImagesDefaultMainModel() string {
+	if value := strings.TrimSpace(os.Getenv(imagesMainModelEnv)); value != "" {
+		return value
+	}
+	return defaultImagesMainModel
+}
+
+// NormalizeImagesMainModel 校验文本驱动名称；空值表示使用部署默认值。
+// 允许尚未同步到模型目录的名称，以便使用中转或新发布的文本模型。
+func NormalizeImagesMainModel(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if len(value) > 128 || strings.IndexFunc(value, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return "", fmt.Errorf("codex_images_main_model 必须是不超过 128 字节且不含空白的模型名称")
+	}
+	if isImageOnlyModel(value) {
+		return "", fmt.Errorf("codex_images_main_model 必须是文本模型，不能使用图像模型")
+	}
+	return value, nil
+}
+
+// imagesMainModel 在每次构造生图请求时读取配置，后台保存后立即生效。
+// 优先级：系统设置 > 环境变量 > 内置默认值。
+func imagesMainModel() string {
+	if value := CurrentRuntimeSettings().CodexImagesMainModel; value != "" {
+		return value
+	}
+	return ImagesDefaultMainModel()
+}
+
+// imagesMainModelCandidates 返回驱动主模型的完整候选序列(首选 + 回退),去重且
+// 排除生图模型本身。
+func imagesMainModelCandidates() []string {
+	seen := make(map[string]bool, len(imagesMainModelFallbacks)+1)
+	candidates := make([]string, 0, len(imagesMainModelFallbacks)+1)
+	for _, candidate := range append([]string{imagesMainModel()}, imagesMainModelFallbacks...) {
+		key := strings.ToLower(strings.TrimSpace(candidate))
+		if key == "" || seen[key] || isImageOnlyModel(key) {
+			continue
+		}
+		seen[key] = true
+		candidates = append(candidates, strings.TrimSpace(candidate))
+	}
+	return candidates
+}
+
+// nextImagesMainModelAfterUnsupported 判断上游 400 是否在拒绝当前驱动主模型
+// (而不是生图模型或请求内容),是则返回下一个未试过的候选驱动。tried 记录本次请求
+// 已被拒绝的驱动,由调用方跨重试保存。
+func nextImagesMainModelAfterUnsupported(responsesBody, errBody []byte, tried map[string]bool) (string, bool) {
+	current := strings.TrimSpace(gjson.GetBytes(responsesBody, "model").String())
+	rejected := codexUnsupportedModelFromBody(errBody)
+	if current == "" || rejected == "" || !strings.EqualFold(current, rejected) || isImageOnlyModel(rejected) {
+		return "", false
+	}
+	tried[strings.ToLower(current)] = true
+	for _, candidate := range imagesMainModelCandidates() {
+		if !tried[strings.ToLower(candidate)] {
+			return candidate, true
+		}
+	}
+	return "", false
+}
 
 type imageCallResult struct {
 	Result        string
@@ -352,6 +446,34 @@ func isImageOnlyModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-image-")
 }
 
+// IsGPTImageModel 判断模型名是否属于 Codex 生图模型族(gpt-image-*),含 -2k/-4k
+// 档位别名与带日期的快照名。供 admin 生图台等外部包复用同一准入判定。
+func IsGPTImageModel(model string) bool {
+	return isImageOnlyModel(model)
+}
+
+// splitImageModelSizeAlias 把 gpt-image-*-2k / -4k 拆成基础模型与档位后缀;
+// 无后缀时返回原模型与空串。
+func splitImageModelSizeAlias(model string) (string, string) {
+	model = strings.TrimSpace(model)
+	lower := strings.ToLower(model)
+	for _, suffix := range []string{imageModel2KSuffix, imageModel4KSuffix} {
+		if strings.HasSuffix(lower, suffix) && len(lower) > len(suffix) {
+			base := model[:len(model)-len(suffix)]
+			if isImageOnlyModel(base) {
+				return base, suffix
+			}
+		}
+	}
+	return model, ""
+}
+
+// isGPTImage2FamilyModel 判断是否 gpt-image-2 世代(含 2.5 flare/sunburst 及其快照名):
+// 这一族共用 1K/2K/4K 尺寸档位与提示词方向推断;更早或未知型号不补默认尺寸。
+func isGPTImage2FamilyModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-image-2")
+}
+
 type imageDefaultSizeSet struct {
 	defaultSize   string
 	squareSize    string
@@ -365,30 +487,39 @@ func normalizeImageToolModel(model string) (string, string) {
 
 func normalizeImageToolModelForPrompt(model string, prompt string) (string, string) {
 	model = strings.TrimSpace(model)
-	switch strings.ToLower(model) {
-	case "", defaultImagesToolModel:
-		return defaultImagesToolModel, inferDefaultImageSize(prompt, imageDefaultSizeSet{
-			defaultSize:   defaultImages1KSize,
-			squareSize:    defaultImages1KSize,
-			landscapeSize: defaultImages1KLandscapeSize,
-			portraitSize:  defaultImages1KPortraitSize,
-		})
-	case imageModel2KAlias:
-		return defaultImagesToolModel, inferDefaultImageSize(prompt, imageDefaultSizeSet{
+	if model == "" {
+		model = defaultImagesToolModel
+	}
+	base, tier := splitImageModelSizeAlias(model)
+	if strings.EqualFold(base, defaultImagesToolModel) {
+		base = defaultImagesToolModel
+	}
+	if !isGPTImage2FamilyModel(base) {
+		// gpt-image-1.5 等更早型号或未知名字:原样透传,尺寸交给上游默认。
+		return model, ""
+	}
+	switch tier {
+	case imageModel2KSuffix:
+		return base, inferDefaultImageSize(prompt, imageDefaultSizeSet{
 			defaultSize:   defaultImages2KSize,
 			squareSize:    defaultImages2KSize,
 			landscapeSize: defaultImages2KLandscapeSize,
 			portraitSize:  defaultImages2KPortraitSize,
 		})
-	case imageModel4KAlias:
-		return defaultImagesToolModel, inferDefaultImageSize(prompt, imageDefaultSizeSet{
+	case imageModel4KSuffix:
+		return base, inferDefaultImageSize(prompt, imageDefaultSizeSet{
 			defaultSize:   defaultImages4KSize,
 			squareSize:    defaultImages4KSquareSize,
 			landscapeSize: defaultImages4KLandscapeSize,
 			portraitSize:  defaultImages4KPortraitSize,
 		})
 	default:
-		return model, ""
+		return base, inferDefaultImageSize(prompt, imageDefaultSizeSet{
+			defaultSize:   defaultImages1KSize,
+			squareSize:    defaultImages1KSize,
+			landscapeSize: defaultImages1KLandscapeSize,
+			portraitSize:  defaultImages1KPortraitSize,
+		})
 	}
 }
 
@@ -458,7 +589,7 @@ func setDefaultImageToolSize(tool []byte, defaultSize string) []byte {
 
 func shouldValidateGPTImage2Size(model string) bool {
 	toolModel, _ := normalizeImageToolModel(model)
-	return strings.EqualFold(strings.TrimSpace(toolModel), defaultImagesToolModel)
+	return isGPTImage2FamilyModel(toolModel)
 }
 
 func validateGPTImage2Size(size string) error {
@@ -907,16 +1038,27 @@ func stripResponsesImageGenerationCapabilities(body []byte) []byte {
 }
 
 func validateImagesModel(model string) error {
-	if !isImageOnlyModel(model) {
+	if isGrokVideoModel(model) {
+		return fmt.Errorf("model %q is a video model, use /v1/videos/generations instead", strings.TrimSpace(model))
+	}
+	if !isImageOnlyModel(model) && !isGrokImageModel(model) {
 		return fmt.Errorf("images endpoint requires an image model, got %q", strings.TrimSpace(model))
 	}
 	return nil
 }
 
+// mediaOnlyModelEndpoints 返回媒体专用模型对应的下游端点提示文案。
+func mediaOnlyModelEndpoints(model string) string {
+	if isGrokVideoModel(model) {
+		return "/v1/videos/generations, /v1/videos/edits and /v1/videos/extensions"
+	}
+	return "/v1/images/generations and /v1/images/edits"
+}
+
 func sendImageOnlyModelError(c *gin.Context, model string) {
 	c.JSON(http.StatusServiceUnavailable, gin.H{
 		"error": gin.H{
-			"message": fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", strings.TrimSpace(model)),
+			"message": fmt.Sprintf("model %s is only supported on %s", strings.TrimSpace(model), mediaOnlyModelEndpoints(model)),
 			"type":    "server_error",
 		},
 	})
@@ -1057,6 +1199,10 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
+	if isGrokImageModel(imageModel) {
+		h.forwardGrokImagesRequest(c, "/v1/images/generations", imageModel, requestModel, logEffectiveModel, promptForRequest, responseFormat, grokImagesParamsFromJSON(rawBody), nil, stream)
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -1185,6 +1331,10 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
+	}
+	if isGrokImageModel(imageModel) {
+		h.forwardGrokImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, promptForRequest, responseFormat, grokImagesParamsFromForm(c), images, stream)
+		return
 	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
@@ -1321,6 +1471,10 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
+	if isGrokImageModel(imageModel) {
+		h.forwardGrokImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, promptForRequest, responseFormat, grokImagesParamsFromJSON(rawBody), images, stream)
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -1345,7 +1499,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
 	req := []byte(`{"instructions":"","stream":true,"reasoning":{"effort":"medium","summary":"auto"},"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"model":"","store":false,"tool_choice":{"type":"image_generation"}}`)
-	req, _ = sjson.SetBytes(req, "model", defaultImagesMainModel)
+	req, _ = sjson.SetBytes(req, "model", imagesMainModel())
 
 	input := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]`)
 	input, _ = sjson.SetBytes(input, "0.content.0.text", prompt)
@@ -1368,8 +1522,14 @@ func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte
 	return req
 }
 
+// imageCapableAccountFilter 生图上游目前只有 Codex 官方账号支持:中转/Grok
+// 账号拿到 image_generation 请求只会对上游 401/404,还会把自己误标成 unauthorized。
+func imageCapableAccountFilter(account *auth.Account) bool {
+	return account != nil && !account.IsRelayStyle()
+}
+
 func imagePreferredAccountFilter(account *auth.Account) bool {
-	if account == nil {
+	if !imageCapableAccountFilter(account) {
 		return false
 	}
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
@@ -1386,7 +1546,7 @@ func (h *Handler) nextImageAccount(c *gin.Context, apiKeyID int64, exclude map[i
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	fallbackFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, nil))
+	fallbackFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, imageCapableAccountFilter))
 	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, fallbackFilter))
 }
 
@@ -1403,13 +1563,28 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, responsesBody)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
+	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
+	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
+	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolResponses)
+	defer stopRetryDeadline()
+	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, stream, "text/event-stream")
+	defer stopRetryKeepalive()
+	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
+		activateContinuousRetryKeepalive(c.Request.Context())
+	}
 	maxRetries := h.getMaxRetries()
 	maxRateLimitRetries := h.getMaxRateLimitRetries()
 	generalRetries := 0
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
-	excludeAccounts := make(map[int64]bool)
+	retryExclusions := newRetryAccountExclusions()
+	continuousRetryActive := false
+	var sameAccountRetryID int64
+	sameAccountEmptyRetried := make(map[int64]bool)
+	// 驱动主模型被上游拒绝("The 'X' model is not supported ...")时换下一个候选驱动
+	// 在同一账号上重试;记录已拒绝的驱动避免绕圈。
+	rejectedMainModels := make(map[string]bool)
 
 	// 仅在 response_format=url 且配置了云存储时启用：上传图片到对象存储、
 	// 登记进图库并返回预签名直链。否则 urlFor 为 nil，沿用 base64/data URL。
@@ -1418,22 +1593,78 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	if persister != nil {
 		urlFor = persister.buildURL
 	}
+	upscalePlan := imageUpscalePlanForRequest(requestModel, responsesBody)
 
-	for attempt := 0; attempt < maxImageAttempts; attempt++ {
+	for attempt := 0; ; attempt++ {
+		if attempt >= maxImageAttempts && !continuousRetryActive {
+			break
+		}
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		account, stickyProxyURL := h.nextImageAccount(c, apiKeyID, excludeAccounts, requestModel, sessionIdentity)
+		selectAccount := func(exclude map[int64]bool) (*auth.Account, string) {
+			return h.nextImageAccount(c, apiKeyID, exclude, requestModel, sessionIdentity)
+		}
+		var account *auth.Account
+		var stickyProxyURL string
+		if sameAccountRetryID > 0 {
+			preferredID := sameAccountRetryID
+			sameAccountRetryID = 0
+			preferredFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
+			preferredFilter = h.applyScopeBudgetFilter(c, preferredFilter)
+			account = h.store.TakePreferredAccountWithDispatch(preferredID, apiKeyID, nil, preferredFilter, dispatchPolicyForModel(requestModel))
+			if account != nil {
+				stickyProxyURL = account.GetProxyURL()
+			}
+		}
+		if account == nil && continuousRetryActive {
+			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount, h.store.Release)
+		} else if account == nil {
+			account, stickyProxyURL = nextBoundedRetryAccountWithContext(c.Request.Context(), h.store.Release, retryExclusions, selectAccount)
+		}
+		if account != nil && c.Request.Context().Err() != nil {
+			h.store.Release(account)
+			if continuousRetryDeadlineExceeded(c.Request.Context()) {
+				continuousRetryCommitExpired(c, continuousRetryProtocolResponses)
+			}
+			return
+		}
 		if account == nil {
-			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, nil))
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.applyScopeBudgetFilter(c, waitFilter))
+			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
+				return
+			}
+			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
+			var selectionErr error
+			account, stickyProxyURL, selectionErr = h.waitForRetryAccountAvailable(c.Request.Context(), "", apiKeyID, retryExclusions.ForSelection(), h.applyScopeBudgetFilter(c, waitFilter), false, dispatchPolicyForModel(requestModel))
+			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
+				return
+			}
+			if account != nil && c.Request.Context().Err() != nil {
+				h.store.Release(account)
+				if continuousRetryDeadlineExceeded(c.Request.Context()) {
+					continuousRetryCommitExpired(c, continuousRetryProtocolResponses)
+				}
+				return
+			}
 			if account == nil {
+				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) || c.Request.Context().Err() != nil {
+					return
+				}
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					if stream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+						return
+					}
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
 				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+					if stream && writeCommittedResponsesRetryError(c, msg) {
+						return
+					}
 					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+					return
+				}
+				if stream && writeCommittedResponsesRetryError(c, noAvailableAccountMessage("")) {
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
@@ -1450,57 +1681,129 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
+		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(c.Request.Context(), func() (*http.Response, error) {
+			return ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
+		})
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
+			if apiKeyModelRequestError(reqErr) != nil {
+				h.store.Release(account)
+				sendAPIKeyModelRequestQuotaError(c, reqErr)
+				return
+			}
+			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
+			if kind := classifyTransportFailure(reqErr); retryable && shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !retryable {
+				if stream && writeCommittedResponsesRetryError(c, continuousRetryRequestErrorMessage(reqErr)) {
+					return
+				}
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			continuousSelected := continuousRetryLimitForRequestError(reqErr, 0, continuousRetryPolicy) == -1
+			retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
+			shouldRetry := retryAllowedByEndpointCap(attempt, maxImageAttempts, continuousSelected) && shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
+			if shouldRetry {
+				rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
+				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries, continuousRetryPolicy)
+				continuousRetryActive = continuousRetryActive || continuousSelected
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit) {
+					return
+				}
 				continue
+			}
+			if stream && writeCommittedResponsesRetryError(c, continuousRetryRequestErrorMessage(reqErr)) {
+				return
 			}
 			ErrorToGinResponse(c, reqErr)
 			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
+			resp.Body.Close()
+			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
+				h.store.Release(account)
+				return
+			}
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
+			if resp.StatusCode == http.StatusBadRequest {
+				// 400 拒绝的是驱动主模型而非生图模型:不能按 (账号, 生图模型) 冷却——那会把
+				// 唯一能生图的账号整体拉黑 30 分钟;换下一个候选驱动在同一账号上重试。
+				if nextMainModel, ok := nextImagesMainModelAfterUnsupported(responsesBody, errBody, rejectedMainModels); ok {
+					rejectedMainModel := gjson.GetBytes(responsesBody, "model").String()
+					log.Printf("账号 %d (plan=%s) 生图驱动模型 %s 被上游拒绝，改用 %s 重试（可通过 %s 覆盖默认驱动）", account.ID(), account.GetPlanType(), rejectedMainModel, nextMainModel, imagesMainModelEnv)
+					if rewritten, err := sjson.SetBytes(responsesBody, "model", nextMainModel); err == nil {
+						responsesBody = rewritten
+					}
+					h.logUsageForRequest(c, &database.UsageLogInput{
+						AccountID:         account.ID(),
+						Endpoint:          inboundEndpoint,
+						Model:             logModel,
+						EffectiveModel:    logEffectiveModel,
+						StatusCode:        resp.StatusCode,
+						DurationMs:        durationMs,
+						InboundEndpoint:   inboundEndpoint,
+						UpstreamEndpoint:  "/v1/responses",
+						Stream:            stream,
+						IsRetryAttempt:    true,
+						AttemptIndex:      attempt + 1,
+						UpstreamErrorKind: "images_main_model_unsupported",
+						ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+					})
+					lastStatusCode = resp.StatusCode
+					lastBody = errBody
+					sameAccountRetryID = account.ID()
+					continue
+				}
+			}
+			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody, upstreamCyberPolicyAttempt{
+				Transport: upstreamPromptPolicyTransport(stream, false), StatusCode: resp.StatusCode,
+				AccountID: account.ID(), AttemptIndex: attempt + 1,
+			}))
+			markImageModelUnavailableFromHTTP(h.store, account, requestModel, resp.StatusCode, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			continuousSelected := continuousRetryHTTPSelected(continuousRetryPolicy, resp.StatusCode, errBody)
+			shouldRetry := retryAllowedByEndpointCap(attempt, maxImageAttempts, continuousSelected) && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          inboundEndpoint,
-				Model:             logModel,
-				EffectiveModel:    logEffectiveModel,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				InboundEndpoint:   inboundEndpoint,
-				UpstreamEndpoint:  "/v1/responses",
-				Stream:            stream,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:              account.ID(),
+				Endpoint:               inboundEndpoint,
+				Model:                  logModel,
+				EffectiveModel:         logEffectiveModel,
+				StatusCode:             resp.StatusCode,
+				DurationMs:             durationMs,
+				InboundEndpoint:        inboundEndpoint,
+				UpstreamEndpoint:       "/v1/responses",
+				Stream:                 stream,
+				IsRetryAttempt:         shouldRetry,
+				AttemptIndex:           attempt + 1,
+				UpstreamErrorKind:      upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:           usageLogErrorMessage(resp.StatusCode, errBody),
+				PromptPolicyIncidentID: promptPolicyIncidentID,
 			})
 			if shouldRetry {
+				clearNewAPIUpstreamCyberPolicyDecision(c)
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+				continuousRetryActive = continuousRetryActive || continuousSelected
+				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+					return
+				}
 				continue
+			}
+			if stream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(resp.StatusCode, errBody)) {
+				return
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
@@ -1516,58 +1819,203 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		var firstTokenMs int
 		var imageCount int
 		var imageLogInfo imageUsageLogInfo
+		var wroteImageOutput bool
 		var readErr error
+		promptPolicyIncidentID := ""
+		var streamAttempt *continuousRetryStreamAttempt
 		if stream {
-			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start)
+			downstreamFlusher, _ := c.Writer.(http.Flusher)
+			streamAttempt = h.newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
+			usage, imageCount, firstTokenMs, imageLogInfo, wroteImageOutput, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start, upscalePlan, streamAttempt)
+			if payload := imageResponseFailedPayload(readErr); len(payload) > 0 {
+				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, responseFailedErrorBody(payload), upstreamCyberPolicyAttempt{
+					Transport: "sse", StatusCode: http.StatusBadGateway, AccountID: account.ID(), AttemptIndex: attempt + 1,
+				}))
+			}
 		} else {
 			var out []byte
-			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(c.Request.Context(), resp.Body, responseFormat, requestModel, urlFor)
+			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(c.Request.Context(), resp.Body, responseFormat, requestModel, urlFor, upscalePlan, continuousRetryBuffersAttempts(continuousRetryPolicy))
+			if payload := imageResponseFailedPayload(readErr); len(payload) > 0 {
+				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, responseFailedErrorBody(payload), upstreamCyberPolicyAttempt{
+					Transport: "http", StatusCode: http.StatusBadGateway, AccountID: account.ID(), AttemptIndex: attempt + 1,
+				}))
+			}
 			if readErr == nil {
+				if !claimContinuousRetrySuccess(c, continuousRetryProtocolResponses) {
+					resp.Body.Close()
+					h.store.Release(account)
+					return
+				}
 				persister.finalize(c.Request.Context())
 				c.Data(http.StatusOK, "application/json", out)
 			} else {
 				// Check retryability BEFORE writing error response to avoid
 				// double-write when the error is transient.
+				markImageModelUnavailable(h.store, account, requestModel, readErr)
+				logImageNoOutputOutcome(account, inboundEndpoint, requestModel, readErr)
+				accountID := account.ID()
 				resp.Body.Close()
 				h.store.Release(account)
-				excludeAccounts[account.ID()] = true
-				willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
+				willRetry := c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts, continuousRetryPolicy)
+				preferSameAccount := willRetry && imageErrorPrefersSameAccountRetry(readErr) && !sameAccountEmptyRetried[accountID]
+				if preferSameAccount {
+					sameAccountEmptyRetried[accountID] = true
+					sameAccountRetryID = accountID
+				}
 				// Always record the failed attempt so it appears in usage stats,
 				// matching the chat completions error path.
-				h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+				failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
+				failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+				if promptPolicyIncidentID != "" {
+					failedLog.UpstreamErrorKind = "cyber_policy"
+				}
+				h.logUsageForRequest(c, failedLog)
 				if willRetry {
-					lastStatusCode = http.StatusBadGateway
-					lastBody = []byte(readErr.Error())
+					rememberContinuousRetryStreamFailure(c.Request.Context(), streamOutcome{
+						logStatusCode:  imageErrorStatusCode(readErr),
+						failureKind:    imageErrorKind(readErr),
+						failureMessage: readErr.Error(),
+					}, imageResponseFailedPayload(readErr))
+					clearNewAPIUpstreamCyberPolicyDecision(c)
+					lastStatusCode = imageErrorStatusCode(readErr)
+					lastBody = imageErrorResponseBody(readErr)
+					continuousSelected := imageStreamRetryLimit(readErr, 0, continuousRetryPolicy) == -1
+					retryLimit := imageStreamRetryLimit(readErr, maxRetries, continuousRetryPolicy)
+					if preferSameAccount {
+						// A truly empty terminal is often a one-off upstream miss. Retry
+						// the same credential once without cooling or excluding it.
+					} else if continuousSelected {
+						continuousRetryActive = true
+						retryExclusions.MarkTransient(accountID)
+						if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit, resp) {
+							return
+						}
+					} else {
+						retryExclusions.MarkHard(accountID)
+					}
 					continue
 				}
-				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
+				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					return
+				}
+				statusCode, payload := imageErrorResponse(readErr)
+				c.JSON(statusCode, payload)
 				return
 			}
 		}
 
 		statusCode := http.StatusOK
 		if readErr != nil {
-			statusCode = http.StatusBadGateway
+			statusCode = imageErrorStatusCode(readErr)
+			localReplayFailure := isContinuousRetryLocalFailure(readErr)
+			if localReplayFailure {
+				statusCode = http.StatusInternalServerError
+			}
 			// Retry stream read errors on next account when there are attempts left.
 			// Stream disconnects and upstream image generation failures can be
 			// transient (e.g. upstream model overload, network hiccup).
+			markImageModelUnavailable(h.store, account, requestModel, readErr)
+			logImageNoOutputOutcome(account, inboundEndpoint, requestModel, readErr)
+			accountID := account.ID()
 			resp.Body.Close()
 			h.store.Release(account)
-			excludeAccounts[account.ID()] = true
-			// Only retry when nothing has been written to the client yet.
-			willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) && !c.Writer.Written()
+			// Connected/keepalive comments do not commit model output. A retry is
+			// still transparent until the first partial/completed image event.
+			downstreamWrote := streamAttempt.downstreamWrote(wroteImageOutput)
+			willRetry := !localReplayFailure && !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts, continuousRetryPolicy)
+			preferSameAccount := willRetry && imageErrorPrefersSameAccountRetry(readErr) && !sameAccountEmptyRetried[accountID]
+			if preferSameAccount {
+				sameAccountEmptyRetried[accountID] = true
+				sameAccountRetryID = accountID
+			}
 			// Always record the failed attempt so it appears in usage stats.
-			h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+			failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
+			if localReplayFailure {
+				failedLog.StatusCode = http.StatusInternalServerError
+				failedLog.UpstreamErrorKind = "local"
+				failedLog.ErrorMessage = usageLogFailureMessage(http.StatusInternalServerError, continuousRetryLocalFailureMessage)
+			}
+			failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+			if promptPolicyIncidentID != "" {
+				failedLog.UpstreamErrorKind = "cyber_policy"
+			}
+			h.logUsageForRequest(c, failedLog)
 			if willRetry {
+				rememberContinuousRetryStreamFailure(c.Request.Context(), streamOutcome{
+					logStatusCode:  statusCode,
+					failureKind:    imageErrorKind(readErr),
+					failureMessage: readErr.Error(),
+				}, imageResponseFailedPayload(readErr))
+				_ = streamAttempt.Close()
+				clearNewAPIUpstreamCyberPolicyDecision(c)
 				lastStatusCode = statusCode
-				lastBody = []byte(readErr.Error())
+				lastBody = imageErrorResponseBody(readErr)
+				continuousSelected := imageStreamRetryLimit(readErr, 0, continuousRetryPolicy) == -1
+				retryLimit := imageStreamRetryLimit(readErr, maxRetries, continuousRetryPolicy)
+				if preferSameAccount {
+					// Same-account empty-output retry is intentionally immediate.
+				} else if continuousSelected {
+					continuousRetryActive = true
+					retryExclusions.MarkTransient(accountID)
+					if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, retryLimit, resp) {
+						return
+					}
+				} else {
+					retryExclusions.MarkHard(accountID)
+				}
 				continue
 			}
-			// Non-retryable -- deliver error response if nothing written yet.
-			if !c.Writer.Written() {
-				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
+			_ = streamAttempt.Close()
+			// A pre-output failure may follow an already-flushed keepalive comment,
+			// so finish it as an SSE error instead of attempting a JSON response.
+			if localReplayFailure && c.Request.Context().Err() == nil {
+				if claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					writeImageStreamErrorEvent(c, readErr)
+				}
+			} else if !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && c.Writer.Written() {
+				if claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					writeImageStreamErrorEvent(c, readErr)
+				}
+			} else if !c.Writer.Written() {
+				if claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
+					clientStatus, payload := imageErrorResponse(readErr)
+					c.JSON(clientStatus, payload)
+				}
 			}
 			return
+		}
+		if streamAttempt != nil {
+			if !claimContinuousRetrySuccess(c, continuousRetryProtocolResponses) {
+				_ = streamAttempt.Close()
+				resp.Body.Close()
+				h.store.Release(account)
+				return
+			}
+			if commitErr := h.commitStreamAttempt(c, streamAttempt); commitErr != nil {
+				if isContinuousRetryLocalFailure(commitErr) {
+					localErr := errors.New(continuousRetryLocalFailureMessage)
+					failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, false, localErr, usage, imageLogInfo)
+					failedLog.StatusCode = http.StatusInternalServerError
+					failedLog.UpstreamErrorKind = "local"
+					failedLog.ErrorMessage = usageLogFailureMessage(http.StatusInternalServerError, continuousRetryLocalFailureMessage)
+					h.logUsageForRequest(c, failedLog)
+					if c.Request.Context().Err() == nil {
+						writeImageStreamErrorEvent(c, commitErr)
+					}
+					_ = streamAttempt.Close()
+					resp.Body.Close()
+					h.store.Release(account)
+					return
+				}
+				if c.Request.Context().Err() == nil && c.Writer.Written() {
+					writeImageStreamErrorEvent(c, commitErr)
+				}
+				_ = streamAttempt.Close()
+				resp.Body.Close()
+				h.store.Release(account)
+				return
+			}
+			_ = streamAttempt.Close()
 		}
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
@@ -1589,6 +2037,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			logInput.OutputTokens = usage.OutputTokens
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
+			logInput.ImageInputTokens, logInput.ImageOutputTokens, logInput.CachedImageInputTokens = usage.ImageInputTokens, usage.ImageOutputTokens, usage.CachedImageInputTokens
 		}
 		if imageCount > 0 && logInput.CompletionTokens == 0 {
 			logInput.CompletionTokens = imageCount
@@ -1607,7 +2056,13 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	}
 	// Exhausted all attempts.
 	if lastStatusCode > 0 && len(lastBody) > 0 {
+		if stream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+			return
+		}
 		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+		return
+	}
+	if stream && writeCommittedResponsesRetryError(c, noAvailableAccountMessage("")) {
 		return
 	}
 	c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
@@ -1618,19 +2073,21 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 // Previously the read-error retry paths called continue without logging, so
 // failed image requests were silently missing from the statistics.
 func buildImageErrorUsageLog(account *auth.Account, inboundEndpoint, logModel, logEffectiveModel string, stream bool, durationMs, attempt int, willRetry bool, readErr error, usage *UsageInfo, imageLogInfo imageUsageLogInfo) *database.UsageLogInput {
+	statusCode := imageErrorStatusCode(readErr)
 	logInput := &database.UsageLogInput{
-		AccountID:        account.ID(),
-		Endpoint:         inboundEndpoint,
-		Model:            logModel,
-		EffectiveModel:   logEffectiveModel,
-		StatusCode:       http.StatusBadGateway,
-		DurationMs:       durationMs,
-		InboundEndpoint:  inboundEndpoint,
-		UpstreamEndpoint: "/v1/responses",
-		Stream:           stream,
-		IsRetryAttempt:   willRetry,
-		AttemptIndex:     attempt + 1,
-		ErrorMessage:     usageLogErrorMessage(http.StatusBadGateway, []byte(readErr.Error())),
+		AccountID:         account.ID(),
+		Endpoint:          inboundEndpoint,
+		Model:             logModel,
+		EffectiveModel:    logEffectiveModel,
+		StatusCode:        statusCode,
+		DurationMs:        durationMs,
+		InboundEndpoint:   inboundEndpoint,
+		UpstreamEndpoint:  "/v1/responses",
+		Stream:            stream,
+		IsRetryAttempt:    willRetry,
+		AttemptIndex:      attempt + 1,
+		UpstreamErrorKind: imageErrorKind(readErr),
+		ErrorMessage:      usageLogFailureMessage(statusCode, readErr.Error()),
 	}
 	if usage != nil {
 		logInput.PromptTokens = usage.PromptTokens
@@ -1640,6 +2097,7 @@ func buildImageErrorUsageLog(account *auth.Account, inboundEndpoint, logModel, l
 		logInput.OutputTokens = usage.OutputTokens
 		logInput.ReasoningTokens = usage.ReasoningTokens
 		logInput.CachedTokens = usage.CachedTokens
+		logInput.ImageInputTokens, logInput.ImageOutputTokens, logInput.CachedImageInputTokens = usage.ImageInputTokens, usage.ImageOutputTokens, usage.CachedImageInputTokens
 	}
 	applyImageUsageLogInfo(logInput, imageLogInfo)
 	return logInput
@@ -1648,30 +2106,544 @@ func buildImageErrorUsageLog(account *auth.Account, inboundEndpoint, logModel, l
 // shouldRetryImageStreamError determines whether an image generation stream
 // read error warrants retrying on a different account. Transient failures
 // (stream disconnects, upstream model errors) are retryable; permanent
-// failures (content policy, invalid request, quota exhausted) are not.
-func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetries int, attempt int, maxAttempts int) bool {
-	if err == nil || generalRetries == nil || *generalRetries >= maxGeneralRetries {
+// failures stay bounded unless the operator selected them explicitly or used
+// catch-all. Explicitly selected failures bypass the ordinary image-attempt
+// cap; unselected legacy retry budgets keep honoring it.
+func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetries int, attempt int, maxAttempts int, policies ...database.ContinuousRetryPolicy) bool {
+	if err == nil || generalRetries == nil {
 		return false
 	}
-	if attempt >= maxAttempts-1 {
+	if isImageStreamTerminalLocalError(err) {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	// Never retry content policy or safety violations.
-	for _, keyword := range []string{
-		"content_policy", "safety", "cyber_policy",
-		"unsupported_country", "invalid_request",
-	} {
-		if strings.Contains(msg, keyword) {
+	if isExplicitUpstreamCyberPolicyError(err) {
+		return false
+	}
+	if payload := imageResponseFailedPayload(err); len(payload) > 0 &&
+		(isExplicitUpstreamSafetyPolicy(payload) || isExplicitUpstreamCyberPolicy(payload)) {
+		return false
+	}
+	policy := continuousRetryPolicyForCall(policies)
+	if outcome := imageNoOutputDetails(err); outcome != nil {
+		if outcome.statusCode < http.StatusInternalServerError {
 			return false
 		}
+		continuousSelected := imageStreamRetryLimit(err, 0, policy) == -1
+		if !retryAllowedByEndpointCap(attempt, maxAttempts, continuousSelected) {
+			return false
+		}
+		// No-output/incomplete outcomes are account/model execution failures,
+		// not client request errors. Give them one bounded failover path even
+		// when the generic transport retry count is zero; catch-all may remain
+		// unlimited until cancellation as elsewhere.
+		*generalRetries++
+		return true
+	}
+	continuousSelected := imageStreamRetryLimit(err, 0, policy) == -1
+	if !continuousSelected {
+		// Keep the pre-continuous-retry image contract for disabled and
+		// unselected failures: the legacy keyword guard, finite retry budget,
+		// and ordinary endpoint attempt cap remain authoritative.
+		if !retryBudgetAvailable(*generalRetries, maxGeneralRetries) || attempt >= maxAttempts-1 {
+			return false
+		}
+		msg := strings.ToLower(err.Error())
+		for _, keyword := range []string{
+			"content_policy", "safety", "cyber_policy",
+			"unsupported_country", "invalid_request",
+		} {
+			if strings.Contains(msg, keyword) {
+				return false
+			}
+		}
+		*generalRetries++
+		return true
+	}
+
+	// Continuous selection is opt-in. Only this branch may apply the new
+	// structured refusal/quota guards and bypass the ordinary image cap.
+	if payload := imageResponseFailedPayload(err); len(payload) > 0 {
+		if isExplicitUpstreamCyberPolicy(payload) {
+			return false
+		}
+		if isExplicitUpstreamSafetyPolicy(payload) && !policy.CatchesAllUpstreamFailures() {
+			return false
+		}
+		if isPermanentQuotaFailure(responseFailedErrorBody(payload)) && !policy.CatchesAllUpstreamFailures() && !policy.MatchesErrorCodes(payload) {
+			return false
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	explicitCodeSelected := policy.MatchesErrorCodes([]byte(err.Error()))
+	if payload := imageResponseFailedPayload(err); len(payload) > 0 {
+		explicitCodeSelected = policy.MatchesErrorCodes(payload)
+	}
+	if !policy.CatchesAllUpstreamFailures() && !explicitCodeSelected {
+		for _, keyword := range []string{
+			"content_policy", "safety", "cyber_policy",
+			"unsupported_country", "invalid_request",
+		} {
+			if strings.Contains(msg, keyword) {
+				return false
+			}
+		}
+	}
+	maxGeneralRetries = imageStreamRetryLimit(err, maxGeneralRetries, policy)
+	if !retryAllowedByEndpointCap(attempt, maxAttempts, continuousSelected) {
+		return false
+	}
+	if !retryBudgetAvailable(*generalRetries, maxGeneralRetries) {
+		return false
 	}
 	// Retry transient upstream issues.
 	*generalRetries++
 	return true
 }
 
-func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, fallbackModel string, urlFor imageURLBuilder) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
+func imageStreamRetryLimit(err error, generalLimit int, policies ...database.ContinuousRetryPolicy) int {
+	if isContinuousRetryLocalFailure(err) {
+		return generalLimit
+	}
+	policy := continuousRetryPolicyForCall(policies)
+	payload := imageResponseFailedPayload(err)
+	if len(payload) > 0 {
+		outcome := classifyResponseFailedOutcome(payload)
+		if continuousRetryStreamSelected(outcome, payload, imageResponseFailedEventType(err), policy) {
+			return -1
+		}
+		return generalLimit
+	}
+	outcome := streamOutcome{
+		logStatusCode:  logStatusUpstreamStreamBreak,
+		failureKind:    "transport",
+		failurePayload: []byte(err.Error()),
+		penalize:       true,
+	}
+	if continuousRetryStreamSelected(outcome, outcome.failurePayload, "", policy) {
+		return -1
+	}
+	return generalLimit
+}
+
+// imageUpscaleTimeout 是单张图超分(含并发闸排队)的耗时上限,对齐生图台。
+const imageUpscaleTimeout = 3 * time.Minute
+
+// imageUpscalePlan 记录请求解析阶段确定的物理目标尺寸:-2k/-4k 别名承诺的是
+// 最终输出分辨率,上游只按 quality 返回基础图,差额由网关超分补齐(issue #477)。
+type imageUpscalePlan struct {
+	Scale         string
+	RequestedSize string
+}
+
+func (p imageUpscalePlan) enabled() bool {
+	return p.Scale != ""
+}
+
+// imageUpscalePlanForRequest 只对 -2k/-4k 别名生成计划;RequestedSize 取 tool
+// 里最终生效的 size(用户显式值优先,否则别名默认),它是权威目标尺寸。
+func imageUpscalePlanForRequest(requestModel string, responsesBody []byte) imageUpscalePlan {
+	var scale string
+	switch _, tier := splitImageModelSizeAlias(requestModel); tier {
+	case imageModel2KSuffix:
+		scale = imageproc.Upscale2K
+	case imageModel4KSuffix:
+		scale = imageproc.Upscale4K
+	default:
+		return imageUpscalePlan{}
+	}
+	requestedSize := strings.TrimSpace(gjson.GetBytes(responsesBody, "tools.0.size").String())
+	if strings.EqualFold(requestedSize, "auto") {
+		requestedSize = ""
+	}
+	return imageUpscalePlan{Scale: scale, RequestedSize: requestedSize}
+}
+
+// applyImageUpscalePlan 对最终返回的每张图执行超分;失败时降级返回上游基础
+// 分辨率而不是让整个请求失败(图本身仍可用)。partial 预览帧不经过这里。
+func applyImageUpscalePlan(ctx context.Context, plan imageUpscalePlan, results []imageCallResult) []imageCallResult {
+	if !plan.enabled() {
+		return results
+	}
+	for i := range results {
+		data, ok := decodeImageBase64(results[i].Result)
+		if !ok {
+			continue
+		}
+		upscaleCtx, cancel := context.WithTimeout(ctx, imageUpscaleTimeout)
+		upscaled, err := imageupscale.EnsureSize(upscaleCtx, data, plan.Scale, plan.RequestedSize)
+		cancel()
+		if err != nil {
+			log.Printf("images 超分失败,按上游基础分辨率返回 (scale=%s size=%s backend=%s): %v",
+				plan.Scale, plan.RequestedSize, imageupscale.Backend(), err)
+			continue
+		}
+		if upscaled == nil {
+			continue
+		}
+		results[i].Result = base64.StdEncoding.EncodeToString(upscaled.Data)
+		results[i].OutputFormat = imageFormatFromContentType(upscaled.ContentType)
+		results[i].ByteSize = len(upscaled.Data)
+		results[i].Width = upscaled.Width
+		results[i].Height = upscaled.Height
+		results[i].Size = fmt.Sprintf("%dx%d", upscaled.Width, upscaled.Height)
+	}
+	return results
+}
+
+func imageFormatFromContentType(contentType string) string {
+	switch strings.ToLower(strings.TrimSpace(contentType)) {
+	case "image/jpeg", "image/jpg":
+		return "jpeg"
+	case "image/webp":
+		return "webp"
+	default:
+		return "png"
+	}
+}
+
+type imageNoOutputKind string
+
+const (
+	imageNoOutputSafety      imageNoOutputKind = "safety"
+	imageNoOutputUnavailable imageNoOutputKind = "unavailable"
+	imageNoOutputEmpty       imageNoOutputKind = "empty"
+	imageNoOutputIncomplete  imageNoOutputKind = "incomplete"
+)
+
+// imageNoOutputError preserves why a nominally successful Responses stream did
+// not produce an image. The outer scheduler can then distinguish deterministic
+// user-policy refusals from account/model capability failures and transient
+// empty/incomplete generations.
+type imageNoOutputError struct {
+	kind       imageNoOutputKind
+	statusCode int
+	errorType  string
+	code       string
+	message    string
+}
+
+func (e *imageNoOutputError) Error() string {
+	if e == nil || strings.TrimSpace(e.message) == "" {
+		return "upstream did not return image output"
+	}
+	return e.message
+}
+
+func appendImageModelText(builder *strings.Builder, text string) {
+	if builder == nil || builder.Len() >= imageModelTextMaxBytes {
+		return
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteByte(' ')
+	}
+	remaining := imageModelTextMaxBytes - builder.Len()
+	if len(text) > remaining {
+		text = text[:remaining]
+	}
+	builder.WriteString(text)
+}
+
+func collectImageModelText(builder *strings.Builder, payload []byte) {
+	if builder == nil || len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return
+	}
+	collectItem := func(item gjson.Result) {
+		if item.Get("type").String() != "message" {
+			return
+		}
+		item.Get("content").ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() == "output_text" {
+				appendImageModelText(builder, part.Get("text").String())
+			}
+			return builder.Len() < imageModelTextMaxBytes
+		})
+	}
+
+	switch gjson.GetBytes(payload, "type").String() {
+	case "response.output_text.delta":
+		appendImageModelText(builder, gjson.GetBytes(payload, "delta").String())
+	case "response.output_text.done":
+		appendImageModelText(builder, gjson.GetBytes(payload, "text").String())
+	case "response.output_item.done":
+		collectItem(gjson.GetBytes(payload, "item"))
+	case "response.completed", "response.incomplete":
+		gjson.GetBytes(payload, "response.output").ForEach(func(_, item gjson.Result) bool {
+			collectItem(item)
+			return builder.Len() < imageModelTextMaxBytes
+		})
+	}
+}
+
+// imageModelReplyPreviewMaxRunes 限制回填进错误信息/用量日志的模型文本长度。
+const imageModelReplyPreviewMaxRunes = 240
+
+// imageModelReplyPreview 把模型的文本回复压成一行可安全外发的摘要：折叠空白、
+// 脱敏、按 rune 截断（不能按字节截，中文回复会被切成乱码）。
+func imageModelReplyPreview(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return ""
+	}
+	preview := security.SafeTruncate(security.SanitizeLog(text), imageModelReplyPreviewMaxRunes)
+	if utf8.RuneCountInString(text) > imageModelReplyPreviewMaxRunes {
+		preview += "…"
+	}
+	return preview
+}
+
+func imageTextContainsAny(lower string, markers ...string) bool {
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isImageContentPolicyRefusal 判断"有文本、无图片"的终态是不是模型的内容拒绝。
+// 两类证据任一成立即判定：
+//  1. 文本点名了审核/安全/内容政策等术语。
+//  2. 自然语言拒绝：既有"无法/不能"类拒绝措辞，又点名了政策类主题（真实人物、
+//     版权、成人内容等）。模型用中文回复时几乎不会出现第 1 类术语，这种拒绝
+//     以前会被当成上游故障换号重试，最后回一句看不出原因的 502（issue #589
+//     里三个账号连环 502 很可能就是这样来的）。
+//
+// 只有拒绝措辞、没有主题的文本（"I can't generate images right now"）不算：那更
+// 像账号缺图片工具的能力缺失，应当换号重试而不是按用户错误终止。
+func isImageContentPolicyRefusal(text string) bool {
+	lower := strings.ToLower(text)
+	if imageTextContainsAny(lower,
+		"content policy", "content_policy", "content filter", "content_filter",
+		"safety system", "safety policy", "safety violation", "moderation",
+		"usage policies", "usage policy", "against our policies", "against my guidelines",
+		"安全系统", "安全策略", "安全政策", "内容政策", "内容审核", "违规内容", "不适合生成",
+		"使用政策", "使用规范", "内容规范",
+	) {
+		return true
+	}
+	refusal := imageTextContainsAny(lower,
+		"can't", "cannot", "can not", "unable to", "not able to", "won't be able", "not allowed to",
+		"无法", "不能", "不会为", "不可以", "不被允许", "不允许",
+	)
+	if !refusal {
+		return false
+	}
+	return imageTextContainsAny(lower,
+		"real people", "real person", "real individual", "actual person", "public figure", "celebrit",
+		"likeness", "copyright", "trademark", "intellectual property", "explicit", "sexual", "nudity",
+		"violence", "violent", "gore", "graphic content", "hateful", "harassment", "self-harm",
+		"minors", "underage", "children",
+		"真实人物", "真人", "公众人物", "名人", "明星", "肖像", "版权", "商标", "知识产权",
+		"未成年", "儿童", "色情", "裸露", "成人内容", "暴力", "血腥", "仇恨", "骚扰", "自残",
+		"敏感内容", "敏感题材", "不符合", "违反",
+	)
+}
+
+func classifyImageNoOutput(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return &imageNoOutputError{
+			kind:       imageNoOutputEmpty,
+			statusCode: http.StatusBadGateway,
+			errorType:  "upstream_error",
+			code:       "image_generation_empty_output",
+			message:    "Upstream did not return image output",
+		}
+	}
+	if isImageContentPolicyRefusal(text) {
+		return &imageNoOutputError{
+			kind:       imageNoOutputSafety,
+			statusCode: http.StatusBadRequest,
+			errorType:  "image_generation_user_error",
+			code:       "content_policy_violation",
+			message:    imageModelReplyPreview(text),
+		}
+	}
+	// 把模型说了什么带回给调用方和用量日志。以前这里只回一句固定文案，用户和
+	// 运维都看不到上游到底为什么没出图（issue #589）。
+	message := "Upstream did not execute image generation"
+	if preview := imageModelReplyPreview(text); preview != "" {
+		message += "; model replied: " + preview
+	}
+	return &imageNoOutputError{
+		kind:       imageNoOutputUnavailable,
+		statusCode: http.StatusBadGateway,
+		errorType:  "upstream_error",
+		code:       "image_generation_unavailable",
+		message:    message,
+	}
+}
+
+func classifyImageIncomplete(payload []byte) error {
+	reason := strings.TrimSpace(gjson.GetBytes(payload, "response.incomplete_details.reason").String())
+	lowerReason := strings.ToLower(reason)
+	if strings.Contains(lowerReason, "content_filter") || strings.Contains(lowerReason, "moderation") || strings.Contains(lowerReason, "safety") {
+		message := "Upstream image generation was blocked by content policy"
+		if reason != "" {
+			message = "Upstream image generation incomplete: " + reason
+		}
+		return &imageNoOutputError{
+			kind:       imageNoOutputSafety,
+			statusCode: http.StatusBadRequest,
+			errorType:  "image_generation_user_error",
+			code:       "content_policy_violation",
+			message:    security.SafeTruncate(security.SanitizeLog(message), imageModelTextMaxBytes),
+		}
+	}
+	message := "Upstream did not complete image generation"
+	if reason != "" {
+		message = "Upstream image generation incomplete: " + reason
+	}
+	return &imageNoOutputError{
+		kind:       imageNoOutputIncomplete,
+		statusCode: http.StatusBadGateway,
+		errorType:  "incomplete_error",
+		code:       "response_incomplete",
+		message:    security.SafeTruncate(security.SanitizeLog(message), imageModelTextMaxBytes),
+	}
+}
+
+func imageNoOutputDetails(err error) *imageNoOutputError {
+	var outcome *imageNoOutputError
+	if errors.As(err, &outcome) {
+		return outcome
+	}
+	return nil
+}
+
+func imageErrorStatusCode(err error) int {
+	if outcome := imageNoOutputDetails(err); outcome != nil && outcome.statusCode > 0 {
+		return outcome.statusCode
+	}
+	if payload := imageResponseFailedPayload(err); len(payload) > 0 &&
+		(isExplicitUpstreamSafetyPolicy(payload) || isExplicitUpstreamCyberPolicy(payload)) {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
+}
+
+func imageErrorResponse(err error) (int, gin.H) {
+	statusCode := imageErrorStatusCode(err)
+	errorType := "upstream_error"
+	code := "image_generation_failed"
+	message := "Upstream image generation failed"
+	if err != nil && strings.TrimSpace(err.Error()) != "" {
+		message = err.Error()
+	}
+	if outcome := imageNoOutputDetails(err); outcome != nil {
+		errorType = outcome.errorType
+		code = outcome.code
+		message = outcome.Error()
+	} else if payload := imageResponseFailedPayload(err); len(payload) > 0 {
+		code = firstNonEmptyImageErrorField(
+			gjson.GetBytes(payload, "response.error.code").String(),
+			gjson.GetBytes(payload, "error.code").String(),
+			code,
+		)
+		errorType = firstNonEmptyImageErrorField(
+			gjson.GetBytes(payload, "response.error.type").String(),
+			gjson.GetBytes(payload, "error.type").String(),
+			errorType,
+		)
+	}
+	return statusCode, gin.H{"error": gin.H{"message": message, "type": errorType, "code": code}}
+}
+
+func imageErrorResponseBody(err error) []byte {
+	_, payload := imageErrorResponse(err)
+	body, _ := json.Marshal(payload)
+	return body
+}
+
+func imageErrorKind(err error) string {
+	if outcome := imageNoOutputDetails(err); outcome != nil {
+		if outcome.kind == imageNoOutputSafety {
+			return "content_policy"
+		}
+		if outcome.code != "" {
+			return outcome.code
+		}
+	}
+	if imageErrorStatusCode(err) == http.StatusBadRequest {
+		return "content_policy"
+	}
+	return "upstream_error"
+}
+
+func imageErrorNeedsModelCooldown(err error) bool {
+	return isExplicitImageGenerationCapabilityLoss(imageResponseFailedPayload(err))
+}
+
+func markImageModelUnavailable(store *auth.Store, account *auth.Account, model string, err error) {
+	if store == nil || account == nil || !imageErrorNeedsModelCooldown(err) {
+		return
+	}
+	markImageModelCapabilityUnavailable(store, account, model)
+}
+
+// logImageNoOutputOutcome 把"上游收到请求却没出图"的终态连同模型文本打进服务日志，
+// 让运维不用翻用量日志也能看到上游给出的理由（issue #589）。
+func logImageNoOutputOutcome(account *auth.Account, inboundEndpoint, model string, err error) {
+	outcome := imageNoOutputDetails(err)
+	if outcome == nil || account == nil {
+		return
+	}
+	log.Printf("%s 上游未产出图片 (account=%d model=%s kind=%s status=%d): %s",
+		inboundEndpoint, account.ID(), model, outcome.kind, outcome.statusCode, outcome.Error())
+}
+
+func markImageModelUnavailableFromHTTP(store *auth.Store, account *auth.Account, model string, statusCode int, body []byte) {
+	if statusCode != http.StatusBadRequest || !isExplicitImageGenerationCapabilityLoss(body) {
+		return
+	}
+	markImageModelCapabilityUnavailable(store, account, model)
+}
+
+// isExplicitImageGenerationCapabilityLoss only accepts structured upstream
+// evidence. A response.completed frame containing plain model text is still
+// retryable for this request, but it is prompt-dependent and must not persist a
+// capability cooldown on the account/model pair.
+func isExplicitImageGenerationCapabilityLoss(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	code := strings.ToLower(firstNonEmptyImageErrorField(
+		gjson.GetBytes(payload, "response.error.code").String(),
+		gjson.GetBytes(payload, "error.code").String(),
+	))
+	if code == "image_generation_unavailable" {
+		return true
+	}
+	message := strings.ToLower(firstNonEmptyImageErrorField(
+		gjson.GetBytes(payload, "response.error.message").String(),
+		gjson.GetBytes(payload, "error.message").String(),
+		gjson.GetBytes(payload, "message").String(),
+		string(payload),
+	))
+	return strings.Contains(message, "image_generation") &&
+		strings.Contains(message, "not found in 'tools' parameter")
+}
+
+func markImageModelCapabilityUnavailable(store *auth.Store, account *auth.Account, model string) {
+	if store == nil || account == nil {
+		return
+	}
+	cooldown := store.MarkModelCooldown(account, model, imageOAuthUnavailableCooldown, "openai_images_oauth_tool_unavailable")
+	if !cooldown.ResetAt.IsZero() {
+		log.Printf("账号 %d 的 OAuth 图片工具明确不可用，模型 %s 冷却到 %s", account.ID(), model, cooldown.ResetAt.Format(time.RFC3339))
+	}
+}
+
+func imageErrorPrefersSameAccountRetry(err error) bool {
+	outcome := imageNoOutputDetails(err)
+	return outcome != nil && outcome.kind == imageNoOutputEmpty
+}
+
+func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, fallbackModel string, urlFor imageURLBuilder, upscalePlan imageUpscalePlan, requireSuccessfulTerminal ...bool) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
 	var (
 		out            []byte
 		usage          *UsageInfo
@@ -1680,21 +2652,26 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 		firstMeta      = imageCallResult{Model: fallbackModel}
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
+		gotTerminal    bool
+		modelText      strings.Builder
 	)
-	err := ReadSSEStream(body, func(data []byte) bool {
+	requireTerminal := len(requireSuccessfulTerminal) > 0 && requireSuccessfulTerminal[0]
+	err := ReadSSEStreamWithEvent(body, func(event string, data []byte) bool {
+		collectImageModelText(&modelText, data)
 		if meta, eventCreatedAt, ok := extractImageMetaFromLifecycleEvent(data); ok {
 			mergeImageMeta(&firstMeta, meta)
 			if eventCreatedAt > 0 {
 				createdAt = eventCreatedAt
 			}
 		}
-		switch gjson.GetBytes(data, "type").String() {
+		switch normalizedUpstreamSSEEventType(event, data) {
 		case "response.output_item.done":
 			if image, ok := extractImageFromOutputItemDone(data, fallbackModel); ok {
 				mergeImageMeta(&image, firstMeta)
 				pendingResults = append(pendingResults, image)
 			}
 		case "response.completed":
+			gotTerminal = true
 			results, completedAt, usageRaw, completedMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, fallbackModel)
 			if err != nil {
 				readErr = err
@@ -1714,17 +2691,22 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 				}
 			}
 			if len(results) == 0 {
-				readErr = fmt.Errorf("upstream did not return image output")
+				readErr = classifyImageNoOutput(modelText.String())
 				return false
 			}
+			results = applyImageUpscalePlan(ctx, upscalePlan, results)
 			out, readErr = buildImagesAPIResponse(ctx, results, createdAt, usageRaw, firstMeta, responseFormat, urlFor)
 			imageLogInfo = imageUsageLogInfoFromImages(results)
 			return false
 		case "error":
-			readErr = imageGenerationFailureError(data)
+			readErr = newImageSSEFailureError("error", data)
 			return false
 		case "response.failed":
-			readErr = imageGenerationFailureError(data)
+			readErr = newImageResponseFailedError(data)
+			return false
+		case "response.incomplete":
+			gotTerminal = true
+			readErr = classifyImageIncomplete(data)
 			return false
 		}
 		return true
@@ -1736,10 +2718,14 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 		return nil, usage, 0, imageLogInfo, readErr
 	}
 	if len(out) == 0 {
+		if requireTerminal && !gotTerminal {
+			return nil, usage, 0, imageLogInfo, fmt.Errorf("stream disconnected before image generation completed")
+		}
 		if len(pendingResults) > 0 {
 			for i := range pendingResults {
 				mergeImageMeta(&pendingResults[i], firstMeta)
 			}
+			pendingResults = applyImageUpscalePlan(ctx, upscalePlan, pendingResults)
 			out, readErr = buildImagesAPIResponse(ctx, pendingResults, createdAt, nil, firstMeta, responseFormat, urlFor)
 			if readErr != nil {
 				return nil, usage, 0, imageLogInfo, readErr
@@ -1752,7 +2738,7 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 	return out, usage, len(gjson.GetBytes(out, "data").Array()), imageLogInfo, nil
 }
 
-func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseFormat, streamPrefix, fallbackModel string, start time.Time) (*UsageInfo, int, int, imageUsageLogInfo, error) {
+func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseFormat, streamPrefix, fallbackModel string, start time.Time, upscalePlan imageUpscalePlan, attempts ...*continuousRetryStreamAttempt) (*UsageInfo, int, int, imageUsageLogInfo, bool, error) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -1760,20 +2746,35 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		return nil, 0, 0, imageUsageLogInfo{}, fmt.Errorf("streaming not supported")
+		return nil, 0, 0, imageUsageLogInfo{}, false, &imageStreamWriteError{cause: fmt.Errorf("streaming not supported")}
 	}
 
 	var (
-		usage          *UsageInfo
-		firstTokenMs   int
-		createdAt      int64
-		streamMeta     = imageCallResult{Model: fallbackModel}
-		pendingResults []imageCallResult
-		imageCount     int
-		imageLogInfo   imageUsageLogInfo
-		readErr        error
+		usage            *UsageInfo
+		firstTokenMs     int
+		createdAt        int64
+		streamMeta       = imageCallResult{Model: fallbackModel}
+		pendingResults   []imageCallResult
+		imageCount       int
+		imageLogInfo     imageUsageLogInfo
+		wroteImageOutput bool
+		readErr          error
+		gotTerminal      bool
+		modelText        strings.Builder
 	)
-	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
+	var streamAttempt *continuousRetryStreamAttempt
+	if len(attempts) > 0 {
+		streamAttempt = attempts[0]
+	}
+	var streamWriter *streamFlushWriter
+	if streamAttempt != nil {
+		// Keep the output-policy scanner out of the private attempt. It must see
+		// only the winning, terminal stream during the single downstream commit;
+		// scanning a failed attempt can turn a local policy decision into a retry.
+		streamWriter = newStreamFlushWriter(streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(flusher))
+	} else {
+		streamWriter = h.newStreamFlushWriter(c, c.Writer, flusher)
+	}
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once
@@ -1808,7 +2809,11 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				err = streamWriter.Flush()
 			}
 			if err != nil && readErr == nil {
-				readErr = err
+				if streamAttempt != nil {
+					readErr = &imageStreamReplayError{cause: err}
+				} else {
+					readErr = &imageStreamWriteError{cause: err}
+				}
 			}
 		} else {
 			err = readErr
@@ -1819,7 +2824,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		}
 		return err
 	}
-	writeEvent := func(eventName string, payload []byte) {
+	writeEvent := func(eventName string, payload []byte) error {
 		var builder strings.Builder
 		if strings.TrimSpace(eventName) != "" {
 			builder.WriteString("event: ")
@@ -1829,20 +2834,38 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		builder.WriteString("data: ")
 		builder.Write(payload)
 		builder.WriteString("\n\n")
-		_ = writeRaw(builder.String(), true)
+		return writeRaw(builder.String(), true)
 	}
-	if err := writeRaw(imageStreamConnectedComment, true); err != nil {
-		return nil, 0, 0, imageUsageLogInfo{}, err
+	writeKeepalive := func(comment string) error {
+		if streamAttempt == nil {
+			return writeRaw(comment, true)
+		}
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if readErr != nil {
+			return readErr
+		}
+		if _, err := c.Writer.WriteString(comment); err != nil {
+			readErr = &imageStreamWriteError{cause: err}
+			closeUpstream()
+			return readErr
+		}
+		flusher.Flush()
+		return nil
+	}
+	if err := writeKeepalive(imageStreamConnectedComment); err != nil {
+		return nil, 0, 0, imageUsageLogInfo{}, false, getReadErr()
 	}
 	stopKeepalive := startImageStreamKeepalive(c.Request.Context(), imageStreamKeepaliveInterval, func() bool {
-		return writeRaw(imageStreamKeepaliveComment, true) == nil
+		return writeKeepalive(imageStreamKeepaliveComment) == nil
 	})
 	defer stopKeepalive()
 
-	err := ReadSSEStream(body, func(data []byte) bool {
+	err := ReadSSEStreamWithEvent(body, func(event string, data []byte) bool {
 		if getReadErr() != nil {
 			return false
 		}
+		collectImageModelText(&modelText, data)
 		if firstTokenMs == 0 {
 			firstTokenMs = int(time.Since(start).Milliseconds())
 		}
@@ -1852,7 +2875,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				createdAt = eventCreatedAt
 			}
 		}
-		switch gjson.GetBytes(data, "type").String() {
+		switch normalizedUpstreamSSEEventType(event, data) {
 		case "response.image_generation_call.partial_image":
 			b64 := strings.TrimSpace(gjson.GetBytes(data, "partial_image_b64").String())
 			if b64 == "" {
@@ -1864,16 +2887,22 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				Background:   strings.TrimSpace(gjson.GetBytes(data, "background").String()),
 			})
 			eventName := streamPrefix + ".partial_image"
-			writeEvent(eventName, buildImagesStreamPartialPayload(eventName, b64, gjson.GetBytes(data, "partial_image_index").Int(), responseFormat, createdAt, partialMeta))
+			if err := writeEvent(eventName, buildImagesStreamPartialPayload(eventName, b64, gjson.GetBytes(data, "partial_image_index").Int(), responseFormat, createdAt, partialMeta)); err != nil {
+				return false
+			}
+			wroteImageOutput = true
 		case "response.output_item.done":
 			if image, ok := extractImageFromOutputItemDone(data, fallbackModel); ok {
 				mergeImageMeta(&image, streamMeta)
 				pendingResults = append(pendingResults, image)
 			}
 		case "response.completed":
+			gotTerminal = true
 			results, completedAt, usageRaw, firstMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, fallbackModel)
 			if err != nil {
-				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				if wroteImageOutput {
+					_ = writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				}
 				setReadErr(err)
 				return false
 			}
@@ -1888,27 +2917,46 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				results = pendingResults
 			}
 			if len(results) == 0 {
-				err := fmt.Errorf("upstream did not return image output")
-				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				err := classifyImageNoOutput(modelText.String())
+				if wroteImageOutput {
+					_ = writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				}
 				setReadErr(err)
 				return false
 			}
+			// 超分期间 keepalive 注释帧仍在发送,下游连接不会因此空闲超时。
+			results = applyImageUpscalePlan(c.Request.Context(), upscalePlan, results)
 			eventName := streamPrefix + ".completed"
 			for _, image := range results {
 				mergeImageMeta(&image, streamMeta)
-				writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, usageRaw))
+				if err := writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, usageRaw)); err != nil {
+					return false
+				}
+				wroteImageOutput = true
 				imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				imageCount++
 			}
 			return false
 		case "error":
-			err := imageGenerationFailureError(data)
-			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			err := newImageSSEFailureError("error", data)
+			if wroteImageOutput {
+				_ = writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			}
 			setReadErr(err)
 			return false
 		case "response.failed":
-			err := imageGenerationFailureError(data)
-			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			err := newImageResponseFailedError(data)
+			if wroteImageOutput {
+				_ = writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			}
+			setReadErr(err)
+			return false
+		case "response.incomplete":
+			gotTerminal = true
+			err := classifyImageIncomplete(data)
+			if wroteImageOutput {
+				_ = writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			}
 			setReadErr(err)
 			return false
 		}
@@ -1917,38 +2965,55 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 	stopKeepalive()
 	writeMu.Lock()
 	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
-		readErr = finalizeErr
+		if streamAttempt != nil {
+			readErr = &imageStreamReplayError{cause: finalizeErr}
+		} else {
+			readErr = &imageStreamWriteError{cause: finalizeErr}
+		}
 	}
 	writeMu.Unlock()
 	if err != nil {
 		if streamErr := getReadErr(); streamErr != nil {
-			return usage, imageCount, firstTokenMs, imageLogInfo, streamErr
+			return usage, imageCount, firstTokenMs, imageLogInfo, wroteImageOutput, streamErr
 		}
-		return usage, imageCount, firstTokenMs, imageLogInfo, err
+		return usage, imageCount, firstTokenMs, imageLogInfo, wroteImageOutput, err
 	}
 	if getReadErr() == nil {
 		_ = writeRaw("", true)
 	}
-	if imageCount == 0 && len(pendingResults) > 0 && getReadErr() == nil {
+	if imageCount == 0 && len(pendingResults) > 0 && getReadErr() == nil && streamAttempt == nil {
+		pendingResults = applyImageUpscalePlan(c.Request.Context(), upscalePlan, pendingResults)
 		eventName := streamPrefix + ".completed"
 		for _, image := range pendingResults {
 			mergeImageMeta(&image, streamMeta)
-			writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, nil))
+			if err := writeEvent(eventName, buildImagesStreamCompletedPayload(eventName, image, responseFormat, createdAt, nil)); err != nil {
+				break
+			}
+			wroteImageOutput = true
 			imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 			imageCount++
 		}
 	}
+	if streamAttempt != nil && !gotTerminal && getReadErr() == nil {
+		setReadErr(fmt.Errorf("stream disconnected before image generation completed"))
+	}
 	if imageCount == 0 && getReadErr() == nil {
 		err := fmt.Errorf("stream disconnected before image generation completed")
-		writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+		if wroteImageOutput {
+			_ = writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+		}
 		setReadErr(err)
 	}
 	writeMu.Lock()
 	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
-		readErr = finalizeErr
+		if streamAttempt != nil {
+			readErr = &imageStreamReplayError{cause: finalizeErr}
+		} else {
+			readErr = &imageStreamWriteError{cause: finalizeErr}
+		}
 	}
 	writeMu.Unlock()
-	return usage, imageCount, firstTokenMs, imageLogInfo, getReadErr()
+	return usage, imageCount, firstTokenMs, imageLogInfo, wroteImageOutput, getReadErr()
 }
 
 func startImageStreamKeepalive(ctx context.Context, interval time.Duration, writeKeepalive func() bool) func() {
@@ -1959,8 +3024,10 @@ func startImageStreamKeepalive(ctx context.Context, interval time.Duration, writ
 		ctx = context.Background()
 	}
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	var stopOnce sync.Once
 	go func() {
+		defer close(exited)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -1980,6 +3047,7 @@ func startImageStreamKeepalive(ctx context.Context, interval time.Duration, writ
 		stopOnce.Do(func() {
 			close(done)
 		})
+		<-exited
 	}
 }
 
@@ -2002,6 +3070,140 @@ func imageGenerationFailureError(payload []byte) error {
 		return fmt.Errorf("upstream image generation failed (%s): %s", code, message)
 	}
 	return fmt.Errorf("upstream image generation failed: %s", message)
+}
+
+type imageStreamWriteError struct {
+	cause error
+}
+
+func (e *imageStreamWriteError) Error() string {
+	if e == nil || e.cause == nil {
+		return "downstream image stream write failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *imageStreamWriteError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func isImageStreamWriteError(err error) bool {
+	var writeErr *imageStreamWriteError
+	return errors.As(err, &writeErr)
+}
+
+// imageStreamReplayError is local proxy state: the private attempt could not
+// be buffered within the configured storage/size bounds. Retrying another
+// paid upstream attempt cannot repair it.
+type imageStreamReplayError struct {
+	cause error
+}
+
+func (e *imageStreamReplayError) Error() string {
+	if e == nil || e.cause == nil {
+		return "continuous retry image replay failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *imageStreamReplayError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func isImageStreamReplayError(err error) bool {
+	var replayErr *imageStreamReplayError
+	return errors.As(err, &replayErr)
+}
+
+func isImageStreamTerminalLocalError(err error) bool {
+	return isImageStreamWriteError(err) || isImageStreamReplayError(err) ||
+		errors.Is(err, promptfilter.ErrOutputBlocked) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func writeImageStreamErrorEvent(c *gin.Context, err error) {
+	if c == nil || err == nil {
+		return
+	}
+	message := err.Error()
+	localFailure := isContinuousRetryLocalFailure(err)
+	if localFailure {
+		message = continuousRetryLocalFailureMessage
+		if !c.Writer.Written() {
+			c.Status(http.StatusInternalServerError)
+		}
+	}
+	var frame bytes.Buffer
+	frame.WriteString("event: error\n")
+	frame.WriteString("data: ")
+	if localFailure {
+		frame.Write(buildImagesStreamLocalErrorPayload(message))
+	} else if imageNoOutputDetails(err) != nil || len(imageResponseFailedPayload(err)) > 0 {
+		frame.Write(imageErrorResponseBody(err))
+	} else {
+		frame.Write(buildImagesStreamErrorPayload(message))
+	}
+	frame.WriteString("\n\n")
+	if _, writeErr := c.Writer.Write(frame.Bytes()); writeErr != nil {
+		return
+	}
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+type imageResponseFailedError struct {
+	cause     error
+	payload   []byte
+	eventType string
+}
+
+func newImageResponseFailedError(payload []byte) error {
+	return newImageSSEFailureError("response.failed", payload)
+}
+
+func newImageSSEFailureError(eventType string, payload []byte) error {
+	return &imageResponseFailedError{
+		cause:     imageGenerationFailureError(payload),
+		payload:   append([]byte(nil), payload...),
+		eventType: normalizedUpstreamSSEEventType(eventType, payload),
+	}
+}
+
+func (e *imageResponseFailedError) Error() string {
+	if e == nil || e.cause == nil {
+		return "upstream image generation failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *imageResponseFailedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func imageResponseFailedPayload(err error) []byte {
+	var failed *imageResponseFailedError
+	if !errors.As(err, &failed) || failed == nil {
+		return nil
+	}
+	return append([]byte(nil), failed.payload...)
+}
+
+func imageResponseFailedEventType(err error) string {
+	var failed *imageResponseFailedError
+	if !errors.As(err, &failed) || failed == nil {
+		return ""
+	}
+	return failed.eventType
 }
 
 func firstNonEmptyImageErrorField(values ...string) string {
@@ -2493,5 +3695,12 @@ func addImageMetaToPayload(payload []byte, meta imageCallResult) []byte {
 func buildImagesStreamErrorPayload(message string) []byte {
 	payload := []byte(`{"error":{"message":"","type":"upstream_error"}}`)
 	payload, _ = sjson.SetBytes(payload, "error.message", message)
+	return payload
+}
+
+func buildImagesStreamLocalErrorPayload(message string) []byte {
+	payload := []byte(`{"error":{"message":"","type":"server_error"}}`)
+	payload, _ = sjson.SetBytes(payload, "error.message", message)
+	payload, _ = sjson.SetBytes(payload, "error.code", ErrorCodeInternalError)
 	return payload
 }

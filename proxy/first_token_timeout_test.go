@@ -110,6 +110,11 @@ func TestNormalizeRuntimeSettingsCodexWSSilentRetries(t *testing.T) {
 		t.Fatalf("negative CodexWSSilentRetries normalized to %d, want 0", settings.CodexWSSilentRetries)
 	}
 
+	settings = NormalizeRuntimeSettings(RuntimeSettings{CodexWSSilentRetries: -2})
+	if settings.CodexWSSilentRetries != 0 {
+		t.Fatalf("below-range CodexWSSilentRetries normalized to %d, want 0", settings.CodexWSSilentRetries)
+	}
+
 	settings = NormalizeRuntimeSettings(RuntimeSettings{CodexWSSilentRetries: 99})
 	if settings.CodexWSSilentRetries != 10 {
 		t.Fatalf("oversized CodexWSSilentRetries normalized to %d, want 10", settings.CodexWSSilentRetries)
@@ -142,6 +147,7 @@ func TestApplyRuntimeSettingsFromSystemCodexWebSocketRetrySettings(t *testing.T)
 		CodexWSHideUpstreamErrors: true,
 		CodexWSSilentRetryEnabled: true,
 		CodexWSSilentMaxRetries:   42,
+		CodexWSWeakNetworkMode:    true,
 	})
 
 	if !settings.CodexWSHideErrors {
@@ -152,6 +158,9 @@ func TestApplyRuntimeSettingsFromSystemCodexWebSocketRetrySettings(t *testing.T)
 	}
 	if settings.CodexWSSilentRetries != 10 {
 		t.Fatalf("CodexWSSilentRetries = %d, want 10", settings.CodexWSSilentRetries)
+	}
+	if !settings.CodexWSWeakNetworkMode {
+		t.Fatal("CodexWSWeakNetworkMode = false, want true")
 	}
 }
 
