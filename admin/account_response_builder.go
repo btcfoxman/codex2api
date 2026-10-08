@@ -113,6 +113,9 @@ func (h *Handler) buildAccountResponse(
 			planType = runtimePlan
 		}
 	}
+	if isGrokAccount && row.GrokPlanDisplay != nil {
+		planType = row.GrokPlanDisplay.Plan
+	}
 	var grokPlan *auth.GrokPlan
 	if isGrokAccount {
 		if resolved, ok := auth.ResolveGrokPlan(planType); ok {
@@ -126,6 +129,10 @@ func (h *Handler) buildAccountResponse(
 	codexPassthroughMode := ""
 	if isOpenAIResponsesAccount && includeDetails {
 		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(row.GetCredential("codex_passthrough_mode"))
+	}
+	responsesUpstreamTransport := ""
+	if isOpenAIResponsesAccount && includeDetails {
+		responsesUpstreamTransport = auth.NormalizeOpenAIResponsesUpstreamTransport(row.GetCredential(auth.OpenAIResponsesUpstreamTransportCredentialKey))
 	}
 	balanceQueryURL := ""
 	if isOpenAIResponsesAccount && includeDetails {
@@ -241,6 +248,8 @@ func (h *Handler) buildAccountResponse(
 		AgentIdentity:                isAgentIdentityCredentialRow(row),
 		GrokAuthKind:                 grokAuthKind,
 		GrokPlan:                     grokPlan,
+		GrokPlanDisplay:              row.GrokPlanDisplay,
+		GrokModels:                   row.GrokModels,
 		GrokBilling:                  grokBilling,
 		AvatarURL:                    row.GetCredential("avatar_url"),
 		VerifiedEmail:                row.GetCredentialBool("verified_email"),
@@ -254,6 +263,7 @@ func (h *Handler) buildAccountResponse(
 		ModelMapping:                 modelMapping,
 		CodexClientMetadataMode:      codexClientMetadataMode,
 		CodexPassthroughMode:         codexPassthroughMode,
+		ResponsesUpstreamTransport:   responsesUpstreamTransport,
 		CodexFingerprintMode:         codexFingerprintMode,
 		ClaudeFingerprintMode:        claudeFingerprintMode,
 		ClaudeUserAgent:              claudeUserAgent,
@@ -264,6 +274,7 @@ func (h *Handler) buildAccountResponse(
 		ClaudeVersionPolicyOverride:  claudeVersionPolicyOverride,
 		ClaudeClientVersionOverride:  claudeClientVersionOverride,
 		Timezone:                     accountTimezone,
+		AccountHref:                  strings.TrimSpace(row.GetCredential(auth.AccountHrefCredentialKey)),
 		CustomHeaders:                customHeaders,
 		UpstreamRequestIDHeader:      row.GetCredential(auth.UpstreamRequestIDHeaderCredentialKey),
 		ProxyURL:                     row.ProxyURL,
@@ -282,7 +293,7 @@ func (h *Handler) buildAccountResponse(
 		Codex5HUsageUpdatedAt:        row.GetCredential("codex_5h_usage_updated_at"),
 		ClaudeUsageProbeAt:           row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey),
 		ClaudeUsageProbeError:        row.GetCredential(auth.ClaudeUsageProbeErrorCredentialKey),
-		ClaudeUsageWindows:           parseClaudeUsageWindows(row.GetCredential(auth.ClaudeUsageWindowsCredentialKey)),
+		ClaudeUsageWindows:           claudeAccountUsageWindows(row),
 		UsageLimitOverride:           ignoreUsageLimitStatusOverride,
 		UsageLimitEffective:          ignoreUsageLimitStatusEffective,
 	}
@@ -295,6 +306,7 @@ func (h *Handler) buildAccountResponse(
 	resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
 	resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 	resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
+	resp.KeepConcurrencyOnDegrade = row.GetCredentialBool(auth.KeepConcurrencyOnDegradeCredentialKey)
 	if includeDetails {
 		resp.DispatchCountLimit = accountDispatchCountLimit(row)
 	}
@@ -367,14 +379,21 @@ func (h *Handler) buildAccountResponse(
 		if credits, ok := runtimeAccount.GetRateLimitResetCredits(); ok {
 			resp.RateLimitResetCredits = &credits
 		}
+		daybreak := runtimeAccount.DaybreakSnapshot()
+		resp.DaybreakSupported = len(daybreak.Models) > 0
+		resp.DaybreakModels = daybreak.Models
+		resp.DaybreakCheckedAt = daybreak.CheckedAt / int64(time.Second)
 		if applicable, ok := runtimeAccount.GetApplicableResetCredits(); ok {
 			resp.ApplicableResetCredits = &applicable
 		}
-		if balance, hasCredits, unlimited, overage, ok := runtimeAccount.GetCreditBalance(); ok {
-			resp.CreditsBalance = &balance
-			resp.CreditsHasCredits = &hasCredits
-			resp.CreditsUnlimited = &unlimited
-			resp.CreditsOverageLimitReached = &overage
+		if credits, ok := runtimeAccount.GetCreditBalance(); ok {
+			resp.CreditsValid = true
+			resp.CreditsBalance = credits.Balance
+			resp.CreditsHasCredits = &credits.HasCredits
+			resp.CreditsUnlimited = &credits.Unlimited
+			resp.CreditsOverageLimitReached = &credits.OverageLimitReached
+			resp.CreditsSpendControlReached = credits.SpendControlReached
+			resp.CreditsRateLimitReachedType = credits.RateLimitReachedType
 		}
 		if includeDetails {
 			if snapshot := runtimeAccount.GetDispatchCountSnapshot(); snapshot.Limit > 0 {
@@ -484,6 +503,33 @@ func (h *Handler) buildAccountResponse(
 		stripAccountDetailFields(&resp)
 	}
 	return resp
+}
+
+// Keep header-only windows when an OAuth probe has no equivalent bucket;
+// when both sources observed the same bucket, display the newer observation.
+func claudeAccountUsageWindows(row *database.AccountRow) []auth.ClaudeUsageWindow {
+	windows := parseClaudeUsageWindows(row.GetCredential(auth.ClaudeUsageWindowsCredentialKey))
+	var header auth.ClaudeHeaderUsageSnapshot
+	if json.Unmarshal([]byte(row.GetCredential(auth.ClaudeHeaderUsageCredentialKey)), &header) != nil {
+		return windows
+	}
+	probedAt, _ := time.Parse(time.RFC3339Nano, row.GetCredential(auth.ClaudeUsageProbeAtCredentialKey))
+	for _, observed := range header.Windows {
+		found := false
+		for i := range windows {
+			if windows[i].Name == observed.Name {
+				found = true
+				if !header.ObservedAt.Before(probedAt) {
+					windows[i] = observed
+				}
+				break
+			}
+		}
+		if !found {
+			windows = append(windows, observed)
+		}
+	}
+	return windows
 }
 
 func parseClaudeUsageWindows(raw string) []auth.ClaudeUsageWindow {

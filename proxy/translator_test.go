@@ -1410,6 +1410,64 @@ func TestPrepareResponsesBody_AlignsRequiredWithProperties(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_PrunesRequiredOnNodesWithoutProperties(t *testing.T) {
+	// 生产实测：上游报 `Extra required key 'target' supplied`，而 alignRequiredWithProperties
+	// 原先只处理自带 properties 的节点，于是「required 有、properties 不在同一层」的三种
+	// 形态都把多余项原样发了出去。
+	cases := []struct {
+		name   string
+		schema string
+		path   string
+		want   []string // nil 表示 required 应被整个删除
+	}{
+		{
+			name:   "composition branch supplies the field names",
+			schema: `{"type":"object","properties":{"cands":{"type":"array","items":{"allOf":[{"type":"object","properties":{"action":{"type":"string"}}}],"required":["action","target"]}}}}`,
+			path:   "text.format.schema.properties.cands.items.required",
+			want:   []string{"action"},
+		},
+		{
+			name:   "no field source at all on a declared object",
+			schema: `{"type":"object","properties":{"cands":{"type":"array","items":{"type":"object","required":["target"]}}}}`,
+			path:   "text.format.schema.properties.cands.items.required",
+			want:   nil,
+		},
+		{
+			name:   "reference keeps its required untouched",
+			schema: `{"type":"object","$defs":{"Cand":{"type":"object","properties":{"action":{"type":"string"}}}},"properties":{"cands":{"type":"array","items":{"$ref":"#/$defs/Cand","required":["target"]}}}}`,
+			path:   "text.format.schema.properties.cands.items.required",
+			want:   []string{"target"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{"model":"gpt-5.4","input":"test","text":{"format":{"type":"json_schema","name":"s","strict":true,"schema":` + tc.schema + `}}}`)
+			got, _ := PrepareResponsesBody(raw)
+
+			required := gjson.GetBytes(got, tc.path)
+			if tc.want == nil {
+				if required.Exists() {
+					t.Fatalf("required should be removed, got %s; body=%s", required.Raw, got)
+				}
+				return
+			}
+			var names []string
+			for _, v := range required.Array() {
+				names = append(names, v.String())
+			}
+			if len(names) != len(tc.want) {
+				t.Fatalf("required = %v, want %v; body=%s", names, tc.want, got)
+			}
+			for i, want := range tc.want {
+				if names[i] != want {
+					t.Fatalf("required = %v, want %v; body=%s", names, tc.want, got)
+				}
+			}
+		})
+	}
+}
+
 func TestPrepareResponsesBody_JSONSchemaDoesNotInjectImageBridge(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.5",
@@ -2638,6 +2696,30 @@ func TestPrepareResponsesBody_DefaultsNullMessageContent(t *testing.T) {
 		if content := gjson.GetBytes(got, fmt.Sprintf("input.%d.content", i)); !content.Exists() || content.String() != "" {
 			t.Fatalf("null message content at input[%d] should be defaulted, got %s; body=%s", i, content.Raw, got)
 		}
+	}
+}
+
+func TestPrepareResponsesBody_StripsInputItemInternalMetadata(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"keep internal_chat_message_metadata_passthrough in text"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1"}},
+			{"type":"function_call","call_id":"call_1","name":"run","arguments":"{\"internal_chat_message_metadata_passthrough\":1}","internal_chat_message_metadata_passthrough":{"turn_id":"t1"}}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	for i := 0; i < 2; i++ {
+		if meta := gjson.GetBytes(got, fmt.Sprintf("input.%d.internal_chat_message_metadata_passthrough", i)); meta.Exists() {
+			t.Fatalf("input[%d].internal_chat_message_metadata_passthrough should be stripped, got %s; body=%s", i, meta.Raw, got)
+		}
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(text, "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("same-named user content must survive, got %q", text)
+	}
+	if args := gjson.GetBytes(got, "input.1.arguments").String(); !strings.Contains(args, "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("function_call arguments must not be touched, got %q", args)
 	}
 }
 
@@ -4105,5 +4187,48 @@ func TestModelSupportsMaxReasoningEffort(t *testing.T) {
 	}
 	if got := normalizeConfiguredReasoningEffort("max", "gpt-daybreak-blue-latest"); got != "max" {
 		t.Fatalf("daybreak max effort clamped to %q", got)
+	}
+}
+
+func TestReasoningReplayOmitsDisplayContent(t *testing.T) {
+	var input any
+	if err := json.Unmarshal([]byte(`[{"type":"reasoning","id":"rs_probe","encrypted_content":"gAAAAnative","summary":[{"type":"summary_text","text":"visible summary"}],"content":[{"type":"reasoning_text","text":"visible summary"}],"status":"completed"},{"role":"user","content":[{"type":"input_text","text":"keep user content"}]}]`), &input); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, changed, keep := dropBareReasoningInputValue(input)
+	if !changed || !keep {
+		t.Fatal("expected cleaned reasoning history")
+	}
+	items := cleaned.([]any)
+	reasoning := items[0].(map[string]any)
+	if _, exists := reasoning["content"]; exists {
+		t.Fatal("display-only reasoning.content is still replayed")
+	}
+	if _, exists := reasoning["status"]; exists {
+		t.Fatal("status is still replayed")
+	}
+	if reasoning["encrypted_content"] != "gAAAAnative" || len(reasoning["summary"].([]any)) != 1 {
+		t.Fatal("reasoning context lost")
+	}
+	if len(items[1].(map[string]any)["content"].([]any)) != 1 {
+		t.Fatal("user content lost")
+	}
+}
+
+func TestPrepareResponsesBodyPreservesNativeAgentContext(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.5","input":[{"type":"agent_message","id":"amsg_native","author":"parent","recipient":"child","content":[{"type":"input_text","text":"plain task"},{"type":"encrypted_content","encrypted_content":"gAAAAnative-agent-context"}]}]}`)
+	got, _ := PrepareResponsesBody(raw)
+	for path, want := range map[string]string{
+		"input.0.type":                        "agent_message",
+		"input.0.author":                      "parent",
+		"input.0.recipient":                   "child",
+		"input.0.content.0.type":              "input_text",
+		"input.0.content.0.text":              "plain task",
+		"input.0.content.1.type":              "encrypted_content",
+		"input.0.content.1.encrypted_content": "gAAAAnative-agent-context",
+	} {
+		if value := gjson.GetBytes(got, path).String(); value != want {
+			t.Errorf("%s = %q, want %q", path, value, want)
+		}
 	}
 }

@@ -68,19 +68,9 @@ type WhamUsage struct {
 	AdditionalRateLimits    []WhamAdditionalRateLimit `json:"additional_rate_limits,omitempty"`
 	AdditionalRateLimitsAlt []WhamAdditionalRateLimit `json:"additionalRateLimits,omitempty"`
 
-	Credits *struct {
-		HasCredits          bool   `json:"has_credits"`
-		Unlimited           bool   `json:"unlimited"`
-		OverageLimitReached bool   `json:"overage_limit_reached"`
-		Balance             string `json:"balance"`
-		ApproxLocalMessages []int  `json:"approx_local_messages"`
-		ApproxCloudMessages []int  `json:"approx_cloud_messages"`
-	} `json:"credits,omitempty"`
-
-	SpendControl *struct {
-		Reached         bool        `json:"reached"`
-		IndividualLimit interface{} `json:"individual_limit"`
-	} `json:"spend_control,omitempty"`
+	Credits              *WhamCredits              `json:"credits,omitempty"`
+	SpendControl         *WhamSpendControl         `json:"spend_control,omitempty"`
+	RateLimitReachedType *WhamRateLimitReachedType `json:"rate_limit_reached_type,omitempty"`
 
 	// RateLimitResetCredits 是账号在 OpenAI 官方那边剩余的「主动重置次数」。
 	// available_count > 0 时可调用 wham/rate-limit-reset-credits/consume 立即重置额度。
@@ -90,6 +80,24 @@ type WhamUsage struct {
 		AvailableCount           int `json:"available_count"`
 		ApplicableAvailableCount int `json:"applicable_available_count"`
 	} `json:"rate_limit_reset_credits,omitempty"`
+}
+
+type WhamCredits struct {
+	HasCredits          bool    `json:"has_credits"`
+	Unlimited           bool    `json:"unlimited"`
+	OverageLimitReached bool    `json:"overage_limit_reached"`
+	Balance             *string `json:"balance"`
+	ApproxLocalMessages []int   `json:"approx_local_messages"`
+	ApproxCloudMessages []int   `json:"approx_cloud_messages"`
+}
+
+type WhamSpendControl struct {
+	Reached         bool        `json:"reached"`
+	IndividualLimit interface{} `json:"individual_limit"`
+}
+
+type WhamRateLimitReachedType struct {
+	Type string `json:"type"`
 }
 
 type whamTimeRaw string
@@ -374,8 +382,7 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
-	req.Header.Set("Originator", Originator)
+	ResolveCodexMaintenanceIdentity(account, nil).Apply(req.Header)
 	// 用 EffectiveAccountID:自定义头覆盖了工作区 ID 时,额度必须查覆盖后的空间,
 	// 否则进度条/自动暂停/智能配速统计的是与实际流量不同的空间。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
@@ -488,8 +495,7 @@ func queryWhamResetCreditsWithURL(ctx context.Context, account *auth.Account, pr
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
-	req.Header.Set("Originator", Originator)
+	ResolveCodexMaintenanceIdentity(account, nil).Apply(req.Header)
 	// 与 wham 查询一致,重置券按自定义头覆盖后的空间查询。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
@@ -575,8 +581,7 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
-	req.Header.Set("Originator", Originator)
+	ResolveCodexMaintenanceIdentity(account, nil).Apply(req.Header)
 	// 与 wham 查询一致,重置额度也作用于自定义头覆盖后的空间。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
@@ -648,6 +653,14 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 
 	// 记录 credits 积分余额快照（wham 的 credits 对象，零额度成本）。
 	if usage.Credits != nil {
+		var spendControlReached *bool
+		if usage.SpendControl != nil {
+			spendControlReached = &usage.SpendControl.Reached
+		}
+		var rateLimitReachedType string
+		if usage.RateLimitReachedType != nil {
+			rateLimitReachedType = usage.RateLimitReachedType.Type
+		}
 		// 走 store 落库版本：积分只有 wham 能刷，只留在内存的话重启后就归零。
 		store.PersistCreditBalance(
 			account,
@@ -655,6 +668,8 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 			usage.Credits.HasCredits,
 			usage.Credits.Unlimited,
 			usage.Credits.OverageLimitReached,
+			spendControlReached,
+			rateLimitReachedType,
 		)
 		// 余额刚被充上（此前为 0 而账号已背着用量窗口判罚）时立刻放回调度，
 		// 不必等窗口重置。非本地用量判罚的冷却不受影响。
@@ -751,6 +766,11 @@ const (
 	whamWindow5hSeconds int64 = 18_000
 	whamWindow7dSeconds int64 = 604_800
 )
+
+// IsWhamLongWindowSeconds 判断窗口是否归入 7d 槽：plus/pro 的周窗，或 team 等 plan 的月窗。
+func IsWhamLongWindowSeconds(sec int64) bool {
+	return sec == whamWindow7dSeconds || auth.IsMonthlyWindowSeconds(sec)
+}
 
 // pickClassifiedWhamWindows 把 primary/secondary 两个窗口归类到 5h/7d 槽位。
 //

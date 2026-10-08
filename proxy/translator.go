@@ -1280,6 +1280,32 @@ func normalizeResponsesInputItemIDs(body map[string]any) bool {
 	return modified
 }
 
+// responsesInputInternalMetadataField 是 Codex CLI 在自定义 provider 名为 "OpenAI"
+// 时附在 input 项顶层的内部元数据，ChatGPT 后端不接受该字段直接 400。
+const responsesInputInternalMetadataField = "internal_chat_message_metadata_passthrough"
+
+// stripResponsesInputInternalMetadata 只删 input[] 顶层项上的内部元数据字段，
+// 不碰 content/arguments 里恰好同名的用户内容。
+func stripResponsesInputInternalMetadata(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := itemMap[responsesInputInternalMetadataField]; exists {
+			delete(itemMap, responsesInputInternalMetadataField)
+			modified = true
+		}
+	}
+	return modified
+}
+
 func normalizeResponsesContentPartTypes(body map[string]any) bool {
 	inputItems, ok := body["input"].([]any)
 	if !ok {
@@ -1558,10 +1584,16 @@ func dropBareReasoningInputValue(value any) (any, bool, bool) {
 			// Codex reasoning schema 不认 status 字段（400 unknown_parameter），
 			// 自家输出也从不携带；跨渠道会话中客户端可能裸回灌带 status 的
 			// 外渠道 reasoning 输出（issue #565）。
-			if _, has := v["status"]; has {
-				delete(v, "status")
-				return v, true, true
+			changed := false
+			// Responses accepts encrypted reasoning and summary; display-only
+			// content is not accepted when replayed as input.
+			for _, field := range []string{"status", "content"} {
+				if _, has := v[field]; has {
+					delete(v, field)
+					changed = true
+				}
 			}
+			return v, changed, true
 		}
 		return v, false, true
 	default:
@@ -1706,6 +1738,9 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 		return nil, err
 	}
 	out := buildChatResponsesRequest(req)
+	if access := gjson.GetBytes(rawJSON, "access_programs"); access.Exists() {
+		out["access_programs"] = json.RawMessage(access.Raw)
+	}
 	// 工具名净化映射从净化历史前的解析结果推导，与响应侧 ChatToolNameRestoreMap
 	// 使用同一份输入，保证去重后缀两边一致。
 	applyCodexToolNameMap(out, buildCodexToolNameMap(collectChatToolNames(parsed)))
@@ -1835,6 +1870,7 @@ func buildChatResponsesRequest(req openAIRequest) map[string]any {
 	normalizeResponsesContentPartTypes(out)
 	normalizeResponsesInputMessageContent(out)
 	normalizeResponsesInputItemIDs(out)
+	stripResponsesInputInternalMetadata(out)
 
 	// 2. reasoning effort + summary
 	// 显式向 Codex 请求 summary,否则上游不会发 response.reasoning_summary_text.delta,
@@ -2227,6 +2263,8 @@ type responsesBodyPrepareOptions struct {
 	expandPreviousResponse       bool
 	preservePreviousResponseID   bool
 	deferStructuredStringLengths bool
+	skipExpandedInput            bool
+	naturalImageIntent           *bool
 	cachedResponseItems          []json.RawMessage
 	// cacheOwner 是 previous_response_id 展开时使用的缓存归属命名空间
 	//（见 responseCacheOwner）。owner 不匹配的缓存按未命中处理，防跨用户注入。
@@ -2289,6 +2327,19 @@ func PrepareResponsesWebSocketBody(rawBody []byte) ([]byte, string) {
 	})
 }
 
+// The native turn only needs the outbound body. Preserve the public preparation
+// function's replay-input result for callers that actually consume it.
+func prepareResponsesWebSocketTurnBody(rawBody []byte) ([]byte, bool) {
+	var naturalImageIntent bool
+	body, _ := prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		preservePreviousResponseID:   true,
+		deferStructuredStringLengths: true,
+		skipExpandedInput:            true,
+		naturalImageIntent:           &naturalImageIntent,
+	})
+	return body, naturalImageIntent
+}
+
 const codexReasoningEncryptedContentInclude = "reasoning.encrypted_content"
 
 func ensureDefaultCodexInclude(body map[string]any) {
@@ -2334,6 +2385,11 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""
+	}
+	if opts.naturalImageIntent != nil {
+		// Inspect the original prompt before compatibility rewrites or automatic
+		// image-tool injection. Reuse this parse when selecting the transport.
+		*opts.naturalImageIntent = promptTextRequestsImageGeneration(extractResponsesPromptText(body))
 	}
 
 	// 1. 强制设置 Codex 必需字段
@@ -2451,6 +2507,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	normalizeResponsesToolCallArgumentTypes(body)
 	sanitizeMalformedResponsesFunctionCalls(body)
 	normalizeResponsesInputItemIDs(body)
+	stripResponsesInputInternalMetadata(body)
 	dropBareReasoningInputItems(body)
 	// 6c. 修复工具调用/输出的 call_id 配对（issue #414）。
 	// previous_response_id 保留给上游的原生续链场景跳过：历史存于上游服务端，
@@ -2483,6 +2540,9 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 
 	result, err := json.Marshal(body)
 	if err != nil {
+		if opts.skipExpandedInput {
+			return rawBody, ""
+		}
 		var expandedInputRaw string
 		if input, ok := body["input"]; ok {
 			if encoded, inputErr := json.Marshal(input); inputErr == nil {
@@ -2492,6 +2552,9 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		return rawBody, expandedInputRaw
 	}
 	result = normalizeCompactionTriggerFinal(result, false)
+	if opts.skipExpandedInput {
+		return result, ""
+	}
 	// Reuse the serialized input, including any final compaction adjustment.
 	// Serializing the same input tree separately doubles work on long histories.
 	return result, gjson.GetBytes(result, "input").Raw
@@ -3083,8 +3146,10 @@ func billingServiceTierCostRank(tier string) (int, bool) {
 		return 0, true
 	case "", "default", "standard", "auto", "scale":
 		return 1, true
-	case "priority", "ultrafast":
+	case "priority":
 		return 2, true
+	case "ultrafast":
+		return 3, true
 	default:
 		return 1, false
 	}
@@ -3581,8 +3646,100 @@ func alignRequiredWithProperties(schema map[string]interface{}) {
 		} else {
 			schema["required"] = required
 		}
+	} else {
+		pruneRequiredWithoutProperties(schema)
 	}
 	forEachSubSchema(schema, alignRequiredWithProperties)
+}
+
+// schemaCompositionKeys 是可能替同级 required 提供字段的组合关键字。allOf 的分支
+// 必定生效，anyOf/oneOf/then/else 只在部分实例上生效，但它们声明的字段名同样属于
+// 「这个节点可能拥有的字段」，足以判断某个 required 项是否有来源。not 不在其中：
+// 它描述被禁止的形态，不提供字段。
+var schemaCompositionKeys = []string{"allOf", "anyOf", "oneOf", "then", "else"}
+
+// schemaReferencesExternalDefinition 报告节点是否通过引用把自己的字段定义放在别处。
+// 这类节点的 properties 在引用目标里（目标本身会作为 $defs/definitions 的子 schema
+// 被独立清洗），本函数看不到，因此不能据此裁剪它的 required。
+func schemaReferencesExternalDefinition(schema map[string]interface{}) bool {
+	for _, key := range []string{"$ref", "$dynamicRef"} {
+		if ref, ok := schema[key].(string); ok && strings.TrimSpace(ref) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// collectSchemaPropertyNames 收集节点自身及其组合分支声明的字段名。
+func collectSchemaPropertyNames(schema map[string]interface{}, names map[string]bool) {
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for name := range props {
+			names[name] = true
+		}
+	}
+	collectCompositionPropertyNames(schema, names)
+}
+
+// collectCompositionPropertyNames 递归收集组合分支（含嵌套组合）里声明的字段名并集。
+// 只用于判断「同级 required 里的名字是否有来源」，不做 $ref 解析。
+func collectCompositionPropertyNames(schema map[string]interface{}, names map[string]bool) {
+	for _, key := range schemaCompositionKeys {
+		switch branch := schema[key].(type) {
+		case map[string]interface{}:
+			collectSchemaPropertyNames(branch, names)
+		case []interface{}:
+			for _, item := range branch {
+				if sub, ok := item.(map[string]interface{}); ok {
+					collectSchemaPropertyNames(sub, names)
+				}
+			}
+		}
+	}
+}
+
+// pruneRequiredWithoutProperties 处理「声明了 required 但自身没有 properties」的节点。
+// alignRequiredWithProperties 原先只在节点自带 properties 时对齐 required，于是这类
+// 节点的多余项被原样发往上游，触发 strict 校验的
+// `'required' is required to be supplied and to be an array including every key in
+// properties. Extra required key 'x' supplied.`
+//
+// 三种处置，按能拿到的证据强弱排列：
+//   - 字段名藏在 allOf/anyOf/oneOf/then/else 分支里时，按分支并集裁掉无来源的项；
+//     不补齐缺失项——组合语义下补齐会改变 schema 的含义。
+//   - 完全找不到来源、且节点自称 object 时，required 在 additionalProperties=false
+//     下永远无法被满足，整个删除。
+//   - 节点带 $ref/$dynamicRef 时字段定义在别处，保持原样以免误删。
+func pruneRequiredWithoutProperties(schema map[string]interface{}) {
+	existing, ok := schema["required"].([]interface{})
+	if !ok || len(existing) == 0 {
+		return
+	}
+	if schemaReferencesExternalDefinition(schema) {
+		return
+	}
+	names := make(map[string]bool)
+	collectCompositionPropertyNames(schema, names)
+	if len(names) == 0 {
+		if schemaDeclaresObject(schema) {
+			delete(schema, "required")
+		}
+		return
+	}
+	kept := make([]interface{}, 0, len(existing))
+	seen := make(map[string]bool, len(existing))
+	for _, item := range existing {
+		name, ok := item.(string)
+		if !ok || seen[name] || !names[name] {
+			continue
+		}
+		seen[name] = true
+		kept = append(kept, name)
+	}
+	if len(kept) == 0 {
+		delete(schema, "required")
+		return
+	}
+	schema["required"] = kept
 }
 
 func schemaDeclaresArray(schema map[string]interface{}) bool {

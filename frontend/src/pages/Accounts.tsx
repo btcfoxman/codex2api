@@ -7,6 +7,9 @@ import type { ProxyRow } from "../api";
 import { ProxyField } from "../components/ProxyField";
 import AccountProxyBadge from "../components/AccountProxyBadge";
 import AccountProxyQuickEditor from "../components/AccountProxyQuickEditor";
+import AccountHrefQuickEditor, {
+  openAccountHref,
+} from "../components/AccountHrefQuickEditor";
 import SubscriptionBadge from "../components/SubscriptionBadge";
 import {
   buildProxyBindingContext,
@@ -42,6 +45,7 @@ import { CompactStat } from "../components/CompactStat";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
+import DaybreakBadge from "../components/DaybreakBadge";
 import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
 import {
   useConfirmDialog,
@@ -60,6 +64,7 @@ import type {
   AddOpenAIResponsesAccountRequest,
   CodexClientMetadataMode,
   CodexPassthroughMode,
+  ResponsesUpstreamTransport,
   CodexFingerprintMode,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
@@ -75,6 +80,7 @@ import type {
   AccountLiveStateResponse,
   UpstreamChannel,
   OpenAIResponsesBalanceResponse,
+  ChannelMonitorBillingSnapshot,
   SubscriptionFilter,
 } from "../types";
 import { SUBSCRIPTION_FILTER_OPTIONS } from "../types";
@@ -89,6 +95,10 @@ import {
 } from "../lib/accountOperationResults";
 import { operationProgressMessage } from "../lib/operationProgressMessage";
 import {
+  formatChannelMonitorMultiplier,
+  resolveChannelMonitorRate,
+} from "../lib/channelMonitorBilling";
+import {
   readOperationResultsVisibility,
   writeOperationResultsVisibility,
 } from "../lib/operationResultsPreference";
@@ -96,6 +106,21 @@ import {
   isLargePoolSortDisabled,
   resolveDisabledAccountSorts,
 } from "../lib/accountListSort";
+import {
+  formatAccountConcurrencyText,
+  resolveAccountConcurrencyDisplay,
+} from "../lib/accountConcurrency";
+import {
+  ACCOUNT_AUTO_REFRESH_INTERVALS,
+  normalizeAccountAutoRefreshSeconds,
+  readAccountAutoRefreshSeconds,
+  readAccountListSort,
+  shouldRefreshPageStats,
+  writeAccountAutoRefreshSeconds,
+  writeAccountListSort,
+  type AccountListSortDir,
+  type AccountListSortKey,
+} from "../lib/accountListPreferences";
 import {
   formatLongUsageWindowLabel,
   getAccountStatusBadgeStatus,
@@ -105,6 +130,7 @@ import {
   needsUsageReload,
   officialUsdValue,
   supportsOfficialUsage,
+  isWorkspaceCreditHardStop,
 } from "../lib/usageFormat";
 import {
   applyOptionalWorkspaceRouteHeader,
@@ -147,6 +173,7 @@ import {
   EyeOff,
   KeyRound,
   ExternalLink,
+  Link2,
   FileText,
   FileJson,
   BarChart3,
@@ -197,6 +224,7 @@ import {
   ArrowUpRight,
   Settings2,
   ListChecks,
+  RadioTower,
 } from "lucide-react";
 import {
   CLAUDE_TIMEZONE_CUSTOM,
@@ -224,6 +252,7 @@ import AccountQuotaDistributionChart from "../components/AccountQuotaDistributio
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
 import AccountQuickConfigSheet from "../components/AccountQuickConfigSheet";
+import ChannelMonitorConfigDialog from "../components/ChannelMonitorConfigDialog";
 import { useImportGroupIds } from "../hooks/useImportGroupIds";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
@@ -307,26 +336,41 @@ const formatMB = (bytes: number): string =>
 
 function AccountConcurrencyBadge({ account }: { account: AccountRow }) {
   const { t } = useTranslation();
-  const active = Math.max(0, account.active_requests ?? 0);
-  const occupied = Math.max(active, account.occupied_requests ?? active);
-  if (occupied === 0) return null;
+  const display = resolveAccountConcurrencyDisplay(account);
+  if (!display) return null;
 
-  const buffered = occupied - active;
-  const showOccupied = account.session_slot_buffer_enabled === true;
-  const title = showOccupied
-    ? t("accounts.occupiedRequestsTooltip", { active, occupied, buffered })
-    : t("accounts.activeRequestsTooltip", { count: active });
+  const { active, occupied, buffered, showOccupied, limit, base, degraded } =
+    display;
+  const titleLines = [
+    showOccupied
+      ? t("accounts.occupiedRequestsTooltip", { active, occupied, buffered })
+      : t("accounts.activeRequestsTooltip", { count: active }),
+  ];
+  if (limit !== null) {
+    titleLines.push(
+      degraded
+        ? t("accounts.concurrencyLimitDegradedTooltip", { limit, base })
+        : t("accounts.concurrencyLimitTooltip", { limit }),
+    );
+  }
 
   return (
     <span
       className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-      title={title}
+      title={titleLines.join("\n")}
     >
       <span
         className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
         aria-hidden
       />
-      {showOccupied ? `${active}/${occupied}` : active}
+      {limit !== null && degraded ? (
+        <span>
+          {display.used} /{" "}
+          <span className="text-amber-600 dark:text-amber-400">{limit}</span>
+        </span>
+      ) : (
+        formatAccountConcurrencyText(display)
+      )}
     </span>
   );
 }
@@ -356,6 +400,7 @@ const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
 const ACCOUNT_VISIBLE_COLUMNS_KEY = "codex2api:accounts:visible-columns";
 const ACCOUNT_TABLE_COLUMNS = [
   "sequence",
+  "id",
   "email",
   "tags",
   "groups",
@@ -530,12 +575,20 @@ function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
 }
 
-// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测）返回 null。
+// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测、已达硬限制）返回 null。
 function getCreditBalanceDisplay(account: AccountRow): string | null {
-  if (!account.credits_has_credits) return null;
+  if (account.credits_valid === false) return null;
+  if (isWorkspaceCreditHardStop(account) || account.credits_overage_limit_reached) return null;
   if (account.credits_unlimited) return "∞";
+  if (!account.credits_has_credits) return null;
   const balance = (account.credits_balance ?? "").trim();
-  return balance ? balance : null;
+  if (!balance) return "✓"; // 上游隐藏了余额（Team 成员）：有积分但看不到数字
+  const parsed = Number.parseFloat(balance);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return balance;
+  }
+  // 余额已知且为 0：与后端 creditsAvailableLocked 一致，不算可用积分
+  return null;
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -668,6 +721,7 @@ function codexFingerprintModeOptions(
     { value: "off", label: t("accounts.codexFingerprintModeOff") },
     { value: "device", label: t("accounts.codexFingerprintModeDevice") },
     { value: "session", label: t("accounts.codexFingerprintModeSession") },
+    { value: "single_machine_multi_window", label: t("accounts.codexFingerprintModeSessionIdentity") },
     { value: "full", label: t("accounts.codexFingerprintModeFull") },
   ];
 }
@@ -679,6 +733,8 @@ function codexFingerprintModeDetail(
   switch (mode) {
     case "device":
       return t("accounts.codexFingerprintModeDeviceDetail");
+    case "single_machine_multi_window":
+      return t("accounts.codexFingerprintModeSessionIdentityDetail");
     case "session":
       return t("accounts.codexFingerprintModeSessionDetail");
     case "full":
@@ -815,6 +871,16 @@ function mergeModelLists(current: string[], incoming: string[]): string[] {
 
 function isOAuthAccount(account: AccountRow | null): boolean {
   return account?.account_type === "oauth";
+}
+
+// 跳转链接图标只给 API Key 类账号（有 api-base 可回退）；OAuth 账号不显示，
+// 除非已配置过自定义链接（否则失去打开/清除入口）。
+function showsAccountHrefLink(account: AccountRow): boolean {
+  return Boolean(
+    account.openai_responses_api ||
+      account.grok_api ||
+      account.account_href?.trim(),
+  );
 }
 
 function parseOAuthCallbackParams(rawUrl: string): { code: string; state: string } {
@@ -1059,12 +1125,16 @@ interface AccountRowActions {
   openDetail: (account: AccountRow) => void;
   openSchedulerEditor: (account: AccountRow) => void;
   openQuickConfig: (account: AccountRow) => void;
+  openChannelMonitor: (account: AccountRow) => void;
   openQuickGroupEditor: (account: AccountRow) => void;
   openQuickProxyEditor: (account: AccountRow) => void;
+  openHrefEditor: (account: AccountRow) => void;
+  openHref: (account: AccountRow) => void;
   openUsage: (account: AccountRow) => void;
   // 直接打开用量弹窗的官方统计 tab（成本列的官方胶囊）。
   openOfficialUsage: (account: AccountRow) => void;
   openTesting: (account: AccountRow) => void;
+  openDetector: (account: AccountRow) => void;
   refresh: (account: AccountRow) => void;
   generateAuthJson: (account: AccountRow) => void;
   toggleEnabled: (account: AccountRow) => void;
@@ -1115,6 +1185,7 @@ function useCountdownRemaining(until?: string): string {
 // 整树重渲染;行数据没变时这里直接跳过,交互卡顿的大头就在这。
 const AccountTableRow = memo(function AccountTableRow({
   account,
+  channelMonitorBilling,
   sequence,
   selected,
   detailOpen,
@@ -1130,6 +1201,7 @@ const AccountTableRow = memo(function AccountTableRow({
   actions,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   sequence: number;
   selected: boolean;
   detailOpen: boolean;
@@ -1216,6 +1288,11 @@ const AccountTableRow = memo(function AccountTableRow({
                                 {sequence}
                               </TableCell>
                             )}
+                            {visibleColumns.id && (
+                              <TableCell className="text-[13px] font-mono tabular-nums text-muted-foreground">
+                                {account.id}
+                              </TableCell>
+                            )}
                             {visibleColumns.email && (
                               <TableCell className="min-w-[220px] whitespace-normal text-[14px] text-muted-foreground">
                                 <div className="flex min-w-0 items-center gap-2.5">
@@ -1227,19 +1304,40 @@ const AccountTableRow = memo(function AccountTableRow({
                                   )}
                                 </span>
                                 <div className="flex min-w-0 flex-col items-start gap-1">
-                                  <button
-                                    type="button"
-                                    className="break-all text-left font-medium text-foreground transition-colors hover:text-primary"
-                                    title={t("accounts.openDetail")}
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      actions.openDetail(account);
-                                    }}
-                                  >
-                                    {account.openai_responses_api || account.grok_api
-                                      ? formatAccountName(account)
-                                      : formatAccountListEmail(account)}
-                                  </button>
+                                  <div className="flex max-w-full items-start gap-1">
+                                    <button
+                                      type="button"
+                                      className="min-w-0 break-all text-left font-medium text-foreground transition-colors hover:text-primary"
+                                      title={t("accounts.openDetail")}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        actions.openDetail(account);
+                                      }}
+                                    >
+                                      {account.openai_responses_api || account.grok_api
+                                        ? formatAccountName(account)
+                                        : formatAccountListEmail(account)}
+                                    </button>
+                                    {showsAccountHrefLink(account) && (
+                                      <button
+                                        type="button"
+                                        className="mt-0.5 inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-muted hover:text-primary"
+                                        title={t("accounts.hrefClickHint")}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          // 点击 = 跳转（account_href → base_url
+                                          // 回退）；Alt/Option+点击 = 打开配置弹窗。
+                                          if (event.altKey) {
+                                            actions.openHrefEditor(account);
+                                          } else {
+                                            actions.openHref(account);
+                                          }
+                                        }}
+                                      >
+                                        <Link2 className="size-3" />
+                                      </button>
+                                    )}
+                                  </div>
                                   {account.effective_workspace_id && (
                                     <span
                                       className={cn(
@@ -1260,13 +1358,16 @@ const AccountTableRow = memo(function AccountTableRow({
                                       {account.effective_workspace_id}
                                     </span>
                                   )}
-                                  {showEmailDomainTags &&
-                                    getAccountEmailDomain(account) && (
-                                    <EmailDomainBadge
-                                      domain={getAccountEmailDomain(account)}
-                                      t={t}
-                                    />
-                                  )}
+                                  <div className="flex flex-wrap items-center gap-1">
+                                    {showEmailDomainTags &&
+                                      getAccountEmailDomain(account) && (
+                                        <EmailDomainBadge
+                                          domain={getAccountEmailDomain(account)}
+                                          t={t}
+                                        />
+                                      )}
+                                    <DaybreakBadge models={account.daybreak_models} />
+                                  </div>
                                   {(account.at_only ||
                                     account.openai_responses_api ||
                                     account.grok_api ||
@@ -1338,7 +1439,9 @@ const AccountTableRow = memo(function AccountTableRow({
                                               ? t(
                                                   "accounts.creditsBalanceUnlimited",
                                                 )
-                                              : t(
+                                              : getCreditBalanceDisplay(account) === "✓"
+                                                ? t("accounts.creditsBalanceAvailable")
+                                                : t(
                                                   "accounts.creditsBalanceBadge",
                                                   {
                                                     balance:
@@ -1493,7 +1596,11 @@ const AccountTableRow = memo(function AccountTableRow({
                             )}
                             {visibleColumns.billed && (
                               <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
-                                <BilledCell account={account} onOpenOfficial={actions.openOfficialUsage} />
+                                <BilledCell
+                                  account={account}
+                                  channelMonitorBilling={channelMonitorBilling}
+                                  onOpenOfficial={actions.openOfficialUsage}
+                                />
                               </TableCell>
                             )}
                             {visibleColumns.importTime && (
@@ -1583,6 +1690,10 @@ const AccountTableRow = memo(function AccountTableRow({
                                     includeTest={false}
                                     includeDelete={false}
                                     onTest={() => actions.openTesting(account)}
+                                    onDetect={() => actions.openDetector(account)}
+                                    onChannelMonitor={() =>
+                                      actions.openChannelMonitor(account)
+                                    }
                                     onRefresh={() => actions.refresh(account)}
                                     onGenerateAuthJson={() =>
                                       actions.generateAuthJson(account)
@@ -1613,6 +1724,7 @@ const AccountTableRow = memo(function AccountTableRow({
 // 行数据不变则整卡跳过。
 const AccountCardItem = memo(function AccountCardItem({
   account,
+  channelMonitorBilling,
   sequence,
   selected,
   detailOpen,
@@ -1629,6 +1741,7 @@ const AccountCardItem = memo(function AccountCardItem({
   actions,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   sequence: number;
   selected: boolean;
   detailOpen: boolean;
@@ -1647,6 +1760,7 @@ const AccountCardItem = memo(function AccountCardItem({
   return (
     <AccountMobileCard
       account={account}
+      channelMonitorBilling={channelMonitorBilling}
       sequence={sequence}
       selected={selected}
       detailOpen={detailOpen}
@@ -1662,12 +1776,16 @@ const AccountCardItem = memo(function AccountCardItem({
       t={t}
       onToggleSelect={() => actions.toggleSelect(account.id)}
       onOpenDetail={() => actions.openDetail(account)}
+      onOpenHref={() => actions.openHref(account)}
+      onOpenHrefEditor={() => actions.openHrefEditor(account)}
       onEdit={() => actions.openSchedulerEditor(account)}
       onEditGroups={() => actions.openQuickGroupEditor(account)}
       onEditProxy={() => actions.openQuickProxyEditor(account)}
       onUsage={() => actions.openUsage(account)}
       onOpenOfficialUsage={() => actions.openOfficialUsage(account)}
+      onChannelMonitor={() => actions.openChannelMonitor(account)}
       onTest={() => actions.openTesting(account)}
+      onDetect={() => actions.openDetector(account)}
       onRefresh={() => actions.refresh(account)}
       onGenerateAuthJson={() => actions.generateAuthJson(account)}
       onToggleEnabled={() => actions.toggleEnabled(account)}
@@ -1774,7 +1892,7 @@ export default function Accounts() {
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const accountPageAbortRef = useRef<AbortController | null>(null);
   const [planFilter, setPlanFilter] = useState<
-    "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
+    "all" | "pro" | "promax" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
   // 订阅状态筛选：按服务端算好的业务/同步状态过滤（到期临近、已过期、待确认等）。
   const [subscriptionFilter, setSubscriptionFilter] = useState<SubscriptionFilter>("all");
@@ -1782,16 +1900,33 @@ export default function Accounts() {
   const [authFilter, setAuthFilter] = useState<"all" | "oauth" | "api_key">(
     "all",
   );
-  const [sortKey, setSortKey] = useState<
-    | "requests"
-    | "today"
-    | "usage"
-    | "importTime"
-    | "schedulerPriority"
-    | "group"
-    | null
-  >(null);
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  // 排序按标签页记住（sessionStorage）：切换菜单再回来不丢，新标签页恢复默认。
+  const [initialSort] = useState(readAccountListSort);
+  const [sortKey, setSortKey] = useState<AccountListSortKey | null>(
+    initialSort.key,
+  );
+  const [sortDir, setSortDir] = useState<AccountListSortDir>(initialSort.dir);
+  useEffect(() => {
+    writeAccountListSort({ key: sortKey, dir: sortDir });
+  }, [sortKey, sortDir]);
+  const sortKeyLabel = (key: AccountListSortKey): string => {
+    switch (key) {
+      case "requests":
+        return t("accounts.requests");
+      case "today":
+        return t("accounts.todayStats");
+      case "usage":
+        return t("accounts.usage");
+      case "importTime":
+        return t("accounts.importTime");
+      case "id":
+        return t("accounts.idColumn");
+      case "schedulerPriority":
+        return t("accounts.schedulerPriorityColumn");
+      case "group":
+        return t("accounts.groupsLabel");
+    }
+  };
 
   const commitSearchQuery = useCallback((next: string) => {
     setDebouncedSearchQuery(next);
@@ -1845,7 +1980,9 @@ export default function Accounts() {
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false);
   const [cleaningError, setCleaningError] = useState(false);
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
+  const [detectorAccount, setDetectorAccount] = useState<AccountRow | null>(null);
   const [quickConfigAccount, setQuickConfigAccount] = useState<AccountRow | null>(null);
+  const [channelMonitorAccount, setChannelMonitorAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
   // 用量弹窗打开时停在哪个 tab。列表里点「官方结算」成本直接落到官方统计,
   // 其余入口保持默认的概览。
@@ -1865,6 +2002,8 @@ export default function Accounts() {
   );
   const [concurrencyInput, setConcurrencyInput] = useState("");
   const [skipWarmTier, setSkipWarmTier] = useState(false);
+  const [keepConcurrencyOnDegrade, setKeepConcurrencyOnDegrade] =
+    useState(false);
   const [editAutoPause5hThresholdInput, setEditAutoPause5hThresholdInput] =
     useState("");
   const [editAutoPause7dThresholdInput, setEditAutoPause7dThresholdInput] =
@@ -1915,6 +2054,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
   const [openAIModelDraft, setOpenAIModelDraft] = useState("");
@@ -2014,6 +2154,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
@@ -2057,6 +2198,8 @@ export default function Accounts() {
   const [quickProxyAccount, setQuickProxyAccount] = useState<AccountRow | null>(
     null,
   );
+  // 跳转地址快捷编辑：配置 account_href 或回退打开 base_url。
+  const [hrefAccount, setHrefAccount] = useState<AccountRow | null>(null);
   // OAuth 账号“支持模型”白名单编辑器状态;空白名单表示该账号可调度所有模型。
   const [modelsAccount, setModelsAccount] = useState<AccountRow | null>(null);
   const [modelsDraft, setModelsDraft] = useState<string[]>([]);
@@ -2083,6 +2226,8 @@ export default function Accounts() {
   // 开启时成立,所以开关与全局代理都得跟着代理池一起进来。
   const [proxyPoolEnabled, setProxyPoolEnabled] = useState(false);
   const [globalProxyURL, setGlobalProxyURL] = useState("");
+  // Resin 启用时 Codex 账号出站整层改经 Resin,徽章要报 resin 而不是下面任何一层。
+  const [resinEnabled, setResinEnabled] = useState(false);
   // 单个对象且引用稳定:memo 行组件的 props 里不能出现每轮新建的数组/对象,
   // 否则整表 memo 失效(账号页性能优化的既有教训)。
   // 分组用全量而非 codexGroups:后端解析组代理时不看渠道,迁移前挂在别的渠道组里
@@ -2094,8 +2239,9 @@ export default function Accounts() {
         groups: allGroups,
         poolEnabled: proxyPoolEnabled,
         globalProxy: globalProxyURL,
+        resinEnabled,
       }),
-    [proxyPool, allGroups, proxyPoolEnabled, globalProxyURL],
+    [proxyPool, allGroups, proxyPoolEnabled, globalProxyURL, resinEnabled],
   );
   const [lazyMode, setLazyMode] = useState(false);
   const [accountPortalEnabled, setAccountPortalEnabled] = useState(false);
@@ -2132,6 +2278,9 @@ export default function Accounts() {
     useState(false);
   const [batchBaseConcurrencyInput, setBatchBaseConcurrencyInput] =
     useState("");
+  const [batchUpdateKeepConcurrency, setBatchUpdateKeepConcurrency] =
+    useState(false);
+  const [batchKeepConcurrency, setBatchKeepConcurrency] = useState(false);
   const [batchUpdateSchedulerPriority, setBatchUpdateSchedulerPriority] =
     useState(false);
   const [batchSchedulerPriorityInput, setBatchSchedulerPriorityInput] =
@@ -2670,7 +2819,7 @@ export default function Accounts() {
   useEffect(() => {
     if (providerView !== "codex") return;
     let cancelled = false;
-    void api.getAPIKeys()
+    void api.getAPIKeys({ view: 'lite' })
       .then((response) => { if (!cancelled) setAPIKeys(response.keys ?? []); })
       .catch(() => undefined);
     void api.listAccountGroups()
@@ -2683,6 +2832,7 @@ export default function Accounts() {
         setAccountPortalEnabled(Boolean(settings.public_account_portal_page_enabled));
         setProxyPoolEnabled(Boolean(settings.proxy_pool_enabled));
         setGlobalProxyURL((settings.proxy_url ?? "").trim());
+        setResinEnabled(Boolean(settings.codex_egress?.resin_enabled));
       })
       .catch(() => undefined);
     return () => { cancelled = true; };
@@ -2806,6 +2956,45 @@ export default function Accounts() {
     () => data.accounts.map((account) => account.id),
     [data.accounts],
   );
+  const responsesAccountIDsKey = useMemo(
+    () => data.accounts
+      .filter((account) => account.openai_responses_api)
+      .map((account) => account.id)
+      .join(","),
+    [data.accounts],
+  );
+  const [channelMonitorBillingByAccount, setChannelMonitorBillingByAccount] = useState<
+    Record<number, ChannelMonitorBillingSnapshot>
+  >({});
+  const refreshChannelMonitorBilling = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const response = await api.getChannelMonitorBillingRates(signal);
+      if (signal?.aborted) return;
+      const next: Record<number, ChannelMonitorBillingSnapshot> = {};
+      for (const item of response.items) {
+        if (item.billing.data) next[item.account_id] = item.billing;
+      }
+      setChannelMonitorBillingByAccount(next);
+    } catch (error) {
+      if (!signal?.aborted) console.warn("channel monitor billing rates load failed:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (providerView !== "codex" || !responsesAccountIDsKey) {
+      setChannelMonitorBillingByAccount({});
+      return undefined;
+    }
+    const controller = new AbortController();
+    void refreshChannelMonitorBilling(controller.signal);
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void refreshChannelMonitorBilling(controller.signal);
+    }, 60_000);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+    };
+  }, [providerView, refreshChannelMonitorBilling, responsesAccountIDsKey]);
   const applyAccountLiveState = useCallback((response: AccountLiveStateResponse) => {
     setData((current) => {
       const accounts = mergeAccountLiveState(current.accounts, response);
@@ -2825,6 +3014,12 @@ export default function Accounts() {
   // 用量弹窗里手动刷新官方统计后 bump 一次,强制重拉本页 stats——
   // 否则官方成本胶囊要等翻页/改筛选才出现,看起来像刷新没生效。
   const [pageStatsReloadToken, setPageStatsReloadToken] = useState(0);
+  // 顶部刷新同时要重拉 page-stats。列表和 page-stats 是两条独立请求链,
+  // 账号 ID 不变时仅 reload 列表不会触发 page-stats effect,今日统计就会留在旧快照。
+  const refreshAccountPage = useCallback(async () => {
+    await reload();
+    setPageStatsReloadToken((token) => token + 1);
+  }, [reload]);
   const handleOfficialUsageRefreshed = useCallback(
     (patch?: { accountId: number; officialUsd: number | null }) => {
       if (patch) {
@@ -2883,6 +3078,8 @@ export default function Accounts() {
     [accounts],
   );
   const healthBars = pagedHealthBars;
+  // 自动刷新按节流 bump,账号 ID 不变时也能刷新健康条。
+  const [healthBarsReloadToken, setHealthBarsReloadToken] = useState(0);
 
   useEffect(() => {
     if (!accountPageIDsKey) {
@@ -2900,8 +3097,10 @@ export default function Accounts() {
         console.warn("account health bars load failed:", err);
       });
     return () => { cancelled = true; };
-  }, [accountPageIDsKey]);
+  }, [accountPageIDsKey, healthBarsReloadToken]);
 
+  // 最近一次拉取 page-stats 的时间,供自动刷新节流(任何来源触发都会更新)。
+  const pageStatsLoadedAtRef = useRef(0);
   useEffect(() => {
     if (!accountPageIDsKey) {
       setAccountPageStats({});
@@ -2909,6 +3108,7 @@ export default function Accounts() {
     }
     const controller = new AbortController();
     const ids = accountPageIDsKey.split(",").map(Number);
+    pageStatsLoadedAtRef.current = Date.now();
     void api.getAccountPageStats(ids, controller.signal)
       .then((response) => {
         if (controller.signal.aborted) return;
@@ -2921,6 +3121,29 @@ export default function Accounts() {
       });
     return () => controller.abort();
   }, [accountPageIDsKey, pageStatsReloadToken]);
+  // 自动刷新:列表静默重拉(不闪加载态、失败不弹错);page-stats 与健康条
+  // 是 usage_logs 聚合查询,按 ACCOUNT_PAGE_STATS_MIN_REFRESH_MS 节流。
+  const autoRefreshAccountPage = useCallback(async () => {
+    await reloadSilently();
+    const now = Date.now();
+    if (shouldRefreshPageStats(pageStatsLoadedAtRef.current, now)) {
+      pageStatsLoadedAtRef.current = now;
+      setPageStatsReloadToken((token) => token + 1);
+      setHealthBarsReloadToken((token) => token + 1);
+    }
+  }, [reloadSilently]);
+  const accountAutoRefresh = useMemo(
+    () => ({
+      onAutoRefresh: autoRefreshAccountPage,
+      intervals: ACCOUNT_AUTO_REFRESH_INTERVALS,
+      loadSeconds: readAccountAutoRefreshSeconds,
+      saveSeconds: (seconds: number) =>
+        writeAccountAutoRefreshSeconds(
+          normalizeAccountAutoRefreshSeconds(seconds),
+        ),
+    }),
+    [autoRefreshAccountPage],
+  );
   const officialCostReloadAttemptsRef = useRef(0);
   const missingOfficialCostKey = useMemo(
     () =>
@@ -3617,6 +3840,7 @@ export default function Accounts() {
         models: [],
         codex_client_metadata_mode: "auto",
         codex_passthrough_mode: "off",
+        responses_upstream_transport: "http",
         proxy_url: "",
       });
       setOpenAIModelDraft("");
@@ -5002,6 +5226,8 @@ export default function Accounts() {
     setBatchScoreBiasInput("");
     setBatchUpdateBaseConcurrency(false);
     setBatchBaseConcurrencyInput("");
+    setBatchUpdateKeepConcurrency(false);
+    setBatchKeepConcurrency(false);
     setBatchUpdateSchedulerPriority(false);
     setBatchSchedulerPriorityInput("");
     setBatchUpdateCodexFingerprintMode(false);
@@ -5022,6 +5248,8 @@ export default function Accounts() {
     setBatchScoreBiasInput("");
     setBatchUpdateBaseConcurrency(false);
     setBatchBaseConcurrencyInput("");
+    setBatchUpdateKeepConcurrency(false);
+    setBatchKeepConcurrency(false);
     setBatchUpdateSchedulerPriority(false);
     setBatchSchedulerPriorityInput("");
     setBatchUpdateCodexFingerprintMode(false);
@@ -5077,6 +5305,12 @@ export default function Accounts() {
       .catch((error) => showToast(getErrorMessage(error), "error"));
   };
 
+  const openDetectorAccount = (account: AccountRow) => {
+    void loadAccountDetail(account)
+      .then(setDetectorAccount)
+      .catch((error) => showToast(getErrorMessage(error), "error"));
+  };
+
   const closeModelsEditor = () => {
     if (modelsSaving || modelsSyncing || modelsProbing) return;
     setModelsAccount(null);
@@ -5106,6 +5340,7 @@ export default function Accounts() {
     try {
       const result = await api.syncAccountModelsUpstream(modelsAccount.id);
       const fetched = result.models ?? [];
+      void reloadSilently();
       setModelsDraft((current) => mergeModelLists(current, fetched));
       showToast(
         t("accounts.supportedModelsSyncDone", { count: fetched.length }),
@@ -5210,6 +5445,7 @@ export default function Accounts() {
       );
     } finally {
       setModelsProbing(false);
+      void reloadSilently();
     }
   };
 
@@ -5261,6 +5497,7 @@ export default function Accounts() {
     batchUpdateGroups ||
     batchUpdateScoreBias ||
     batchUpdateBaseConcurrency ||
+    batchUpdateKeepConcurrency ||
     batchUpdateSchedulerPriority ||
     batchUpdateCodexFingerprintMode ||
     batchUpdateTimezone;
@@ -5289,6 +5526,8 @@ export default function Accounts() {
           scoreBias: batchScoreBiasValue,
           updateBaseConcurrency: batchUpdateBaseConcurrency,
           baseConcurrency: batchBaseConcurrencyValue,
+          updateKeepConcurrency: batchUpdateKeepConcurrency,
+          keepConcurrency: batchKeepConcurrency,
           updateSchedulerPriority: batchUpdateSchedulerPriority,
           schedulerPriority: schedulerPriorityInputToValue(
             batchSchedulerPriorityInput,
@@ -5516,6 +5755,7 @@ export default function Accounts() {
         : String(account.base_concurrency_override),
     );
     setSkipWarmTier(account.skip_warm_tier ?? false);
+    setKeepConcurrencyOnDegrade(account.keep_concurrency_on_degrade ?? false);
     setEditAutoPause5hThresholdInput(
       formatQuotaAutoPausePercentInput(account.auto_pause_5h_threshold),
     );
@@ -5559,6 +5799,8 @@ export default function Accounts() {
         account.codex_client_metadata_mode ?? "auto",
       codex_passthrough_mode:
         account.codex_passthrough_mode ?? "off",
+      responses_upstream_transport:
+        account.responses_upstream_transport ?? "http",
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
@@ -5593,6 +5835,7 @@ export default function Accounts() {
     setConcurrencyMode("default");
     setConcurrencyInput("");
     setSkipWarmTier(false);
+    setKeepConcurrencyOnDegrade(false);
     setEditAutoPause5hThresholdInput("");
     setEditAutoPause7dThresholdInput("");
     setEditAutoPause5hDisabled(false);
@@ -5616,6 +5859,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
@@ -5700,6 +5944,7 @@ export default function Accounts() {
         healthTier,
         editingAccount,
         baseConcurrency,
+        keepConcurrencyOnDegrade,
       ),
       appliedBias,
       baseConcurrency,
@@ -5711,6 +5956,7 @@ export default function Accounts() {
     concurrencyMode,
     parsedBaseConcurrency,
     skipWarmTier,
+    keepConcurrencyOnDegrade,
   ]);
 
   const handleSaveScheduler = async () => {
@@ -5739,6 +5985,7 @@ export default function Accounts() {
         base_concurrency_override:
           concurrencyMode === "custom" ? parsedBaseConcurrency : null,
         skip_warm_tier: skipWarmTier,
+        keep_concurrency_on_degrade: keepConcurrencyOnDegrade,
         allowed_api_key_ids: allowedAPIKeySelection,
         proxy_url: editProxyUrl.trim() || null,
         tags: editTags,
@@ -5948,8 +6195,15 @@ export default function Accounts() {
     openDetail: openAccountDetail,
     openSchedulerEditor,
     openQuickConfig: (account) => setQuickConfigAccount(account),
+    openChannelMonitor: (account) => setChannelMonitorAccount(account),
     openQuickGroupEditor,
     openQuickProxyEditor: (account) => setQuickProxyAccount(account),
+    openHrefEditor: (account) => setHrefAccount(account),
+    openHref: (account) => {
+      if (!openAccountHref(account)) {
+        setHrefAccount(account);
+      }
+    },
     openUsage: (account) => {
       setUsageInitialPage("overview");
       setUsageAccount(account);
@@ -5959,6 +6213,7 @@ export default function Accounts() {
       setUsageAccount(account);
     },
     openTesting: openTestingAccount,
+    openDetector: openDetectorAccount,
     refresh: (account) => void handleRefresh(account),
     generateAuthJson: (account) => void handleGenerateAuthJSON(account),
     toggleEnabled: (account) => void handleToggleEnabled(account),
@@ -5975,11 +6230,15 @@ export default function Accounts() {
       openDetail: (a) => rowActionsImplRef.current?.openDetail(a),
       openSchedulerEditor: (a) => rowActionsImplRef.current?.openSchedulerEditor(a),
       openQuickConfig: (a) => rowActionsImplRef.current?.openQuickConfig(a),
+      openChannelMonitor: (a) => rowActionsImplRef.current?.openChannelMonitor(a),
       openQuickGroupEditor: (a) => rowActionsImplRef.current?.openQuickGroupEditor(a),
       openQuickProxyEditor: (a) => rowActionsImplRef.current?.openQuickProxyEditor(a),
+      openHrefEditor: (a) => rowActionsImplRef.current?.openHrefEditor(a),
+      openHref: (a) => rowActionsImplRef.current?.openHref(a),
       openUsage: (a) => rowActionsImplRef.current?.openUsage(a),
       openOfficialUsage: (a) => rowActionsImplRef.current?.openOfficialUsage(a),
       openTesting: (a) => rowActionsImplRef.current?.openTesting(a),
+      openDetector: (a) => rowActionsImplRef.current?.openDetector(a),
       refresh: (a) => rowActionsImplRef.current?.refresh(a),
       generateAuthJson: (a) => rowActionsImplRef.current?.generateAuthJson(a),
       toggleEnabled: (a) => rowActionsImplRef.current?.toggleEnabled(a),
@@ -6152,9 +6411,10 @@ export default function Accounts() {
           <PageHeader
             title={t("accounts.title")}
             description={t("accounts.description")}
-            onRefresh={() => void reload()}
+            onRefresh={() => void refreshAccountPage()}
             hideTitle
             actionsBelow
+            autoRefresh={accountAutoRefresh}
             titleAdornment={
               <div className="flex items-center gap-2">
                 {providerSwitcher}
@@ -6664,7 +6924,7 @@ export default function Accounts() {
               </div>
               <div className="flex max-w-full shrink-0 items-center gap-0.5 overflow-x-auto rounded-lg border border-border bg-muted/30 p-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                 {(
-                  ["all", "pro", "prolite", "plus", "team", "k12", "free"] as const
+                  ["all", "pro", "promax", "prolite", "plus", "team", "k12", "free"] as const
                 ).map((key) => (
                   <button
                     key={key}
@@ -6682,7 +6942,9 @@ export default function Accounts() {
                       ? t("accounts.filterAll")
                       : key === "prolite"
                         ? "ProLite"
-                        : key === "k12"
+                        : key === "promax"
+                          ? "ProMax"
+                          : key === "k12"
                           ? "K12"
                           : key.charAt(0).toUpperCase() + key.slice(1)}
                   </button>
@@ -6833,6 +7095,41 @@ export default function Accounts() {
                     </span>
                   ) : null}
                 </Button>
+                {/* 排序会按标签页记住;表头与分组/优先级按钮只能切换方向,
+                    这里给出当前排序与一键恢复默认。卡片布局的排序下拉已含
+                    「默认排序」,只在它覆盖不到的分组/优先级排序时显示。 */}
+                {sortKey !== null &&
+                  (shouldRenderDesktopTable ||
+                    sortKey === "group" ||
+                    sortKey === "schedulerPriority") && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="w-full min-w-0 border-primary/30 bg-primary/5 px-2 text-primary sm:w-auto"
+                    title={t("accounts.sortResetHint", {
+                      label: sortKeyLabel(sortKey),
+                    })}
+                    aria-label={t("accounts.sortResetHint", {
+                      label: sortKeyLabel(sortKey),
+                    })}
+                    onClick={() => {
+                      setSortKey(null);
+                      setSortDir("desc");
+                      setPage(1);
+                    }}
+                  >
+                    <span className="truncate">
+                      {t("accounts.sortCurrent", {
+                        label: sortKeyLabel(sortKey),
+                      })}
+                    </span>
+                    <span aria-hidden="true" className="shrink-0">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                    <X className="size-3.5 shrink-0" aria-hidden />
+                  </Button>
+                )}
                 {/* 卡片布局(自用模式/网格/移动端)没有可排序表头,这里补一个
                     紧凑排序入口,避免升级后"排序功能消失"(issue #493)。 */}
                 {!shouldRenderDesktopTable && (
@@ -6844,7 +7141,8 @@ export default function Accounts() {
                         sortKey === "requests" ||
                         sortKey === "today" ||
                         sortKey === "usage" ||
-                        sortKey === "importTime"
+                        sortKey === "importTime" ||
+                        sortKey === "id"
                           ? sortKey
                           : "default"
                       }
@@ -6855,7 +7153,7 @@ export default function Accounts() {
                         if (value === "default") {
                           setSortKey(null);
                         } else {
-                          setSortKey(value as "requests" | "today" | "usage" | "importTime");
+                          setSortKey(value as "requests" | "today" | "usage" | "importTime" | "id");
                           setSortDir("desc");
                         }
                         setPage(1);
@@ -6866,12 +7164,14 @@ export default function Accounts() {
                         { value: "today", label: t("accounts.todayStats") },
                         { value: "usage", label: t("accounts.usage") },
                         { value: "importTime", label: t("accounts.importTime") },
+                        { value: "id", label: t("accounts.idColumn") },
                       ]}
                     />
                     {(sortKey === "requests" ||
                       sortKey === "today" ||
                       sortKey === "usage" ||
-                      sortKey === "importTime") && (
+                      sortKey === "importTime" ||
+                      sortKey === "id") && (
                       <Button
                         type="button"
                         variant="outline"
@@ -6969,6 +7269,7 @@ export default function Accounts() {
                       resetTitle={t("accounts.columnReset")}
                       labels={{
                         sequence: t("accounts.sequence"),
+                        id: t("accounts.idColumn"),
                         email: t("accounts.email"),
                         plan: t("accounts.plan"),
                         subscription: t("accounts.subscriptionColumn"),
@@ -7040,7 +7341,9 @@ export default function Accounts() {
                   >
                     {planFilter === "prolite"
                       ? "ProLite"
-                      : planFilter === "k12"
+                      : planFilter === "promax"
+                        ? "ProMax"
+                        : planFilter === "k12"
                         ? "K12"
                         : planFilter.charAt(0).toUpperCase() + planFilter.slice(1)}
                     <X className="size-3" />
@@ -7285,6 +7588,7 @@ export default function Accounts() {
                       <AccountCardItem
                         key={account.id}
                         account={account}
+                        channelMonitorBilling={channelMonitorBillingByAccount[account.id]}
                         sequence={(currentPage - 1) * pageSize + index + 1}
                         selected={selected.has(account.id)}
                         detailOpen={detailAccountId === account.id}
@@ -7331,6 +7635,29 @@ export default function Accounts() {
                         {visibleColumns.sequence && (
                           <TableHead className="text-[13px] font-semibold">
                             {t("accounts.sequence")}
+                          </TableHead>
+                        )}
+                        {visibleColumns.id && (
+                          <TableHead
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            onClick={() => {
+                              if (sortKey === "id") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("id");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.idColumn")}{" "}
+                            {sortKey === "id"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.email && (
@@ -7543,6 +7870,7 @@ export default function Accounts() {
                         <AccountTableRow
                           key={account.id}
                           account={account}
+                          channelMonitorBilling={channelMonitorBillingByAccount[account.id]}
                           sequence={(currentPage - 1) * pageSize + index + 1}
                           selected={selected.has(account.id)}
                           detailOpen={detailAccountId === account.id}
@@ -8070,6 +8398,34 @@ export default function Accounts() {
                   />
                   <p className="mt-1.5 text-xs text-muted-foreground">
                     {t("accounts.codexPassthroughHint")}
+                  </p>
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.responsesUpstreamTransport")}
+                  </label>
+                  <Select
+                    value={openAIForm.responses_upstream_transport ?? "http"}
+                    onValueChange={(value) =>
+                      setOpenAIForm((form) => ({
+                        ...form,
+                        responses_upstream_transport:
+                          value as ResponsesUpstreamTransport,
+                      }))
+                    }
+                    options={[
+                      {
+                        value: "http",
+                        label: t("accounts.responsesUpstreamHTTP"),
+                      },
+                      {
+                        value: "websocket",
+                        label: t("accounts.responsesUpstreamWebsocket"),
+                      },
+                    ]}
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.responsesUpstreamTransportHint")}
                   </p>
                 </div>
                 <div>
@@ -8854,6 +9210,20 @@ export default function Accounts() {
             />
           )}
 
+          {detectorAccount && (
+            <TestConnectionModal
+              mode="detector"
+              account={detectorAccount}
+              onSettled={() => undefined}
+              onClose={() => {
+                forceUsageReloadRef.current.add(detectorAccount.id);
+                usageReloadAttemptsRef.current.delete(detectorAccount.id);
+                setDetectorAccount(null);
+                void reloadSilently();
+              }}
+            />
+          )}
+
           {usageAccount && (
             <AccountUsageModal
               account={usageAccount}
@@ -8921,6 +9291,11 @@ export default function Accounts() {
               if (!detailAccount) return;
               setQuickConfigAccount(detailAccount);
             }}
+            onChannelMonitor={
+              detailAccount?.openai_responses_api && !detailAccount.grok_api
+                ? () => setChannelMonitorAccount(detailAccount)
+                : undefined
+            }
             onEdit={() => {
               if (!detailAccount) return;
               openSchedulerEditor(detailAccount);
@@ -8981,6 +9356,13 @@ export default function Accounts() {
             show={Boolean(quickConfigAccount)}
             onClose={() => setQuickConfigAccount(null)}
             onSaved={() => void reloadSilently()}
+          />
+
+          <ChannelMonitorConfigDialog
+            account={channelMonitorAccount}
+            show={Boolean(channelMonitorAccount)}
+            onClose={() => setChannelMonitorAccount(null)}
+            onSaved={() => void refreshChannelMonitorBilling()}
           />
 
           <Modal
@@ -9233,6 +9615,34 @@ export default function Accounts() {
                       />
                       <p className="mt-1.5 text-xs text-muted-foreground">
                         {t("accounts.codexPassthroughHint")}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block mb-2 text-xs font-semibold text-muted-foreground">
+                        {t("accounts.responsesUpstreamTransport")}
+                      </label>
+                      <Select
+                        value={editOpenAIForm.responses_upstream_transport ?? "http"}
+                        onValueChange={(value) =>
+                          setEditOpenAIForm((form) => ({
+                            ...form,
+                            responses_upstream_transport:
+                              value as ResponsesUpstreamTransport,
+                          }))
+                        }
+                        options={[
+                          {
+                            value: "http",
+                            label: t("accounts.responsesUpstreamHTTP"),
+                          },
+                          {
+                            value: "websocket",
+                            label: t("accounts.responsesUpstreamWebsocket"),
+                          },
+                        ]}
+                      />
+                      <p className="mt-1.5 text-xs text-muted-foreground">
+                        {t("accounts.responsesUpstreamTransportHint")}
                       </p>
                     </div>
 
@@ -9629,6 +10039,35 @@ export default function Accounts() {
                           </div>
                         </div>
 
+                        {/* 降级不降并发 (issue #772) */}
+                        <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs hover:border-border/90 transition-colors">
+                          <div className="flex items-start justify-between gap-4">
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-2 font-semibold text-foreground text-sm">
+                                <Gauge className="size-4 text-sky-500" />
+                                <span>{t("accounts.schedulerKeepConcurrencyLabel")}</span>
+                              </div>
+                              <p className="text-xs text-muted-foreground leading-relaxed">
+                                {t("accounts.schedulerKeepConcurrencyHint")}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-label={t("accounts.schedulerKeepConcurrencyLabel")}
+                              aria-checked={keepConcurrencyOnDegrade}
+                              onClick={() =>
+                                setKeepConcurrencyOnDegrade((current) => !current)
+                              }
+                              className={`relative inline-flex h-5.5 w-10 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${keepConcurrencyOnDegrade ? "bg-primary" : "bg-muted"}`}
+                            >
+                              <span
+                                className={`pointer-events-none block size-4.5 rounded-full bg-white shadow-xs transition-transform ${keepConcurrencyOnDegrade ? "translate-x-4.5" : "translate-x-0"}`}
+                              />
+                            </button>
+                          </div>
+                        </div>
+
                         {/* 请求次数限流 */}
                         <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs hover:border-border/90 transition-colors">
                           <div className="flex items-center gap-2 font-semibold text-foreground text-sm">
@@ -9968,6 +10407,15 @@ export default function Accounts() {
             proxies={proxyPool}
             ctx={proxyBindingCtx}
             onClose={() => setQuickProxyAccount(null)}
+            onSaved={async () => {
+              await reload();
+            }}
+          />
+
+          <AccountHrefQuickEditor
+            account={hrefAccount}
+            accountLabel={hrefAccount ? formatAccountName(hrefAccount) : ""}
+            onClose={() => setHrefAccount(null)}
             onSaved={async () => {
               await reload();
             }}
@@ -10357,6 +10805,35 @@ export default function Accounts() {
                       {batchBaseConcurrencyInvalid
                         ? t("accounts.schedulerConcurrencyRange")
                         : t("accounts.batchMetaResetHint")}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-border p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.schedulerKeepConcurrencyLabel")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.schedulerKeepConcurrencyHint")}
+                        </div>
+                      </div>
+                      <Switch
+                        checked={batchUpdateKeepConcurrency}
+                        onCheckedChange={setBatchUpdateKeepConcurrency}
+                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.schedulerKeepConcurrencyLabel")}`}
+                      />
+                    </div>
+                    <div className="mt-3 flex items-center justify-between gap-3 rounded-lg bg-muted/40 px-3 py-2">
+                      <span className="text-xs text-muted-foreground">
+                        {t("accounts.schedulerKeepConcurrencyLabel")}
+                      </span>
+                      <Switch
+                        checked={batchKeepConcurrency}
+                        onCheckedChange={setBatchKeepConcurrency}
+                        disabled={!batchUpdateKeepConcurrency}
+                        aria-label={t("accounts.schedulerKeepConcurrencyLabel")}
+                      />
                     </div>
                   </div>
 
@@ -11133,6 +11610,7 @@ function RecycleBinView({
   const [planFilter, setPlanFilter] = useState<
     | "all"
     | "pro"
+    | "promax"
     | "prolite"
     | "plus"
     | "team"
@@ -11629,6 +12107,7 @@ function RecycleBinView({
                   [
                     "all",
                     "pro",
+                    "promax",
                     "prolite",
                     "plus",
                     "team",
@@ -11653,7 +12132,9 @@ function RecycleBinView({
                         ? t("accounts.recycleBinPlanUnknown")
                         : key === "prolite"
                           ? "ProLite"
-                          : key === "k12"
+                          : key === "promax"
+                            ? "ProMax"
+                            : key === "k12"
                             ? "K12"
                             : key === "api"
                               ? "API"
@@ -12541,13 +13022,22 @@ function SchedulerPriorityBadge({ account }: { account: AccountRow }) {
   );
 }
 
-// OpenAI reports the $100 Pro tier as "prolite" — functionally a Pro plan with
-// a smaller usage cap. Keep behavioral comparisons (usage windows, plan filter,
+// OpenAI reports the $100 Pro tier as "prolite" and the top Pro tier as
+// "promax" — functionally Pro plans with a different usage cap. Keep behavioral comparisons (usage windows, plan filter,
 // scheduler bias) aligned with the Go side by folding it into "pro".
 function normalizePlanType(planType?: string): string {
   const raw = (planType || "").toLowerCase().trim();
   if (raw === "prolite" || raw === "pro_lite" || raw === "pro-lite")
     return "pro";
+  if (raw === "promax" || raw === "pro_max" || raw === "pro-max")
+    return "pro";
+  if (
+    raw === "ent26" ||
+    raw === "enterprise_cbp_usage_based" ||
+    raw === "enterprise_cbp_automation"
+  )
+    return "enterprise";
+  if (raw === "edu_plus" || raw === "edu_pro") return "edu";
   return raw;
 }
 
@@ -12884,6 +13374,15 @@ function formatPlanLabel(planType?: string): string {
   const lower = raw.toLowerCase();
   if (lower === "prolite" || lower === "pro_lite" || lower === "pro-lite")
     return "ProLite";
+  if (lower === "promax" || lower === "pro_max" || lower === "pro-max")
+    return "ProMax";
+  if (lower === "self_serve_business_prolite") return "team5x";
+  if (lower === "self_serve_business_usage_based") return "Business";
+  if (lower === "ent26" || lower === "enterprise_cbp_usage_based")
+    return "Enterprise";
+  if (lower === "enterprise_cbp_automation") return "Enterprise (Automation)";
+  if (lower === "edu_plus") return "Edu Plus";
+  if (lower === "edu_pro") return "Edu Pro";
   return raw;
 }
 
@@ -12918,6 +13417,8 @@ function PlanBadge({
     pro: "bg-violet-100 text-violet-700 ring-violet-500/30 dark:bg-violet-500/20 dark:text-violet-300 dark:ring-violet-400/30",
     prolite:
       "bg-purple-50 text-purple-600 ring-purple-400/25 dark:bg-purple-500/15 dark:text-purple-300 dark:ring-purple-400/25",
+    promax:
+      "bg-fuchsia-100 text-fuchsia-700 ring-fuchsia-500/35 dark:bg-fuchsia-500/20 dark:text-fuchsia-300 dark:ring-fuchsia-400/35",
     plus: "bg-blue-100 text-blue-700 ring-blue-500/30 dark:bg-blue-500/20 dark:text-blue-300 dark:ring-blue-400/30",
     team: "bg-amber-100 text-amber-700 ring-amber-500/30 dark:bg-amber-500/20 dark:text-amber-300 dark:ring-amber-400/30",
     k12: "bg-emerald-100 text-emerald-700 ring-emerald-500/30 dark:bg-emerald-500/20 dark:text-emerald-300 dark:ring-emerald-400/30",
@@ -12926,7 +13427,13 @@ function PlanBadge({
 
   const normalized = normalizePlanType(planType);
   const key =
-    normalized === "pro" && label === "ProLite" ? "prolite" : normalized;
+    normalized === "pro" && label === "ProLite"
+      ? "prolite"
+      : normalized === "pro" && label === "ProMax"
+        ? "promax"
+        : label === "team5x"
+        ? "team"
+        : normalized;
   const cls =
     style[key] ||
     "bg-slate-100 text-slate-600 ring-slate-400/20 dark:bg-slate-500/15 dark:text-slate-300 dark:ring-slate-400/20";
@@ -13032,7 +13539,14 @@ function computePreviewDynamicConcurrency(
   healthTier: string | undefined,
   account: AccountRow,
   baseConcurrency: number,
+  keepConcurrencyOnDegrade: boolean,
 ): number {
+  if (
+    keepConcurrencyOnDegrade &&
+    (healthTier === "warm" || healthTier === "risky")
+  ) {
+    return baseConcurrency;
+  }
   switch (healthTier) {
     case "healthy":
       return baseConcurrency;
@@ -13095,6 +13609,8 @@ function AccountRowActionsMenu({
   includeTest = true,
   includeDelete = true,
   onTest,
+  onDetect,
+  onChannelMonitor,
   onRefresh,
   onGenerateAuthJson,
   onToggleEnabled,
@@ -13111,6 +13627,8 @@ function AccountRowActionsMenu({
   includeTest?: boolean;
   includeDelete?: boolean;
   onTest: () => void;
+  onDetect?: () => void;
+  onChannelMonitor?: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
   onToggleEnabled: () => void;
@@ -13138,6 +13656,27 @@ function AccountRowActionsMenu({
             label: t("accounts.testConnection"),
             icon: <Zap className="size-3.5" />,
             onSelect: onTest,
+          },
+        ]
+      : []),
+    // 与测连弹窗内的入口一致:Grok / Antigravity 不支持 ModelTrace 指纹检测。
+    ...(onDetect && !account.grok_api && !account.antigravity_api
+      ? [
+          {
+            key: "model-detector",
+            label: t("accounts.detectorOpen"),
+            icon: <ShieldCheck className="size-3.5" />,
+            onSelect: onDetect,
+          },
+        ]
+      : []),
+    ...(account.openai_responses_api && !account.grok_api && onChannelMonitor
+      ? [
+          {
+            key: "channel-monitor",
+            label: "渠道监控",
+            icon: <RadioTower className="size-3.5" />,
+            onSelect: onChannelMonitor,
           },
         ]
       : []),
@@ -13404,6 +13943,7 @@ function GroupChipList({
 
 function AccountMobileCard({
   account,
+  channelMonitorBilling,
   sequence,
   selected,
   detailOpen = false,
@@ -13419,11 +13959,14 @@ function AccountMobileCard({
   t,
   onToggleSelect,
   onOpenDetail,
+  onOpenHref,
+  onOpenHrefEditor,
   onEdit,
   onEditGroups,
   onEditProxy,
   onUsage,
   onTest,
+  onDetect,
   onRefresh,
   onGenerateAuthJson,
   onToggleEnabled,
@@ -13434,8 +13977,10 @@ function AccountMobileCard({
   onDelete,
   onUsageRefreshed,
   onOpenOfficialUsage,
+  onChannelMonitor,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   sequence: number;
   selected: boolean;
   detailOpen?: boolean;
@@ -13451,11 +13996,14 @@ function AccountMobileCard({
   t: ReturnType<typeof useTranslation>["t"];
   onToggleSelect: () => void;
   onOpenDetail: () => void;
+  onOpenHref: () => void;
+  onOpenHrefEditor: () => void;
   onEdit: () => void;
   onEditGroups: () => void;
   onEditProxy: () => void;
   onUsage: () => void;
   onTest: () => void;
+  onDetect?: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
   onToggleEnabled: () => void;
@@ -13467,6 +14015,7 @@ function AccountMobileCard({
   onUsageRefreshed?: () => void;
   // 成本列的官方胶囊点击后跳到用量弹窗的官方统计 tab。
   onOpenOfficialUsage?: () => void;
+  onChannelMonitor?: () => void;
 }) {
   const displayName = account.openai_responses_api
     ? formatAccountName(account)
@@ -13524,14 +14073,34 @@ function AccountMobileCard({
             {avatarInitial}
           </button>
           <div className="min-w-0 flex-1">
-            <button
-              type="button"
-              className="codex-account-card__name"
-              title={fullName}
-              onClick={onOpenDetail}
-            >
-              {displayName}
-            </button>
+            <div className="flex min-w-0 items-center gap-1">
+              <button
+                type="button"
+                className="codex-account-card__name min-w-0 flex-1"
+                title={fullName}
+                onClick={onOpenDetail}
+              >
+                {displayName}
+              </button>
+              {showsAccountHrefLink(account) && (
+                <button
+                  type="button"
+                  className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-muted hover:text-primary"
+                  title={t("accounts.hrefClickHint")}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    // 与表格行同口径：点击跳转，Alt/Option+点击配置。
+                    if (event.altKey) {
+                      onOpenHrefEditor();
+                    } else {
+                      onOpenHref();
+                    }
+                  }}
+                >
+                  <Link2 className="size-3" />
+                </button>
+              )}
+            </div>
             {chatgptAccountId && (
               <div
                 className="codex-account-card__chatgpt-id"
@@ -13545,6 +14114,9 @@ function AccountMobileCard({
           <label className="codex-account-card__selection">
             {showColumn("sequence") && (
               <span className="codex-account-card__sequence">#{sequence}</span>
+            )}
+            {showColumn("id") && (
+              <span className="codex-account-card__sequence">ID {account.id}</span>
             )}
             <input
               type="checkbox"
@@ -13604,6 +14176,7 @@ function AccountMobileCard({
                   <AccountConcurrencyBadge account={account} />
                 </>
               )}
+              <DaybreakBadge models={account.daybreak_models} />
               {isFullCard && resetCredits > 0 && (
                 <button
                   type="button"
@@ -13623,7 +14196,9 @@ function AccountMobileCard({
                   title={
                     account.credits_unlimited
                       ? t("accounts.creditsBalanceUnlimited")
-                      : t("accounts.creditsBalanceBadge", { balance: creditBalance })
+                      : creditBalance === "✓"
+                        ? t("accounts.creditsBalanceAvailable")
+                        : t("accounts.creditsBalanceBadge", { balance: creditBalance })
                   }
                 >
                   <Coins className="size-3" />
@@ -13730,6 +14305,7 @@ function AccountMobileCard({
                   >
                     <BilledCell
                       account={account}
+                      channelMonitorBilling={channelMonitorBilling}
                       onOpenOfficial={onOpenOfficialUsage}
                     />
                   </AccountCardMetric>
@@ -13836,6 +14412,8 @@ function AccountMobileCard({
           refreshing={refreshing}
           authJsonExporting={authJsonExporting}
           onTest={onTest}
+          onDetect={onDetect}
+          onChannelMonitor={onChannelMonitor}
           onRefresh={onRefresh}
           onGenerateAuthJson={onGenerateAuthJson}
           onToggleEnabled={onToggleEnabled}
@@ -14497,15 +15075,49 @@ function APIAccountBalanceBadge({ accountId }: { accountId: number }) {
   );
 }
 
+function ChannelMonitorRateBadge({
+  billing,
+}: {
+  billing?: ChannelMonitorBillingSnapshot;
+}) {
+  const rate = resolveChannelMonitorRate(billing?.data, Date.now());
+  if (rate == null) return null;
+
+  const current = billing?.status === "ok";
+  const lastSuccess = billing?.success_at
+    ? formatRelativeTime(billing.success_at)
+    : "未知";
+  const title = current
+    ? `上游当前计费倍率，上次探测 ${lastSuccess}`
+    : `上游最近一次成功计费倍率，成功于 ${lastSuccess}\n当前倍率探测状态：${billing?.status ?? "unknown"}`;
+
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 font-mono text-[11px] tabular-nums ring-1 ring-inset",
+        current
+          ? "bg-sky-500/10 text-sky-700 ring-sky-500/20 dark:text-sky-300"
+          : "bg-amber-500/10 text-amber-700 ring-amber-500/20 dark:text-amber-300",
+      )}
+      title={title}
+    >
+      <Gauge className="size-3 shrink-0" aria-hidden />
+      倍率 ×{formatChannelMonitorMultiplier(rate)}
+    </span>
+  );
+}
+
 // 成本列并排两套账,颜色区分口径:
 // 上行(石板色)是网关自己的日志算出来的,只含经由本网关转发的请求;
 // 下行(琥珀色)是 OpenAI 官方结算数,还包含用户直接用官方客户端的消耗。
 // 两者不该相等,差额就是账号在网关之外的用量。
 function BilledCell({
   account,
+  channelMonitorBilling,
   onOpenOfficial,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   // 传了才把官方胶囊变成可点按钮（跳到用量弹窗的官方统计 tab）。
   onOpenOfficial?: (account: AccountRow) => void;
 }) {
@@ -14540,7 +15152,7 @@ function BilledCell({
     (account.usage_percent_5h !== null && account.usage_percent_5h !== undefined) ||
     !!account.reset_5h_at;
   const visibleH5 = has5hWindow ? h5 : null;
-  if (visibleH5 === null && d7 === null && !showOfficial && !showAPIBalance) {
+  if (visibleH5 === null && d7 === null && !showOfficial && !showAPIBalance && !channelMonitorBilling?.data) {
     return <span className="text-[12px] text-muted-foreground">-</span>;
   }
   const longLabel = formatLongUsageWindowLabel(account);
@@ -14558,6 +15170,7 @@ function BilledCell({
   return (
     <div className="account-billed-cell flex flex-col items-start gap-1">
       {showAPIBalance && <APIAccountBalanceBadge accountId={account.id} />}
+      {showAPIBalance && <ChannelMonitorRateBadge billing={channelMonitorBilling} />}
       {(visibleH5 !== null || d7 !== null) && (
         <span
           className="account-billed-gateway inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-slate-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-slate-700 ring-1 ring-inset ring-slate-500/20 dark:text-slate-300"

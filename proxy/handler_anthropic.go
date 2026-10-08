@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -54,6 +53,8 @@ var claudeDownstreamResponseHeaders = map[string]struct{}{
 	"anthropic-ratelimit-unified-5h-reset":             {},
 	"anthropic-ratelimit-unified-7d-utilization":       {},
 	"anthropic-ratelimit-unified-7d-reset":             {},
+	"anthropic-ratelimit-unified-7d_oi-utilization":    {},
+	"anthropic-ratelimit-unified-7d_oi-reset":          {},
 	"anthropic-ratelimit-unified-reset":                {},
 	"anthropic-ratelimit-unified-status":               {},
 	"anthropic-ratelimit-unified-representative-claim": {},
@@ -276,7 +277,11 @@ func (h *Handler) hasNativeClaudeAccountMatching(c *gin.Context, model string, a
 	}
 	apiKeyID := requestAPIKeyID(c)
 	accountFilter := claudeChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(model, accountFilter)
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	accountFilter = h.withModelCooldownFilter(ctx, model, accountFilter)
 	if c != nil && c.Request != nil {
 		// The full Messages filter is assembled immediately after this routing
 		// stub. Apply the request's session affinity here as well, so a native
@@ -506,6 +511,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	// Codex / OpenAI 中转仍按需翻译成 Codex-safe Responses。
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	routingBody := h.resolveMessagesRoutingBodyForRequest(c, canonicalBody, model, supportedModels)
+	rememberDaybreakRequest(c, canonicalBody)
 	originalModel := model
 	effectiveModel := effectiveRequestModel(routingBody, model)
 	if isMediaOnlyModel(effectiveModel) {
@@ -526,18 +532,16 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发，
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
-	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolAnthropic)
 	defer stopRetryDeadline()
-	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, isStream, "text/event-stream; charset=utf-8")
+	stopRetryKeepalive := installContinuousRetryMessagesKeepalive(c, isStream)
 	defer stopRetryKeepalive()
-	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
-		activateContinuousRetryKeepalive(c.Request.Context())
-	}
+	h.activateAnthropicMessagesKeepalive(c.Request.Context(), nil, isStream)
 
 	reasoningEffort := extractReasoningEffort(routingBody)
 	serviceTier := extractServiceTier(routingBody)
@@ -615,6 +619,14 @@ func (h *Handler) Messages(c *gin.Context) {
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", msg)
 				return
 			}
+			if h.accountPoolConcurrencySaturated(apiKeyID, retryExclusions.ForSelection(), accountFilter, auth.DispatchPolicyStandard) {
+				setConcurrencySaturatedRetryAfter(c)
+				if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", concurrencySaturatedMessageEN) {
+					return
+				}
+				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", concurrencySaturatedMessageEN)
+				return
+			}
 			if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel)) {
 				return
 			}
@@ -641,6 +653,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
+		if account.OpenAIResponsesUsesUpstreamWebsocket() && !rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
+			useWebsocket = true
+		}
 		upstreamEndpoint := "/v1/responses"
 		if account.IsClaudeOAuth() {
 			// Native Claude accounts do not use the relay/Codex endpoint even
@@ -676,6 +691,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
@@ -688,12 +704,18 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		lastUpstreamCancel = upstreamCancel
 		attemptFirstTokenTimeout := claudeFirstTokenTimeoutFor(h.store, account)
-		ttftGuard := newFirstTokenTimeoutGuard(attemptFirstTokenTimeout, upstreamCancel)
+		// 非流式且要下发 Antigravity 思考时上游改取非流式(见下),首个 token 要等整段
+		// 生成完才到,首字超时守卫不适用。
+		bufferAntigravity := account.IsAntigravityAPI() && AntigravityBuffersUpstream(account, isStream, routingBody)
+		var ttftGuard *firstTokenTimeoutGuard
+		if !bufferAntigravity {
+			ttftGuard = newFirstTokenTimeoutGuard(attemptFirstTokenTimeout, upstreamCancel)
+		}
 		var resp *http.Response
 		var reqErr error
+		h.activateAnthropicMessagesKeepalive(c.Request.Context(), account, isStream)
 		if account.IsClaudeOAuth() {
 			// 首字前保活：长推理期间让下游能区分"上游在思考"与"连接已死"。
-			activateClaudeStreamKeepalive(c.Request.Context(), h.store, account, isStream)
 			// Claude Code OAuth 账号本身说 Anthropic Messages API：不翻译成 Codex，
 			// 直接把原始入站 body 透传到 api.anthropic.com/v1/messages；返回的响应
 			// 已是原生 Anthropic SSE，打上原生路由标记复用既有透传链路。
@@ -767,9 +789,13 @@ func (h *Handler) Messages(c *gin.Context) {
 				// Messages 入站已翻译成 Responses 形态，正是 Antigravity 适配器的入参；
 				// 回程走下面的 Responses→Messages 翻译（issue #595）。该翻译只吃
 				// SSE——翻译恒置 stream:true，非流式客户端也是在网关侧聚合的，
-				// 所以上游一律取流，不跟随下游 stream 标志。
+				// 所以上游默认取流，不跟随下游 stream 标志。例外是非流式客户端要思考
+				// 内容:上游流式几乎不下发 thought 摘要,改取非流式再回放成 SSE（issue #752）。
 				// Antigravity 只认原生公共模型 ID，不做别名映射。
 				resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
+					if bufferAntigravity {
+						return ExecuteAntigravityResponsesRequestBuffered(upstreamCtx, account, attemptEffectiveModel, upstreamBody, proxyURL)
+					}
 					return ExecuteAntigravityResponsesRequest(upstreamCtx, account, attemptEffectiveModel, upstreamBody, true, proxyURL)
 				})
 			} else {
@@ -794,6 +820,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
 			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
+			upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
+			guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
 				return ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 			})
@@ -816,7 +844,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 			}
-			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+			if useWebsocket && kind == upstreamErrorKindMessageTooBig && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 				wsElapsed := time.Since(start)
 				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()))
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
@@ -908,7 +936,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			errBody, readErr := readAllLimited(resp.Body, upstreamErrorBodyReadMaxBytes)
+			errBody, readErr := readAllLimitedWithContinuousRetryKeepalive(readCtx, resp.Body, upstreamErrorBodyReadMaxBytes)
 			if readErr != nil {
 				errBody = []byte(`{"error":{"message":"Upstream error response exceeded the safe read limit","type":"api_error"}}`)
 			}
@@ -1079,7 +1107,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if account.IsClaudeOAuth() && (!isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy)) {
 				copyClaudeNativeResponseHeaders(c, resp.Header)
 			}
-			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
+			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(readCtx, c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
 			if account.IsClaudeOAuth() {
 				// Anthropic 的 input_tokens 不含缓存命中/写入，转换成计费层的总输入口径。
 				applyAnthropicUsageSemantics(usage)
@@ -1245,45 +1273,14 @@ func (h *Handler) Messages(c *gin.Context) {
 			streamAttempt = h.newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, flusher)
 			streamWriter := h.newAttemptStreamFlushWriter(c, streamAttempt, c.Writer, flusher)
 			var pendingFirstTokenEvents bytes.Buffer
-			// downstreamMu 串行化翻译写路径与其共享状态(writeErr/wroteAnyBody/
-			// streamWriter):下面的下游保活 goroutine 与翻译回调并发写同一个
-			// ResponseWriter,必须互斥,否则注释可能插进半个 SSE 事件里。
-			var downstreamMu sync.Mutex
-			// 首个内容帧之后上游长推理/等工具边界期间可能数十秒无可转发帧,与
-			// /v1/responses 一样定期写标准 SSE 注释,避免反代/CDN/隧道把健康长流
-			// 当空闲连接掐断(issue #623)。缓冲式持续重试下 streamWriter 写的是
-			// 私有缓冲,真实下游心跳由 request 级 keepalive 负责,不再起第二个。
-			stopDownstreamKeepalive := func() {}
-			if !continuousRetryBuffersAttempts(continuousRetryPolicy) {
-				stopDownstreamKeepalive = startDownstreamSSEKeepalive(c.Request.Context(), downstreamSSEKeepaliveInterval, func() bool {
-					downstreamMu.Lock()
-					defer downstreamMu.Unlock()
-					if writeErr != nil || c.Request.Context().Err() != nil {
-						return false
-					}
-					// 首个真实字节前不能写注释,否则会提前提交 HTTP 200,
-					// 破坏首包前 response.failed 的真实状态码与换号重试语义。
-					if !wroteAnyBody {
-						return true
-					}
-					if err := streamWriter.WriteSSEComment(downstreamSSEKeepaliveComment); err != nil {
-						// 下游已断:翻译回调只会在下一帧到达时才发现,上游静默期间
-						// 会一直阻塞在读上,这里主动取消上游读让本 attempt 尽快收尾。
-						writeErr = err
-						upstreamCancel()
-						return false
-					}
-					return true
-				})
-			}
+			// 请求级 Messages keepalive 从首个模型事件前开始发送
+			// Anthropic 原生 ping；翻译写入与保活不会再由独立 ticker 并发。
 			// contentStarted 用严格口径（isFirstTokenResult）跟踪"首个真实内容帧"，
 			// 专供流提交决策（缓冲/重试窗口/failed 抑制）使用；ttftRecorded 按
-			// first_token_mode 可能是 loose 口径，只用于首字统计。loose 模式会把
+			// 宽松首字口径记录，只用于首字统计。宽松口径会把
 			// output_item.added 等纯结构帧当"首字"，若拿它做流提交门，结构帧一到
 			// 就落盘 200，首包前静默重试窗口被过早关闭（issue #435）。
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
-				downstreamMu.Lock()
-				defer downstreamMu.Unlock()
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				// 保活写失败已判定下游断开:不再翻译/写入,停止读取。
 				if writeErr != nil {
 					return false
@@ -1293,7 +1290,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				// TTFT 跟踪
 				ttftGuard.MarkProgress(eventType)
-				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
+				isFirstToken := isLooseFirstTokenResult(parsed)
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -1421,8 +1418,6 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return !isResponsesTerminalEvent(eventType)
 			})
-			// stop 会等保活 goroutine 完整退出,之后的收尾写入不再有并发方。
-			stopDownstreamKeepalive()
 			// 仅在真的写过 body 时才做收尾 flush：flusher.Flush 会先提交 HTTP 200 header，
 			// 零写入时提前 flush 会让循环外按真实错误码返回的 JSON 失效（status 已定型为 200）。
 			if writeErr == nil && wroteAnyBody {
@@ -1448,7 +1443,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			translator := newAnthropicStreamTranslator(originalModel)
 			accumulator := newAnthropicResponseAccumulator(originalModel)
 
-			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 				if eventType == "error" {
@@ -1465,7 +1460,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 
 				ttftGuard.MarkProgress(eventType)
-				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
+				if !ttftRecorded && isLooseFirstTokenResult(parsed) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -1534,7 +1529,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 		}
 		downstreamWrote := streamAttempt.downstreamWrote(wroteAnyBody)
-		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, downstreamWrote, c.Request.Context().Err(), writeErr) {
+		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, downstreamWrote, c.Request.Context().Err(), writeErr) && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 			_ = streamAttempt.Close()
 			wsElapsed := time.Since(start)
 			resp.Body.Close()

@@ -45,15 +45,20 @@ func TestCopyClaudeNativeResponseHeadersPreservesUsageMetadata(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	header := http.Header{
-		"anthropic-ratelimit-unified-5h-utilization": []string{"0.42"},
-		"anthropic-ratelimit-unified-5h-reset":       []string{"4102444800"},
-		"anthropic-ratelimit-unified-status":         []string{"allowed"},
-		"anthropic-version":                          []string{"2023-06-01"},
-		"Authorization":                              []string{"Bearer secret"},
-		"Set-Cookie":                                 []string{"secret=1"},
-		"X-Leak":                                     []string{"nope"},
+		"anthropic-ratelimit-unified-5h-utilization":    []string{"0.42"},
+		"anthropic-ratelimit-unified-5h-reset":          []string{"4102444800"},
+		"anthropic-ratelimit-unified-7d_oi-utilization": []string{"0.0"},
+		"anthropic-ratelimit-unified-7d_oi-reset":       []string{"4102444800"},
+		"anthropic-ratelimit-unified-status":            []string{"allowed"},
+		"anthropic-version":                             []string{"2023-06-01"},
+		"Authorization":                                 []string{"Bearer secret"},
+		"Set-Cookie":                                    []string{"secret=1"},
+		"X-Leak":                                        []string{"nope"},
 	}
 	copyClaudeNativeResponseHeaders(ctx, header)
+	if recorder.Header().Get("anthropic-ratelimit-unified-7d_oi-utilization") != "0.0" || recorder.Header().Get("anthropic-ratelimit-unified-7d_oi-reset") != "4102444800" {
+		t.Fatalf("Fable usage headers were not forwarded: %#v", recorder.Header())
+	}
 	if recorder.Header().Get("anthropic-ratelimit-unified-5h-utilization") != "0.42" || recorder.Header().Get("anthropic-version") != "2023-06-01" {
 		t.Fatalf("Claude usage headers were not forwarded: %#v", recorder.Header())
 	}
@@ -148,7 +153,7 @@ func TestForwardGrokNativePrivateAttemptDoesNotPublishFailedHeaders(t *testing.T
 	t.Cleanup(func() { _ = attempt.Close() })
 
 	_, outcome, _, _ := forwardGrokNativeResponseTo(
-		ctx, resp, GrokProtocolResponses, true, time.Now(), nil,
+		ctx.Request.Context(), ctx, resp, GrokProtocolResponses, true, time.Now(), nil,
 		attempt.writerOr(recorder), attempt.flusherOr(recorder),
 	)
 	if outcome.logStatusCode == http.StatusOK {
@@ -201,6 +206,8 @@ func TestForwardGrokNativeTypelessEventErrorStaysPrivateAcrossProtocols(t *testi
 	}
 }
 
+// TestForwardGrokNativeFailureBeforeVisibleOutputReturnsProtocolHTTPError 验证首个可见事件前
+// 的失败仍返回协议对应的 HTTP 错误，而不会伪造成功流。
 func TestForwardGrokNativeFailureBeforeVisibleOutputReturnsProtocolHTTPError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
@@ -232,7 +239,9 @@ func TestForwardGrokNativeFailureBeforeVisibleOutputReturnsProtocolHTTPError(t *
 	}
 }
 
-func TestSendGrokNativeHTTPErrorAfterKeepaliveUsesProtocolEvent(t *testing.T) {
+// TestSendGrokNativeErrorAfterInitialKeepaliveUsesSSE 验证首个保活提交 SSE 后，
+// Grok 各协议的错误仍以协议事件返回。
+func TestSendGrokNativeErrorAfterInitialKeepaliveUsesSSE(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
 		name       string
@@ -241,7 +250,7 @@ func TestSendGrokNativeHTTPErrorAfterKeepaliveUsesProtocolEvent(t *testing.T) {
 		wantMarker string
 	}{
 		{name: "responses", protocol: GrokProtocolResponses, path: "/v1/responses", wantMarker: `"type":"response.failed"`},
-		{name: "chat", protocol: GrokProtocolChatCompletions, path: "/v1/chat/completions", wantMarker: `"type":"upstream_error"`},
+		{name: "chat", protocol: GrokProtocolChatCompletions, path: "/v1/chat/completions", wantMarker: `"error":{"code":"upstream_stream_break"`},
 		{name: "messages", protocol: GrokProtocolMessages, path: "/v1/messages", wantMarker: "event: error\n"},
 	}
 	for _, tc := range tests {
@@ -264,8 +273,12 @@ func TestSendGrokNativeHTTPErrorAfterKeepaliveUsesProtocolEvent(t *testing.T) {
 				failureMessage: "upstream busy",
 			})
 
-			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), tc.wantMarker) {
-				t.Fatalf("committed protocol error = status %d body %q", recorder.Code, recorder.Body.String())
+			body := recorder.Body.String()
+			if recorder.Code != http.StatusOK ||
+				!strings.Contains(body, downstreamSSEKeepaliveComment) ||
+				!strings.Contains(body, tc.wantMarker) ||
+				!strings.Contains(body, "upstream busy") {
+				t.Fatalf("committed SSE error = status %d body %q", recorder.Code, body)
 			}
 		})
 	}

@@ -9,13 +9,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/tidwall/gjson"
 )
 
@@ -57,9 +60,6 @@ func TestAntigravityResponsesLogicalModelsSelectBackingAndBudgetByEffort(t *test
 		wire   string
 		budget int
 	}{
-		{model: "gemini-3.5-flash", effort: "none", wire: "gemini-3.5-flash-extra-low", budget: 1000},
-		{model: "gemini-3.5-flash", effort: "medium", wire: "gemini-3.5-flash-low", budget: 4000},
-		{model: "gemini-3.5-flash", effort: "max", wire: "gemini-3-flash-agent", budget: 10000},
 		{model: "gemini-3.6-flash", effort: "minimal", wire: "gemini-3.6-flash-low", budget: 4096},
 		{model: "gemini-3.6-flash", effort: "medium", wire: "gemini-3.6-flash-medium", budget: 8192},
 		{model: "gemini-3.6-flash", effort: "xhigh", wire: "gemini-3.6-flash-high", budget: 24576},
@@ -91,7 +91,6 @@ func TestAntigravityResponsesLogicalModelsSelectBackingAndBudgetByEffort(t *test
 		model, wire string
 		budget      int
 	}{
-		{model: "gemini-3.5-flash", wire: "gemini-3.5-flash-low", budget: 4000},
 		{model: "gemini-3.6-flash", wire: "gemini-3.6-flash-medium", budget: 8192},
 		{model: "gemini-3.7-flash", wire: "gemini-3.7-flash-tiered", budget: 8192},
 		{model: "gemini-3.1-pro", wire: "gemini-pro-agent", budget: 10001},
@@ -143,9 +142,6 @@ func TestAntigravityResponsesReasoningUsesVariantSpecificBudgets(t *testing.T) {
 		max    int
 		wire   string
 	}{
-		{model: "gemini-3.5-flash-low", effort: "high", budget: 1000, max: 65536, wire: "gemini-3.5-flash-extra-low"},
-		{model: "gemini-3.5-flash-medium", effort: "low", budget: 4000, max: 65536, wire: "gemini-3.5-flash-low"},
-		{model: "gemini-3.5-flash-high", effort: "low", budget: 10000, max: 65536, wire: "gemini-3-flash-agent"},
 		{model: "gemini-3.6-flash-low", effort: "high", budget: 4096, max: 65535, wire: "gemini-3.6-flash-low"},
 		{model: "gemini-3.6-flash-medium", effort: "low", budget: 8192, max: 65535, wire: "gemini-3.6-flash-medium"},
 		{model: "gemini-3.6-flash-high", effort: "low", budget: 24576, max: 65535, wire: "gemini-3.6-flash-high"},
@@ -221,6 +217,64 @@ func TestAntigravityResponsesNonGeminiPreservesMaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestAntigravityResponsesCapsMaxOutputTokensFromSyncedCatalog(t *testing.T) {
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "antigravity-max-output.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	quota, err := json.Marshal(auth.AntigravityQuotaSnapshot{Models: []auth.AntigravityModelQuota{
+		{ModelID: "claude-opus-5-5-high", MaxOutputTokens: func() *int { v := 128000; return &v }()},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := db.InsertAccountWithUpstream(ctx, "antigravity", "google", auth.UpstreamAntigravity, map[string]any{
+		"upstream_type":     auth.UpstreamAntigravity,
+		"access_token":      "token",
+		"refresh_token":     "refresh",
+		"project_id":        "project",
+		"models":            []string{"claude-opus-5-5-high"},
+		"antigravity_quota": string(quota),
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewStore(db, nil, nil)
+	t.Cleanup(store.Stop)
+	if err := store.LoadAccountByID(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	account := store.FindByID(id)
+	if account == nil {
+		t.Fatal("loaded account is nil")
+	}
+
+	for _, test := range []struct {
+		name    string
+		account *auth.Account
+		request int
+		want    int
+	}{
+		{name: "synced limit admits 128k", account: account, request: 128000, want: 128000},
+		{name: "synced limit caps above", account: account, request: 200000, want: 128000},
+		{name: "static fallback without catalog", account: nil, request: 128000, want: 64000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"input":"hello","max_output_tokens":` + strconv.Itoa(test.request) + `}`)
+			got, err := responsesToGeminiInternalForAccount(body, "project", "claude-opus-5-5-high", test.account)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := got["request"].(map[string]any)["generationConfig"].(map[string]any)
+			if config["maxOutputTokens"] != test.want {
+				t.Fatalf("maxOutputTokens = %v, want %d", config["maxOutputTokens"], test.want)
+			}
+		})
+	}
+}
+
 func TestAntigravityResponsesConvertsFunctionDeclarations(t *testing.T) {
 	t.Setenv(antigravityFunctionToolsEnv, "true")
 	got, err := responsesToGeminiInternal([]byte(`{
@@ -238,7 +292,7 @@ func TestAntigravityResponsesConvertsFunctionDeclarations(t *testing.T) {
 				"required":["query"]
 			}
 		}]
-	}`), "project", "gemini-3-flash-agent")
+	}`), "project", "gemini-3.6-flash-high")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +357,7 @@ func TestAntigravityGeminiParametersDropsNestedOrphanRequiredFields(t *testing.T
 				"required":["environment"]
 			}
 		}]
-	}`), "project", "gemini-3-flash-agent")
+	}`), "project", "gemini-3.6-flash-high")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +376,7 @@ func TestAntigravityResponsesConvertsFunctionCallRoundTripInput(t *testing.T) {
 			{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"value\"}"},
 			{"type":"function_call_output","call_id":"call_1","output":"found"}
 		]
-	}`), "project", "gemini-3-flash-agent")
+	}`), "project", "gemini-3.6-flash-high")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +505,7 @@ func TestAntigravityResponsesSkipsEchoedReasoningItems(t *testing.T) {
 			{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"query\":\"value\"}"},
 			{"type":"function_call_output","call_id":"call_1","output":"found"}
 		]
-	}`), "project", "gemini-3-flash-agent")
+	}`), "project", "gemini-3.6-flash-high")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,7 +802,6 @@ func TestAntigravityInteractionsLogicalModelsUseRequestedEffort(t *testing.T) {
 	for _, test := range []struct {
 		model, effort, wire, normalized string
 	}{
-		{model: "gemini-3.5-flash", effort: "low", wire: "gemini-3.5-flash-extra-low", normalized: "low"},
 		{model: "gemini-3.6-flash", effort: "max", wire: "gemini-3.6-flash-high", normalized: "high"},
 		{model: "gemini-3.7-flash", effort: "medium", wire: "gemini-3.7-flash-tiered", normalized: "medium"},
 		{model: "gemini-3.1-pro", effort: "medium", wire: "gemini-pro-agent", normalized: "high"},
@@ -936,7 +989,7 @@ func TestAntigravityOAuthWireUsesOfficialIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
-	if gotHTTPUserAgent != antigravityOfficialHTTPUserAgent {
+	if gotHTTPUserAgent != auth.AntigravityUserAgent() {
 		t.Fatalf("HTTP User-Agent = %q", gotHTTPUserAgent)
 	}
 	if gotBody["userAgent"] != antigravityOfficialBodyUserAgent {
@@ -1649,5 +1702,267 @@ func TestAntigravitySessionIDFallsBackToFirstUserTurn(t *testing.T) {
 	}
 	if metadataSeeded := sessionOf(`{"input":"x","metadata":{"session_id":"sess-1"}}`); metadataSeeded != antigravitySessionIDFromSeed("metadata.session_id:sess-1") {
 		t.Fatalf("metadata.session_id was not used as the seed: %q", metadataSeeded)
+	}
+}
+
+const antigravityCustomToolPatchInput = "*** Begin Patch\n*** Update File: a.txt\n*** End Patch\n"
+
+func TestResponsesToGeminiInternalSupportsCustomToolCall(t *testing.T) {
+	t.Setenv(antigravityFunctionToolsEnv, "true")
+	got, err := responsesToGeminiInternal([]byte(`{
+		"input":[
+			{
+				"type":"custom_tool_call",
+				"call_id":"call_patch_1",
+				"name":"apply_patch",
+				"input":"*** Begin Patch\n*** Update File: a.txt\n*** End Patch\n"
+			},
+			{
+				"type":"custom_tool_call_output",
+				"call_id":"call_patch_1",
+				"output":"Success. Updated the following files:\nM a.txt\n"
+			}
+		],
+		"tools":[{
+			"type":"custom",
+			"name":"apply_patch",
+			"description":"Use the apply_patch tool to edit files.",
+			"format":{"type":"grammar","syntax":"lark","definition":"start: patch"}
+		}]
+	}`), "project", "gemini-3.8-flash")
+	if err != nil {
+		t.Fatalf("custom_tool_call must be accepted: %v", err)
+	}
+	request := got["request"].(map[string]any)
+	contents := request["contents"].([]any)
+	if len(contents) != 2 {
+		t.Fatalf("contents length != 2: %#v", contents)
+	}
+	modelTurn := contents[0].(map[string]any)
+	if modelTurn["role"] != "model" {
+		t.Fatalf("model turn missing: %#v", contents[0])
+	}
+	modelParts := modelTurn["parts"].([]any)
+	if len(modelParts) != 1 {
+		t.Fatalf("model parts length != 1: %#v", modelParts)
+	}
+	functionCall := modelParts[0].(map[string]any)["functionCall"].(map[string]any)
+	if functionCall["name"] != "apply_patch" || functionCall["id"] != "call_patch_1" {
+		t.Fatalf("functionCall identity mismatch: %#v", functionCall)
+	}
+	args, ok := functionCall["args"].(map[string]any)
+	if !ok || args["input"] != antigravityCustomToolPatchInput {
+		t.Fatalf("freeform payload was not carried in args.input: %#v", functionCall["args"])
+	}
+	userTurn := contents[1].(map[string]any)
+	if userTurn["role"] != "user" {
+		t.Fatalf("user turn missing: %#v", contents[1])
+	}
+	functionResponse := userTurn["parts"].([]any)[0].(map[string]any)["functionResponse"].(map[string]any)
+	if functionResponse["name"] != "apply_patch" || functionResponse["id"] != "call_patch_1" {
+		t.Fatalf("functionResponse identity mismatch: %#v", functionResponse)
+	}
+	if result := functionResponse["response"].(map[string]any)["result"]; result != "Success. Updated the following files:\nM a.txt\n" {
+		t.Fatalf("custom tool output was not forwarded: %#v", result)
+	}
+
+	declarations := request["tools"].([]any)[0].(map[string]any)["functionDeclarations"].([]any)
+	if len(declarations) != 1 {
+		t.Fatalf("custom tool was not declared: %#v", request["tools"])
+	}
+	declaration := declarations[0].(map[string]any)
+	if declaration["name"] != "apply_patch" || declaration["description"] != "Use the apply_patch tool to edit files." {
+		t.Fatalf("declaration = %#v", declaration)
+	}
+	schema := declaration["parametersJsonSchema"].(map[string]any)
+	input, ok := schema["properties"].(map[string]any)["input"].(map[string]any)
+	if !ok || input["type"] != "STRING" {
+		t.Fatalf("custom tool must expose a single string input: %#v", schema)
+	}
+	if required := schema["required"].([]any); len(required) != 1 || required[0] != "input" {
+		t.Fatalf("input must be required: %#v", schema["required"])
+	}
+}
+
+func TestResponsesToGeminiInternalSupportsNestedCustomToolDeclaration(t *testing.T) {
+	t.Setenv(antigravityFunctionToolsEnv, "true")
+	got, err := responsesToGeminiInternal([]byte(`{
+		"input":"hello",
+		"tools":[{
+			"type":"custom",
+			"custom":{
+				"name":"apply_patch",
+				"description":"Use the apply_patch tool to edit files."
+			}
+		}]
+	}`), "project", "gemini-3.8-flash")
+	if err != nil {
+		t.Fatalf("nested custom declaration must be accepted: %v", err)
+	}
+	declarations := got["request"].(map[string]any)["tools"].([]any)[0].(map[string]any)["functionDeclarations"].([]any)
+	if len(declarations) != 1 {
+		t.Fatalf("functionDeclarations = %#v", declarations)
+	}
+	declaration := declarations[0].(map[string]any)
+	if declaration["name"] != "apply_patch" || declaration["description"] != "Use the apply_patch tool to edit files." {
+		t.Fatalf("declaration = %#v", declaration)
+	}
+}
+
+func TestResponsesToGeminiInternalRejectsOrphanCustomToolCallOutput(t *testing.T) {
+	_, err := responsesToGeminiInternal([]byte(`{
+		"input":[{"type":"custom_tool_call_output","call_id":"call_missing","output":"done"}]
+	}`), "project", "gemini-3.8-flash")
+	if err == nil || !strings.Contains(err.Error(), "orphan custom_tool_call_output") {
+		t.Fatalf("orphan custom_tool_call_output error = %v", err)
+	}
+}
+
+func TestAntigravityCustomToolNamesReadsOnlyFreeformDeclarations(t *testing.T) {
+	names := antigravityCustomToolNames([]byte(`{
+		"tools":[
+			{"type":"custom","name":"apply_patch"},
+			{"type":"custom","custom":{"name":"nested_tool"}},
+			{"type":"function","name":"lookup"},
+			{"type":"web_search_preview"}
+		]
+	}`))
+	if len(names) != 2 || !names["apply_patch"] || !names["nested_tool"] {
+		t.Fatalf("custom tool names = %#v", names)
+	}
+	if names := antigravityCustomToolNames([]byte(`{"tools":[{"type":"function","name":"lookup"}]}`)); names != nil {
+		t.Fatalf("function-only tools must yield no custom names: %#v", names)
+	}
+	if names := antigravityCustomToolNames([]byte(`not json`)); names != nil {
+		t.Fatalf("unparseable body must yield no custom names: %#v", names)
+	}
+}
+
+// The declaration path normalizes the tool type via lowerStringField; the
+// collection path must normalize identically or a `"CUSTOM"` declaration is
+// forwarded to the model while the response comes back as function_call.
+func TestAntigravityCustomToolNamesNormalizesToolTypeLikeDeclaration(t *testing.T) {
+	for _, body := range []string{
+		`{"tools":[{"type":"CUSTOM","name":"apply_patch"}]}`,
+		`{"tools":[{"type":" custom ","name":"apply_patch"}]}`,
+		`{"tools":[{"type":"Custom","custom":{"name":"apply_patch"}}]}`,
+	} {
+		names := antigravityCustomToolNames([]byte(body))
+		if !names["apply_patch"] {
+			t.Fatalf("body %s must register apply_patch as custom, got %#v", body, names)
+		}
+	}
+	// A non-custom type must still not be picked up by loose matching.
+	if names := antigravityCustomToolNames([]byte(`{"tools":[{"type":"customs","name":"apply_patch"}]}`)); names != nil {
+		t.Fatalf("type \"customs\" must not match custom: %#v", names)
+	}
+}
+
+func TestAntigravitySSERebuildsCustomToolCallLifecycle(t *testing.T) {
+	input := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"apply_patch\",\"args\":{\"input\":\"*** Begin Patch\\n*** End Patch\\n\"},\"id\":\"call_patch_1\"}}]},\"finishReason\":\"STOP\"}]}\n\n"
+	body := newAntigravitySSEResponseBodyWithCustomTools(
+		io.NopCloser(strings.NewReader(input)),
+		map[string]bool{"apply_patch": true},
+		"gemini-test",
+	)
+	defer body.Close()
+	out, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	for _, eventType := range []string{
+		"response.output_item.added",
+		"response.custom_tool_call_input.delta",
+		"response.custom_tool_call_input.done",
+		"response.output_item.done",
+		"response.completed",
+	} {
+		if !strings.Contains(got, `"type":"`+eventType+`"`) {
+			t.Fatalf("missing %s: %s", eventType, got)
+		}
+	}
+	if strings.Contains(got, "response.function_call_arguments") {
+		t.Fatalf("a freeform tool must not use the function_call event family: %s", got)
+	}
+	if !strings.Contains(got, `"type":"custom_tool_call"`) || !strings.Contains(got, `"call_id":"call_patch_1"`) || !strings.Contains(got, `"name":"apply_patch"`) {
+		t.Fatalf("custom tool call item is incomplete: %s", got)
+	}
+	// The unwrapped freeform payload, not the JSON wrapper, is what Codex feeds
+	// back into apply_patch.
+	if !strings.Contains(got, `"input":"*** Begin Patch\n*** End Patch\n"`) {
+		t.Fatalf("custom tool input was not unwrapped: %s", got)
+	}
+	if strings.Contains(got, `\"input\":\"*** Begin Patch`) {
+		t.Fatalf("custom tool input leaked the JSON wrapper: %s", got)
+	}
+}
+
+func TestAntigravitySSEKeepsFunctionCallWhenToolIsNotFreeform(t *testing.T) {
+	input := "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"apply_patch\",\"args\":{\"input\":\"patch\"},\"id\":\"call_patch_1\"}}]},\"finishReason\":\"STOP\"}]}\n\n"
+	body := newAntigravitySSEResponseBody(io.NopCloser(strings.NewReader(input)), "gemini-test")
+	defer body.Close()
+	out, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	if !strings.Contains(got, `"type":"function_call"`) || !strings.Contains(got, "response.function_call_arguments.done") {
+		t.Fatalf("an undeclared freeform tool must stay a function_call: %s", got)
+	}
+	if strings.Contains(got, "custom_tool_call") {
+		t.Fatalf("custom_tool_call must require an explicit custom declaration: %s", got)
+	}
+}
+
+func TestAntigravityJSONResponseRebuildsCustomToolCall(t *testing.T) {
+	upstream := `{"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Update File: a.txt\n*** End Patch\n"},"id":"call_patch_1"}}]},"finishReason":"STOP"}]}`
+	body, err := newAntigravityJSONResponseBodyWithCustomTools(
+		io.NopCloser(strings.NewReader(upstream)),
+		"gemini-test",
+		map[string]bool{"apply_patch": true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	output := env["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output length != 1: %#v", output)
+	}
+	item := output[0].(map[string]any)
+	if item["type"] != "custom_tool_call" || item["name"] != "apply_patch" || item["call_id"] != "call_patch_1" {
+		t.Fatalf("custom tool call item = %#v", item)
+	}
+	if item["input"] != antigravityCustomToolPatchInput {
+		t.Fatalf("custom tool input = %#v", item["input"])
+	}
+	if _, ok := item["arguments"]; ok {
+		t.Fatalf("custom_tool_call must not carry function_call arguments: %#v", item)
+	}
+}
+
+func TestAntigravityCustomToolCallInputFallsBackToRawArguments(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		arguments string
+		want      string
+	}{
+		{name: "wrapped input", arguments: `{"input":"patch"}`, want: "patch"},
+		{name: "bare string", arguments: `"patch"`, want: "patch"},
+		{name: "empty object", arguments: `{}`, want: ""},
+		{name: "unexpected schema", arguments: `{"patch":"x"}`, want: `{"patch":"x"}`},
+		{name: "not json", arguments: "patch", want: "patch"},
+	} {
+		if got := antigravityCustomToolCallInput(test.arguments); got != test.want {
+			t.Fatalf("%s: got %q, want %q", test.name, got, test.want)
+		}
 	}
 }

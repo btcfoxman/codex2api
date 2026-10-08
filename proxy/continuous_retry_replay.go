@@ -29,6 +29,7 @@ var (
 type continuousRetryReplay struct {
 	memory      bytes.Buffer
 	file        *os.File
+	filePath    string
 	size        int64
 	memoryLimit int64
 	totalLimit  int64
@@ -93,7 +94,7 @@ func (r *continuousRetryReplay) Write(data []byte) (int, error) {
 				_ = r.Close()
 				return 0, errContinuousRetryReplayStorage
 			}
-			r.memory.Reset()
+			r.memory = bytes.Buffer{}
 		}
 	}
 	n, err := r.file.Write(data)
@@ -151,13 +152,17 @@ func (r *continuousRetryReplay) Close() error {
 		return nil
 	}
 	r.closed = true
-	r.memory.Reset()
+	r.memory = bytes.Buffer{}
 	var closeErr error
 	if r.file != nil {
 		if err := r.file.Close(); err != nil {
 			closeErr = errContinuousRetryReplayStorage
 		}
 		r.file = nil
+	}
+	if r.filePath != "" {
+		_ = os.Remove(r.filePath)
+		r.filePath = ""
 	}
 	return closeErr
 }

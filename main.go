@@ -40,6 +40,7 @@ func migrateOnlyEnabled() bool {
 	return value == "1" || strings.EqualFold(value, "true")
 }
 
+// main 加载配置、初始化存储与路由，并启动 Codex2API HTTP 服务。
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
@@ -49,6 +50,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
+	proxy.ConfigureDownstreamKeepaliveFromEnv()
 	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s, tz=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label(), time.Local)
 
 	// 2. 初始化数据库
@@ -116,12 +118,13 @@ func main() {
 			UsageLogFlushIntervalSeconds:      5,
 			StreamFlushPolicy:                 proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:             20,
-			FirstTokenMode:                    proxy.FirstTokenModeStrict,
+			FirstTokenMode:                    proxy.FirstTokenModeLoose,
 			FirstTokenTimeoutSeconds:          0,
 			BillingTierPolicy:                 proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:                "{}",
 			PublicKeyUsagePageEnabled:         true,
 			PublicImageStudioPageEnabled:      true,
+			ShowUpstreamModelMismatch:         true,
 			CodexWSHideUpstreamErrors:         true,
 			CodexWSSilentRetryEnabled:         true,
 			CodexWSSilentMaxRetries:           2,
@@ -168,12 +171,13 @@ func main() {
 			UsageLogFlushIntervalSeconds:      5,
 			StreamFlushPolicy:                 proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:             20,
-			FirstTokenMode:                    proxy.FirstTokenModeStrict,
+			FirstTokenMode:                    proxy.FirstTokenModeLoose,
 			FirstTokenTimeoutSeconds:          0,
 			BillingTierPolicy:                 proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:                "{}",
 			PublicKeyUsagePageEnabled:         true,
 			PublicImageStudioPageEnabled:      true,
+			ShowUpstreamModelMismatch:         true,
 			CodexWSHideUpstreamErrors:         true,
 			CodexWSSilentRetryEnabled:         true,
 			CodexWSSilentMaxRetries:           2,
@@ -232,6 +236,9 @@ func main() {
 		auth.SetConfiguredAntigravitySettings(parsed)
 		if len(parsed.ModelRedirects) > 0 {
 			log.Printf("Antigravity 模型重定向已加载: %d 条", len(parsed.ModelRedirects))
+		}
+		if parsed.ExposeThoughts {
+			log.Printf("Antigravity 思考内容下发已开启")
 		}
 	}
 	antigravityCfgCancel()
@@ -372,6 +379,8 @@ func main() {
 	adminHandler.StartOfficialPricingSync(backgroundCtx)
 	// Prompt 审核日志保留清理：默认保留 7 天，每小时分批清理过期行，CY 关联行不动。
 	adminHandler.StartPromptLogRetention(backgroundCtx)
+	// Responses API 渠道监控按账号启用，健康检查和倍率探测分别调度。
+	adminHandler.StartChannelMonitor(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -395,6 +404,7 @@ func main() {
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	security.ConfigureRequestMemoryBudget(cfg.RequestMemoryBudgetBytes)
 	// 账号导入端点(multipart 文件上传)单独放宽体积上限,默认 200MB,可用
 	// CODEX_MAX_IMPORT_BODY_SIZE_MB 覆盖。前端按大小分批发送,单批控制在此上限内。
 	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_IMPORT_BODY_SIZE_MB")); v != "" {
@@ -443,6 +453,16 @@ func main() {
 
 	handler.RegisterRoutes(r)
 	adminHandler.RegisterExternalImageRoutes(r, handler)
+	imageWorkers, queueErr := admin.ImageJobWorkerCount()
+	if queueErr != nil {
+		log.Fatal(queueErr)
+	}
+	if err := adminHandler.StartImageJobQueue(backgroundCtx, imageWorkers); err != nil {
+		log.Fatalf("Initialize image queue: %v", err)
+	}
+	if err := adminHandler.StartImageMaintenance(backgroundCtx); err != nil {
+		log.Fatalf("Initialize image maintenance: %v", err)
+	}
 	adminHandler.StartPromptIntelligence(backgroundCtx)
 	adminHandler.RegisterRoutes(r)
 
@@ -610,7 +630,10 @@ func main() {
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
 	log.Printf("  API:    POST /v1/images/jobs")
+	log.Printf("  API:    POST /v1/images/jobs/results")
 	log.Printf("  API:    GET  /v1/images/jobs/:id")
+	log.Printf("  API:    GET  /v1/images/jobs/:id/output")
+	log.Printf("  API:    POST /v1/images/jobs/:id/ack")
 	log.Printf("  API:    POST /v1/messages")
 	log.Printf("  API:    GET  /v1/models")
 	log.Println("==========================================")

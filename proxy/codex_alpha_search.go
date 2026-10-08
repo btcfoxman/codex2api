@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,6 +66,13 @@ func (h *Handler) CodexAlphaSearchHandler(c *gin.Context) {
 	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/alpha/search", model) {
 		return
 	}
+	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
+	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
+	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolResponses)
+	defer stopRetryDeadline()
+	stopRetryKeepalive := installContinuousRetryHTTPInformationalKeepalive(c)
+	defer stopRetryKeepalive()
+	activateContinuousRetryKeepalive(c.Request.Context())
 
 	apiKeyID := requestAPIKeyID(c)
 	// 搜索端点只存在于 ChatGPT 后端，relay/Grok 账号无从代答。
@@ -89,6 +97,14 @@ func (h *Handler) CodexAlphaSearchHandler(c *gin.Context) {
 		apiKey,
 	)
 	if err != nil {
+		// 版本不可用在出站前就已拦下，是本地配置问题，不能报成上游 502。
+		var identityErr *Error
+		if errors.As(err, &identityErr) && identityErr.Code == ErrorCodeCodexClientVersionUnavailable {
+			api.SendErrorWithStatus(c,
+				api.NewAPIError(api.ErrCodeServiceUnavailable, identityErr.Message, api.ErrorTypeServer),
+				identityErr.HTTPStatus)
+			return
+		}
 		api.SendErrorWithStatus(c,
 			api.NewAPIError(api.ErrCodeUpstreamError, fmt.Sprintf("codex alpha search: %v", err), api.ErrorTypeUpstream),
 			http.StatusBadGateway)
@@ -143,12 +159,16 @@ func ForwardCodexAlphaSearch(ctx context.Context, account *auth.Account, proxyUR
 	if deviceCfg == nil {
 		deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 	}
-	userAgent, version := ResolveCodexOutboundClientHeaders(account, apiKey, deviceCfg, downstreamHeaders)
+	identity, err := ResolveCodexOutboundClientIdentity(CodexClientIdentityInput{Account: account, APIKey: apiKey, DeviceConfig: deviceCfg, Headers: downstreamHeaders})
+	if err != nil {
+		return nil, err
+	}
+	userAgent, version := identity.UserAgent, identity.Version
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Originator", Originator)
+	req.Header.Set("Originator", CodexOriginatorForGeneratedUserAgent(userAgent))
 	if version != "" {
 		req.Header.Set("Version", version)
 	}
@@ -159,13 +179,15 @@ func ForwardCodexAlphaSearch(ctx context.Context, account *auth.Account, proxyUR
 	// 复用网关同款 transport（支持 uTLS Chrome 指纹），与 /responses、清单透传一致。
 	// 池化而非每次新建，避免一次性 uTLS transport 泄漏连接（issue #446）。
 	client := getCodexMaintenanceClient(account, proxyURL)
-	resp, err := client.Do(req)
+	resp, err := executeHTTPWithContinuousRetryKeepalive(reqCtx, func() (*http.Response, error) {
+		return client.Do(req)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("codex search request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, codexAlphaSearchBodyLimit))
+	body, err := readAllLimitedWithContinuousRetryKeepalive(reqCtx, resp.Body, codexAlphaSearchBodyLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read codex search response: %w", err)
 	}

@@ -46,7 +46,7 @@ func ageAccountForOfficialUsage(t *testing.T, store *auth.Store, id int64) {
 	if account == nil {
 		t.Fatalf("account %d not in store", id)
 	}
-	account.AddedAt = time.Now().Add(-25 * time.Hour).UnixNano()
+	account.AddedAt.Store(time.Now().Add(-25 * time.Hour).UnixNano())
 }
 
 func waitAccountDailyUsage(t *testing.T, db *database.DB, id int64) {
@@ -176,6 +176,9 @@ func TestGetAccountPageStatsMarksSyncedWhenUpstreamHasNoData(t *testing.T) {
 		mu.Unlock()
 		return &proxy.WhamDailyUsageResponse{}, nil, nil
 	}
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 
 	key := strconv.FormatInt(id, 10)
 	first := invokeAccountPageStats(t, handler, []int64{id})
@@ -240,6 +243,9 @@ func TestWhamDailyBackfillFailureCooldownSkipsRetry(t *testing.T) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
+		return nil, nil, errWhamDailyUsageUnavailable
+	}
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
 		return nil, nil, errWhamDailyUsageUnavailable
 	}
 
