@@ -19,6 +19,19 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func TestImageJobWorkerCountDefaultsToOne(t *testing.T) {
+	t.Setenv("IMAGE_JOB_WORKERS", "")
+	workers, err := ImageJobWorkerCount()
+	if err != nil || workers != 1 {
+		t.Fatalf("default workers=%d err=%v, want one", workers, err)
+	}
+	t.Setenv("IMAGE_JOB_WORKERS", "0")
+	workers, err = ImageJobWorkerCount()
+	if err != nil || workers != 0 {
+		t.Fatalf("explicit zero workers=%d err=%v", workers, err)
+	}
+}
+
 func TestImageQueueAcceptsThousandWithoutFetchingOrKeySlots(t *testing.T) {
 	const jobCount = 1000
 	t.Setenv("IMAGE_JOB_WORKERS", "2")

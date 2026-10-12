@@ -374,7 +374,7 @@ var (
 
 func GlobalUpscaleCache() *UpscaleCache {
 	globalUpscaleCacheOnce.Do(func() {
-		budget := int64(512)
+		budget := int64(64)
 		if value, err := strconv.ParseInt(os.Getenv("IMAGE_UPSCALE_CACHE_MB"), 10, 64); err == nil && value >= 1 && value <= 4096 {
 			budget = value
 		}

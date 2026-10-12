@@ -15,7 +15,7 @@ import (
 // 设计取舍：
 //   - 不持久化（重启清零，数据足够小）
 //   - 不在 key 里编码 mime；不同后端/格式重新生成时按 capBytes 自然淘汰旧条目
-//   - 64MB 默认上限，按字节淘汰；超大单图（>capBytes）拒绝缓存
+//   - 16MB 默认上限，按字节淘汰；超大单图（>capBytes）拒绝缓存
 type ThumbnailCache struct {
 	mu       sync.Mutex
 	ll       *list.List
@@ -30,10 +30,10 @@ type thumbEntry struct {
 	data        []byte
 }
 
-// NewThumbnailCache 创建容量为 capBytes 字节的 LRU。capBytes <= 0 时使用 64MB 默认值。
+// NewThumbnailCache 创建容量为 capBytes 字节的 LRU。capBytes <= 0 时使用 16MB 默认值。
 func NewThumbnailCache(capBytes int64) *ThumbnailCache {
 	if capBytes <= 0 {
-		capBytes = 64 * 1024 * 1024
+		capBytes = 16 * 1024 * 1024
 		if value, err := strconv.ParseInt(os.Getenv("IMAGE_THUMB_CACHE_MB"), 10, 64); err == nil && value >= 1 && value <= 1024 {
 			capBytes = value * 1024 * 1024
 		}

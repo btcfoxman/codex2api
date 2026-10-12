@@ -34,11 +34,12 @@ type imageJobQueue struct {
 	pipeline bool
 }
 
-// ImageJobWorkerCount reads the opt-in worker limit; zero preserves legacy admission.
+// ImageJobWorkerCount defaults to one durable worker so external image jobs do
+// not fan out into unbounded goroutines when a server has no explicit setting.
 func ImageJobWorkerCount() (int, error) {
 	raw := strings.TrimSpace(os.Getenv("IMAGE_JOB_WORKERS"))
 	if raw == "" {
-		return 0, nil
+		return 1, nil
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 0 || n > 32 {
@@ -58,7 +59,7 @@ func (h *Handler) StartImageJobQueue(ctx context.Context, workers int) error {
 	if err := h.db.ExpireImageJobLeases(ctx, time.Now()); err != nil {
 		return err
 	}
-	memoryWorkers := 0
+	memoryWorkers := 1
 	if raw := strings.TrimSpace(os.Getenv("IMAGE_JOB_MEMORY_WORKERS")); raw != "" {
 		var err error
 		memoryWorkers, err = strconv.Atoi(raw)
