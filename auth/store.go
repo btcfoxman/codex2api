@@ -415,13 +415,14 @@ type Account struct {
 	ActiveRequests atomic.Int64 // 当前正在执行的请求数
 	// OccupiedRequests 包含当前请求和成功结束后为原会话保留的缓冲槽。
 	// 调度准入读取它；管理端仍分别展示真实在途与含缓冲占用。
-	OccupiedRequests atomic.Int64
-	TotalRequests    atomic.Int64 // 累计总请求数
-	LastUsedAt       atomic.Int64 // 最后使用时间（UnixNano）
-	Disabled         int32        // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
-	AddedAt          atomic.Int64 // 加入号池的时间（UnixNano），用于过期清理
-	Locked           int32        // 原子标志，1 = 锁定，自动清理跳过此账号
-	DispatchPaused   int32        // 原子标志，1 = 禁用调度选择，不影响刷新/探针/清理
+	OccupiedRequests   atomic.Int64
+	TotalRequests      atomic.Int64 // 累计总请求数
+	LastUsedAt         atomic.Int64 // 最后使用时间（UnixNano）
+	Disabled           int32        // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
+	AddedAt            atomic.Int64 // 加入号池的时间（UnixNano），用于过期清理
+	Locked             int32        // 原子标志，1 = 锁定，自动清理跳过此账号
+	IntelligencePaused int32        // 独立的持久化降智检测暂停；不修改人工 enabled
+	DispatchPaused     int32        // 原子标志，1 = 禁用调度选择，不影响刷新/探针/清理
 
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
@@ -1195,7 +1196,7 @@ func (a *Account) premium5hUsageUrgencyBonusLocked(now time.Time) float64 {
 	if a.AccessToken == "" || a.Status == StatusError || a.HealthTier == HealthTierBanned {
 		return 0
 	}
-	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0 {
 		return 0
 	}
 	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
@@ -1240,7 +1241,7 @@ func (a *Account) premium7dUsageUrgencyBonusLocked(now time.Time) float64 {
 	if a.AccessToken == "" || a.Status == StatusError || a.HealthTier == HealthTierBanned {
 		return 0
 	}
-	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0 {
 		return 0
 	}
 	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
@@ -1437,7 +1438,7 @@ func (a *Account) IsAvailable() bool {
 	if atomic.LoadInt32(&a.Disabled) != 0 {
 		return false
 	}
-	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0 {
 		return false
 	}
 
@@ -1957,7 +1958,7 @@ func (a *Account) usageLimitContinuationEligibleLocked(now time.Time) bool {
 	if !a.ignoreUsageLimitStatus {
 		return false
 	}
-	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) {
 		return false
 	}
 	if a.Status == StatusError || a.healthTierLocked() == HealthTierBanned ||
@@ -1994,7 +1995,7 @@ func (a *Account) UsageLimitContinuationEligible() bool {
 // account is blocked specifically by a usage-limit observation. It lets API
 // handlers return 429 instead of misreporting an exhausted pool as 503.
 func (a *Account) FreshDispatchUsageLimited() bool {
-	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) {
 		return false
 	}
 	a.mu.RLock()
@@ -2153,7 +2154,7 @@ func (a *Account) ModelCatalogEligible() bool {
 		return false
 	}
 	if a.IsAntigravityAPI() {
-		if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		if atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0 {
 			return false
 		}
 		a.mu.RLock()
@@ -2164,7 +2165,7 @@ func (a *Account) ModelCatalogEligible() bool {
 		}
 		return a.hasDispatchCredentialLocked()
 	}
-	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0 {
 		return false
 	}
 	a.mu.RLock()
@@ -2431,7 +2432,7 @@ func (a *Account) ShouldActivate5hWindow(now time.Time) bool {
 	if a == nil {
 		return false
 	}
-	if atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) {
 		return false
 	}
 	if now.IsZero() {
@@ -3611,20 +3612,21 @@ type Store struct {
 	codexForceWebsocket atomic.Bool // 强制 Codex 上游走 WebSocket（复用连接池）
 	// codexRequestCompression HTTP /responses 请求体 zstd 压缩，默认开启（对齐真实客户端）。
 	// 与上面几项 WS 设置正交：WS 走 permessage-deflate，本项只作用于 HTTP 路径。
-	codexRequestCompression     atomic.Bool
-	codexWSKeepaliveEnabled     atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
-	codexWSKeepaliveIntervalSec atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
-	codexWSHideUpstreamErrors   atomic.Bool  // 隐藏上游 WS 原始错误，默认开启
-	codexWSSilentRetryEnabled   atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
-	codexWSSilentMaxRetries     atomic.Int64 // WS 静默换号最大重试次数，默认 2
-	codexWSSizeRouterEnabled    atomic.Bool  // 1009 自学习体积路由，默认开启
-	codexWSBusyMaxWaitSec       atomic.Int64 // busy session 等待上限（秒），默认 30（issue #413）
-	codexWSBusyOverflowEnabled  atomic.Bool  // busy session 溢出到同账号兄弟连接，默认关闭
-	codexWSBusyPatienceSec      atomic.Int64 // 触发溢出前的短等待（秒），默认 2
-	codexWSStatelessSlots       atomic.Int64 // 无状态请求每 (账号, cacheKey) 的连接槽位数，默认 8（issue #522）
-	overflowAutoCompactEnabled  atomic.Bool  // 上下文超窗自动摘要重试（实验性，默认关闭，issue #415）
-	compactViaResponsesEnabled  atomic.Bool  // /v1/responses/compact 改写为 /responses body-signal 压缩，默认关闭
-	firstTokenExcludesWsAcquire atomic.Bool  // 落库 first_token_ms 扣除 WS 取连耗时，默认关闭
+	codexRequestCompression         atomic.Bool
+	codexWSKeepaliveEnabled         atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
+	codexWSKeepaliveIntervalSec     atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
+	codexWSHideUpstreamErrors       atomic.Bool  // 隐藏上游 WS 原始错误，默认开启
+	codexWSSilentRetryEnabled       atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
+	codexWSSilentMaxRetries         atomic.Int64 // WS 静默换号最大重试次数，默认 2
+	codexWSSizeRouterEnabled        atomic.Bool  // 1009 自学习体积路由，默认开启
+	codexWSBusyMaxWaitSec           atomic.Int64 // busy session 等待上限（秒），默认 30（issue #413）
+	codexWSBusyOverflowEnabled      atomic.Bool  // busy session 溢出到同账号兄弟连接，默认关闭
+	codexWSBusyPatienceSec          atomic.Int64 // 触发溢出前的短等待（秒），默认 2
+	codexWSStatelessSlots           atomic.Int64 // 每账号空白上游 WS 槽位预算，默认 8
+	codexWSDownstreamKeepaliveSlots atomic.Int64
+	overflowAutoCompactEnabled      atomic.Bool // 上下文超窗自动摘要重试（实验性，默认关闭，issue #415）
+	compactViaResponsesEnabled      atomic.Bool // /v1/responses/compact 改写为 /responses body-signal 压缩，默认关闭
+	firstTokenExcludesWsAcquire     atomic.Bool // 落库 first_token_ms 扣除 WS 取连耗时，默认关闭
 
 	// 前置元数据 SSE 事件立即透传下游（旧版兼容，默认关闭，issue #425）
 	codexPreflightSSEPassthroughEnabled atomic.Bool
@@ -4212,6 +4214,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSBusyAcquireMaxWaitSec:       30,
 			CodexWSBusyPatienceSec:             2,
 			CodexWSStatelessSlots:              8,
+			CodexWSDownstreamKeepaliveSlots:    database.DefaultCodexWSDownstreamKeepaliveSlots,
 			CodexContinueMaxRounds:             8,
 			AutoPause5hGuardBandPercent:        defaultAutoPause5hGuardBandPercent,
 			AutoPause5hGuardConcurrency:        defaultAutoPause5hGuardConcurrency,
@@ -4332,6 +4335,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSBusyOverflowEnabled.Store(settings.CodexWSBusyOverflowEnabled)
 	s.codexWSBusyPatienceSec.Store(int64(database.NormalizeCodexWSBusyPatienceSec(settings.CodexWSBusyPatienceSec)))
 	s.codexWSStatelessSlots.Store(int64(database.NormalizeCodexWSStatelessSlots(settings.CodexWSStatelessSlots)))
+	s.SetCodexWSDownstreamKeepaliveSlots(settings.CodexWSDownstreamKeepaliveSlots)
 	s.overflowAutoCompactEnabled.Store(settings.OverflowAutoCompactEnabled)
 	s.compactViaResponsesEnabled.Store(settings.CompactViaResponsesEnabled)
 	s.codexPreflightSSEPassthroughEnabled.Store(settings.CodexPreflightSSEPassthroughEnabled)
@@ -4358,6 +4362,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		OAuthMode:           settings.OAuthModelCooldownMode,
 		OAuthSeconds:        settings.OAuthModelCooldownSeconds,
 		OAuthBackoffEnabled: settings.OAuthModelCooldownBackoffEnabled,
+
+		OAuthUnsupportedDisabled: settings.OAuthUnsupportedModelCooldownDisabled,
+		OAuthUnsupportedSeconds:  settings.OAuthUnsupportedModelCooldownSeconds,
 	})
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
@@ -4780,7 +4787,7 @@ func (s *Store) GithubProxyURL() string {
 	return ""
 }
 
-// SetCodexWSStatelessSlots 设置无状态请求每 (账号, cacheKey) 的连接槽位数。
+// SetCodexWSStatelessSlots 设置每个账号的空白上游 WS 连接槽位预算。
 func (s *Store) SetCodexWSStatelessSlots(slots int) {
 	if s == nil {
 		return
@@ -4788,7 +4795,7 @@ func (s *Store) SetCodexWSStatelessSlots(slots int) {
 	s.codexWSStatelessSlots.Store(int64(database.NormalizeCodexWSStatelessSlots(slots)))
 }
 
-// CodexWSStatelessSlots 返回无状态请求每 (账号, cacheKey) 的连接槽位数。
+// CodexWSStatelessSlots 返回每个账号的空白上游 WS 连接槽位预算。
 func (s *Store) CodexWSStatelessSlots() int {
 	if s == nil {
 		return 8
@@ -5452,6 +5459,11 @@ func (s *Store) Init(ctx context.Context) error {
 
 // loadFromDB 从数据库加载账号
 func (s *Store) loadFromDB(ctx context.Context) error {
+	var pauseErr error
+	ctx, pauseErr = s.withIntelligencePauses(ctx)
+	if pauseErr != nil {
+		return pauseErr
+	}
 	rows, err := s.db.ListActive(ctx)
 	if err != nil {
 		return fmt.Errorf("从数据库加载账号失败: %w", err)
@@ -5704,6 +5716,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	if !row.Enabled {
 		atomic.StoreInt32(&account.DispatchPaused, 1)
+	}
+	if s.intelligencePaused(ctx, row.ID) {
+		atomic.StoreInt32(&account.IntelligencePaused, 1)
 	}
 	account.CreditEnabled = row.CreditEnabled
 	account.CreditSkipUsageWindow = row.CreditSkipUsageWindow
@@ -5994,6 +6009,11 @@ func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
 	}
 	s.dispatchReconciledAt.Store(now.UnixNano())
 
+	var pauseErr error
+	ctx, pauseErr = s.withIntelligencePauses(ctx)
+	if pauseErr != nil {
+		return false, pauseErr
+	}
 	rows, err := s.db.ListActive(ctx)
 	if err != nil {
 		return false, fmt.Errorf("reconcile dispatch accounts: %w", err)
@@ -6060,6 +6080,14 @@ func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
 			paused := int32(0)
 			if !row.Enabled {
 				paused = 1
+			}
+			qualityPaused := int32(0)
+			if s.intelligencePaused(ctx, row.ID) {
+				qualityPaused = 1
+			}
+			if atomic.SwapInt32(&acc.IntelligencePaused, qualityPaused) != qualityPaused {
+				s.fastSchedulerUpdate(acc)
+				changed = true
 			}
 			if atomic.SwapInt32(&acc.DispatchPaused, paused) != paused {
 				changed = true
@@ -6521,7 +6549,7 @@ func accountOccupiedRequests(acc *Account) int64 {
 }
 
 func accountDispatchBlocked(acc *Account) bool {
-	return acc == nil || atomic.LoadInt32(&acc.Disabled) != 0 || atomic.LoadInt32(&acc.DispatchPaused) != 0
+	return acc == nil || atomic.LoadInt32(&acc.Disabled) != 0 || (atomic.LoadInt32(&acc.DispatchPaused) != 0 || atomic.LoadInt32(&acc.IntelligencePaused) != 0)
 }
 
 func reserveOccupiedAccountSlot(acc *Account, limit int64) bool {
@@ -6732,7 +6760,7 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 	if atomic.LoadInt32(&acc.Disabled) != 0 {
 		return false
 	}
-	if atomic.LoadInt32(&acc.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&acc.DispatchPaused) != 0 || atomic.LoadInt32(&acc.IntelligencePaused) != 0 {
 		return false
 	}
 
@@ -7415,7 +7443,7 @@ func (s *Store) affinityAccountStillHealthy(accountID int64) bool {
 	if target == nil {
 		return false
 	}
-	if atomic.LoadInt32(&target.Disabled) != 0 || atomic.LoadInt32(&target.DispatchPaused) != 0 {
+	if atomic.LoadInt32(&target.Disabled) != 0 || (atomic.LoadInt32(&target.DispatchPaused) != 0 || atomic.LoadInt32(&target.IntelligencePaused) != 0) {
 		return false
 	}
 	target.mu.RLock()
@@ -8664,7 +8692,7 @@ func (s *Store) EnabledGrokAccounts() []*Account {
 		if a == nil || !a.IsGrokAPI() {
 			continue
 		}
-		if atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		if atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0 {
 			continue
 		}
 		out = append(out, a)
@@ -9907,6 +9935,7 @@ func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
 	if acc == nil {
 		return false
 	}
+	atomic.StoreInt32(&acc.IntelligencePaused, 0) // DB manual write revoked detection ownership.
 	if enabled {
 		atomic.StoreInt32(&acc.DispatchPaused, 0)
 	} else {
@@ -10279,6 +10308,105 @@ func (s *Store) ClearAllModelCooldowns(acc *Account) int {
 		}
 	}
 	return len(models)
+}
+
+// ModelCooldownReasonUnsupported marks the plan-gated Codex 400 "model is not
+// supported when using Codex with a ChatGPT account".
+const ModelCooldownReasonUnsupported = "model_not_supported"
+
+// UnsupportedModelCooldown returns the configured cooldown for the plan-gated
+// unsupported-model 400; zero when disabled.
+func (s *Store) UnsupportedModelCooldown() time.Duration {
+	settings := s.GetModelCooldownSettings()
+	return time.Duration(settings.UnsupportedCooldownSeconds()) * time.Second
+}
+
+// MarkModelUnsupported cools (account, model) down without touching account
+// health: a plan that cannot serve one model says nothing about the others.
+func (s *Store) MarkModelUnsupported(acc *Account, model string, duration time.Duration) ModelCooldown {
+	if s == nil || acc == nil || duration <= 0 {
+		return ModelCooldown{}
+	}
+	if duration > 30*time.Minute {
+		duration = 30 * time.Minute
+	}
+	resetAt := time.Now().Add(duration)
+	if remaining := acc.ModelCooldownRemaining(model); remaining > duration {
+		resetAt = time.Now().Add(remaining)
+	}
+	cooldown := acc.SetModelCooldownUntil(model, ModelCooldownReasonUnsupported, resetAt)
+	if cooldown.Model == "" {
+		return cooldown
+	}
+	s.fastSchedulerUpdate(acc)
+	s.setCachedModelCooldown(acc.DBID, cooldown)
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.db.SetModelCooldown(ctx, acc.DBID, cooldown.Model, cooldown.Reason, cooldown.ResetAt); err != nil {
+			log.Printf("[账号 %d] 持久化模型冷却失败 model=%s: %v", acc.DBID, cooldown.Model, err)
+		}
+	}
+	return cooldown
+}
+
+// ClearModelCooldownsByReason clears active model cooldowns with the given
+// reason whose remaining time exceeds keepWithin (0 clears all of them).
+func (s *Store) ClearModelCooldownsByReason(reason string, keepWithin time.Duration) int {
+	if s == nil {
+		return 0
+	}
+	cleared := 0
+	now := time.Now()
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil {
+			continue
+		}
+		for _, cooldown := range acc.ActiveModelCooldowns() {
+			if cooldown.Reason != reason || (keepWithin > 0 && cooldown.ResetAt.Sub(now) <= keepWithin) {
+				continue
+			}
+			s.ClearModelCooldown(acc, cooldown.Model)
+			cleared++
+		}
+	}
+	return cleared
+}
+
+// UnsupportedModelPoolSummary reports whether dispatchable accounts are being
+// skipped for model because each recently answered the unsupported-model 400,
+// so callers can surface that instead of a bare "no available account".
+type UnsupportedModelPoolSummary struct {
+	Found   bool
+	ResetAt time.Time // earliest recovery among those accounts
+}
+
+func (s *Store) UnsupportedModelCandidateSummary(apiKeyID int64, exclude map[int64]bool, model string, policy DispatchPolicy) UnsupportedModelPoolSummary {
+	var summary UnsupportedModelPoolSummary
+	key := normalizeModelCooldownKey(model)
+	if s == nil || key == "" {
+		return summary
+	}
+	now := time.Now()
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil || (exclude != nil && exclude[acc.DBID]) || acc.IsRelayStyle() {
+			continue
+		}
+		if !acc.dispatchableForPolicy(policy) || !s.accountAllowedForAPIKey(acc, apiKeyID) {
+			continue
+		}
+		acc.mu.RLock()
+		cooldown, ok := acc.ModelCooldowns[key]
+		acc.mu.RUnlock()
+		if !ok || cooldown.Reason != ModelCooldownReasonUnsupported || !cooldown.ResetAt.After(now) {
+			continue
+		}
+		summary.Found = true
+		if summary.ResetAt.IsZero() || cooldown.ResetAt.Before(summary.ResetAt) {
+			summary.ResetAt = cooldown.ResetAt
+		}
+	}
+	return summary
 }
 
 type ModelCooldownPolicy struct {
@@ -11693,7 +11821,7 @@ func (s *Store) HealthCountsNonBlocking() (available int, total int, complete bo
 		if acc == nil {
 			continue
 		}
-		if atomic.LoadInt32(&acc.Disabled) != 0 || atomic.LoadInt32(&acc.DispatchPaused) != 0 {
+		if atomic.LoadInt32(&acc.Disabled) != 0 || (atomic.LoadInt32(&acc.DispatchPaused) != 0 || atomic.LoadInt32(&acc.IntelligencePaused) != 0) {
 			continue
 		}
 		if !acc.mu.TryRLock() {

@@ -1110,7 +1110,7 @@ export interface AntigravityModelQuota {
   model?: string
   model_id?: string
   name?: string
-  remaining_fraction: number
+  remaining_fraction?: number
   remaining_percent?: number
   reset_time?: string
   display_name?: string
@@ -1140,6 +1140,7 @@ export interface AntigravityQuotaGroup {
 
 export interface AntigravityQuotaSnapshot {
   models: Record<string, AntigravityModelQuota> | AntigravityModelQuota[]
+  catalog_model_ids?: string[]
   quota_groups?: AntigravityQuotaGroup[]
   groups?: AntigravityQuotaGroup[]
   subscription_tier?: string
@@ -1244,6 +1245,8 @@ export interface UpdateAntigravityAccountRequest {
 
 export interface AntigravityImportRequest {
   files: string[]
+  /** 每项一个 Google refresh token;与 files 一起交给后端解析器。 */
+  refresh_tokens?: string[]
   proxy_url?: string
   /** 把文件内携带的代理注册进代理池（该渠道一直会采用文件内代理，开关只控制是否入表）。 */
   import_proxy?: boolean
@@ -2172,6 +2175,7 @@ export interface SystemSettings {
   codex_ws_busy_overflow_enabled: boolean
   codex_ws_busy_patience_sec: number
   codex_ws_stateless_slots: number
+  codex_ws_downstream_keepalive_slots: number
   // GitHub 访问（issue #522）：token 只写不读，响应仅回 configured
   github_token?: string
   github_token_configured?: boolean
@@ -2251,6 +2255,7 @@ export interface SystemSettings {
   oauth_model_cooldown_mode: ModelCooldownMode
   oauth_model_cooldown_seconds: number
   oauth_model_cooldown_backoff_enabled: boolean
+  oauth_unsupported_model_cooldown_seconds: number
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string
