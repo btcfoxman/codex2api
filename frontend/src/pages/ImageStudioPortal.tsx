@@ -1014,10 +1014,9 @@ export default function ImageStudioPortal() {
                         }
                       }}
                       rows={5}
-                      maxLength={8000}
                       placeholder={t('imageStudioPortal.design.promptPlaceholder')}
                     />
-                    <div className="portal-prompt-footer"><span>{t('imageStudioPortal.design.promptHint')}</span><span>{prompt.length} / 8000</span></div>
+                    <div className="portal-prompt-footer"><span>{t('imageStudioPortal.design.promptHint')}</span><span>{prompt.length}</span></div>
                     </div>
                   </div>
 

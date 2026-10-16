@@ -305,8 +305,8 @@ export function buildExtraEndpoints(
           "string",
           true,
           c(
-            "图片描述，最多 8000 字符。",
-            "Image prompt, up to 8000 characters.",
+            "图片描述。",
+            "Image prompt.",
           ),
         ),
         param(

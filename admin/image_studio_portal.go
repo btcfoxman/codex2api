@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/codex2api/database"
@@ -183,7 +184,7 @@ func normalizePortalImageJobPayload(req *imageGenerationJobPayload, editMode boo
 	if req == nil {
 		return errors.New("请求体无效")
 	}
-	req.Prompt = truncateImageJobPrompt(req.Prompt)
+	req.Prompt = strings.TrimSpace(req.Prompt)
 	if req.Prompt == "" {
 		return errors.New("提示词不能为空")
 	}

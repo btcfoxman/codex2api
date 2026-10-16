@@ -88,7 +88,6 @@ const (
 
 	imageOAuthUnavailableCooldown = 30 * time.Minute
 	imageModelTextMaxBytes        = 600
-	maxImagePromptRunes           = 8000
 )
 
 // imagesMainModelFallbacks 是驱动主模型被上游按"不支持"拒绝时的候选序列,
@@ -400,20 +399,9 @@ func AppendImageStyleToPrompt(prompt string, style string) string {
 	prompt = strings.TrimSpace(prompt)
 	style = strings.TrimSpace(style)
 	if style == "" {
-		return truncateImagePrompt(prompt)
+		return prompt
 	}
-	return truncateImagePrompt(prompt + "\n\nStyle guidance: " + style)
-}
-
-func truncateImagePrompt(prompt string) string {
-	count := 0
-	for byteIndex := range prompt {
-		if count == maxImagePromptRunes {
-			return prompt[:byteIndex]
-		}
-		count++
-	}
-	return prompt
+	return prompt + "\n\nStyle guidance: " + style
 }
 
 func imageUsageLogInfoFromResponseJSON(responseJSON []byte) imageUsageLogInfo {

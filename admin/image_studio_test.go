@@ -71,6 +71,36 @@ func TestBuildAdminImageGenerationRequestOmitsAutoSize(t *testing.T) {
 	}
 }
 
+func TestImageJobPromptPassesThroughWithoutCharacterLimit(t *testing.T) {
+	prompt := strings.Repeat("图", 8001) + " end"
+	for name, normalize := range map[string]func(*imageGenerationJobPayload) error{
+		"external": func(req *imageGenerationJobPayload) error {
+			_, err := normalizeExternalImageJobFields(req)
+			return err
+		},
+		"portal": func(req *imageGenerationJobPayload) error {
+			return normalizePortalImageJobPayload(req, false)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := imageGenerationJobPayload{Prompt: prompt, Model: "gpt-image-2"}
+			if err := normalize(&req); err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			if req.Prompt != prompt {
+				t.Fatalf("prompt changed: got %d bytes, want %d", len(req.Prompt), len(prompt))
+			}
+		})
+	}
+	body, err := buildAdminImageGenerationRequest(imageGenerationJobPayload{Prompt: prompt, Model: "gpt-image-2"})
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if got := gjson.GetBytes(body, "prompt").String(); got != prompt {
+		t.Fatalf("upstream prompt changed: got %d bytes, want %d", len(got), len(prompt))
+	}
+}
+
 func TestBuildAdminImageRequestsUseCompatibleUpstreamSizeForStrictCanvas(t *testing.T) {
 	req := imageGenerationJobPayload{
 		Prompt:       "draw a landscape",
@@ -158,30 +188,6 @@ func TestNormalizePortalImageJobPayloadLocalizesBatchValidation(t *testing.T) {
 	invalidCount := imageGenerationJobPayload{Prompt: "test", Model: "gpt-image-2", N: maxImageJobOutputCount + 1}
 	if err := normalizePortalImageJobPayload(&invalidCount, false); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("1 到 %d", maxImageJobOutputCount)) {
 		t.Fatalf("invalid count error = %v", err)
-	}
-}
-
-func TestImageJobPromptTruncatesUnicodeInsteadOfRejecting(t *testing.T) {
-	longPrompt := strings.Repeat("图", maxImageJobPromptRunes-1) + "😊后续"
-	want := strings.Repeat("图", maxImageJobPromptRunes-1) + "😊"
-	if got := truncateImageJobPrompt(longPrompt); got != want {
-		t.Fatalf("truncated prompt length=%d, want %d", len([]rune(got)), maxImageJobPromptRunes)
-	}
-
-	external := imageGenerationJobPayload{Prompt: longPrompt, Model: "gpt-image-2"}
-	if _, err := normalizeExternalImageJobFields(&external); err != nil {
-		t.Fatalf("external image job rejected long prompt: %v", err)
-	}
-	if external.Prompt != want {
-		t.Fatalf("external prompt length=%d, want %d", len([]rune(external.Prompt)), maxImageJobPromptRunes)
-	}
-
-	portal := imageGenerationJobPayload{Prompt: longPrompt, Model: "gpt-image-2"}
-	if err := normalizePortalImageJobPayload(&portal, false); err != nil {
-		t.Fatalf("portal image job rejected long prompt: %v", err)
-	}
-	if portal.Prompt != want {
-		t.Fatalf("portal prompt length=%d, want %d", len([]rune(portal.Prompt)), maxImageJobPromptRunes)
 	}
 }
 

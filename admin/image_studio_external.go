@@ -211,7 +211,7 @@ func normalizeExternalImageJobFields(req *imageGenerationJobPayload) (bool, erro
 	if err := normalizeImageStoragePolicy(req); err != nil {
 		return false, err
 	}
-	req.Prompt = truncateImageJobPrompt(req.Prompt)
+	req.Prompt = strings.TrimSpace(req.Prompt)
 	if req.Prompt == "" {
 		return false, fmt.Errorf("prompt is required")
 	}
