@@ -28,6 +28,20 @@ import (
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 
+func TestAppendImageStyleToPromptTruncatesUnicode(t *testing.T) {
+	prompt := strings.Repeat("图", maxImagePromptRunes-1) + "😊尾部"
+	want := strings.Repeat("图", maxImagePromptRunes-1) + "😊"
+	if got := AppendImageStyleToPrompt(prompt, ""); got != want {
+		t.Fatalf("prompt length=%d, want %d", utf8.RuneCountInString(got), maxImagePromptRunes)
+	}
+	if got := AppendImageStyleToPrompt(prompt, "cinematic"); got != want {
+		t.Fatalf("styled prompt length=%d, want %d", utf8.RuneCountInString(got), maxImagePromptRunes)
+	}
+	if got := AppendImageStyleToPrompt("draw a circle", "cinematic"); !strings.Contains(got, "Style guidance: cinematic") {
+		t.Fatalf("short prompt lost style guidance: %q", got)
+	}
+}
+
 func TestBuildImagesAPIResponseCloudURL(t *testing.T) {
 	// 用本地 httptest 充当 S3 端点：PUT 返回 200 让上传成功；
 	// presign 是离线签名，生成的 GET 直链会指向该测试服务器。
