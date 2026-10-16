@@ -36,6 +36,15 @@ const defaultImageAssetDir = "/data/images"
 const maxInlineImageAssetCacheBytes = 64 * 1024 * 1024
 const defaultSignedImageThumbKB = 32
 const maxImageJobOutputCount = 4
+const maxImageJobPromptRunes = 8000
+
+func truncateImageJobPrompt(prompt string) string {
+	runes := []rune(strings.TrimSpace(prompt))
+	if len(runes) > maxImageJobPromptRunes {
+		runes = runes[:maxImageJobPromptRunes]
+	}
+	return strings.TrimSpace(string(runes))
+}
 
 var errInvalidUpscaledImage = errors.New("invalid upscaled image")
 
@@ -256,9 +265,7 @@ func templateInputFromPayload(req imagePromptTemplatePayload, existing *database
 	if strings.TrimSpace(input.Prompt) == "" {
 		return input, fmt.Errorf("提示词不能为空")
 	}
-	if len([]rune(input.Prompt)) > 8000 {
-		return input, fmt.Errorf("提示词不能超过 8000 个字符")
-	}
+	input.Prompt = truncateImageJobPrompt(input.Prompt)
 	if input.Model == "" {
 		input.Model = "gpt-image-2"
 	}
@@ -283,13 +290,9 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	req.Prompt = strings.TrimSpace(req.Prompt)
+	req.Prompt = truncateImageJobPrompt(req.Prompt)
 	if req.Prompt == "" {
 		writeError(c, http.StatusBadRequest, "提示词不能为空")
-		return
-	}
-	if len([]rune(req.Prompt)) > 8000 {
-		writeError(c, http.StatusBadRequest, "提示词不能超过 8000 个字符")
 		return
 	}
 	req.Model = normalizeImageStudioModel(req.Model)
@@ -384,7 +387,7 @@ func (h *Handler) CreateImageEditJob(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	req.Prompt = strings.TrimSpace(req.Prompt)
+	req.Prompt = truncateImageJobPrompt(req.Prompt)
 	if req.Prompt == "" {
 		writeError(c, http.StatusBadRequest, "提示词不能为空")
 		return
@@ -395,10 +398,6 @@ func (h *Handler) CreateImageEditJob(c *gin.Context) {
 	}
 	if len(req.InputImages) > proxy.MaxImageEditInputCount {
 		writeError(c, http.StatusBadRequest, fmt.Sprintf("参考图片数量超过限制 (%d, 最多 %d)", len(req.InputImages), proxy.MaxImageEditInputCount))
-		return
-	}
-	if len([]rune(req.Prompt)) > 8000 {
-		writeError(c, http.StatusBadRequest, "提示词不能超过 8000 个字符")
 		return
 	}
 	req.Model = normalizeImageStudioModel(req.Model)

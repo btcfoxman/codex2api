@@ -161,6 +161,30 @@ func TestNormalizePortalImageJobPayloadLocalizesBatchValidation(t *testing.T) {
 	}
 }
 
+func TestImageJobPromptTruncatesUnicodeInsteadOfRejecting(t *testing.T) {
+	longPrompt := strings.Repeat("图", maxImageJobPromptRunes-1) + "😊后续"
+	want := strings.Repeat("图", maxImageJobPromptRunes-1) + "😊"
+	if got := truncateImageJobPrompt(longPrompt); got != want {
+		t.Fatalf("truncated prompt length=%d, want %d", len([]rune(got)), maxImageJobPromptRunes)
+	}
+
+	external := imageGenerationJobPayload{Prompt: longPrompt, Model: "gpt-image-2"}
+	if _, err := normalizeExternalImageJobFields(&external); err != nil {
+		t.Fatalf("external image job rejected long prompt: %v", err)
+	}
+	if external.Prompt != want {
+		t.Fatalf("external prompt length=%d, want %d", len([]rune(external.Prompt)), maxImageJobPromptRunes)
+	}
+
+	portal := imageGenerationJobPayload{Prompt: longPrompt, Model: "gpt-image-2"}
+	if err := normalizePortalImageJobPayload(&portal, false); err != nil {
+		t.Fatalf("portal image job rejected long prompt: %v", err)
+	}
+	if portal.Prompt != want {
+		t.Fatalf("portal prompt length=%d, want %d", len([]rune(portal.Prompt)), maxImageJobPromptRunes)
+	}
+}
+
 func TestImageJobJPEGFallbackDecision(t *testing.T) {
 	req := imageGenerationJobPayload{OutputFormat: "png"}
 	if !shouldFallbackImageJobToJPEG(req, http.StatusBadGateway, fmt.Errorf("upstream image generation failed (server_error): An error occurred while processing your request")) {

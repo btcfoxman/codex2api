@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/codex2api/database"
@@ -184,12 +183,9 @@ func normalizePortalImageJobPayload(req *imageGenerationJobPayload, editMode boo
 	if req == nil {
 		return errors.New("请求体无效")
 	}
-	req.Prompt = strings.TrimSpace(req.Prompt)
+	req.Prompt = truncateImageJobPrompt(req.Prompt)
 	if req.Prompt == "" {
 		return errors.New("提示词不能为空")
-	}
-	if len([]rune(req.Prompt)) > 8000 {
-		return errors.New("提示词不能超过 8000 个字符")
 	}
 	req.Model = normalizeImageStudioModel(req.Model)
 	if req.Model == "" {

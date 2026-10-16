@@ -211,12 +211,9 @@ func normalizeExternalImageJobFields(req *imageGenerationJobPayload) (bool, erro
 	if err := normalizeImageStoragePolicy(req); err != nil {
 		return false, err
 	}
-	req.Prompt = strings.TrimSpace(req.Prompt)
+	req.Prompt = truncateImageJobPrompt(req.Prompt)
 	if req.Prompt == "" {
 		return false, fmt.Errorf("prompt is required")
-	}
-	if len([]rune(req.Prompt)) > 8000 {
-		return false, fmt.Errorf("prompt must be at most 8000 characters")
 	}
 	req.Model = normalizeImageStudioModel(req.Model)
 	if req.Model == "" {
