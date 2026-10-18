@@ -30,9 +30,11 @@ const queueInputPrefix = "queue-input:"
 const queueInputBudget = 32 << 20
 const queueLeaseDuration = 2 * time.Minute
 const queueHeadScanLimit = 64
-const queueStaleScanLimit = 32
-const defaultMaxQueuedPerKey = 1000
-const defaultMaxQueueWait = 24 * time.Hour
+// Sweep a whole burst before claiming more work. A small scan limit lets an
+// overloaded queue keep accepting old jobs for hours after they have expired.
+const queueStaleScanLimit = 1024
+const defaultMaxQueuedPerKey = 8
+const defaultMaxQueueWait = 10 * time.Minute
 
 type imageJobQueue struct {
 	intake          chan struct{}

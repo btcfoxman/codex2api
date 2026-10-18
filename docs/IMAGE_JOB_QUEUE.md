@@ -6,8 +6,8 @@
 
 - 外部 `/v1/images/jobs`、后台工作台、公开工作台共用数据库队列。API Key 鉴权、提示词检查和配额检查仍然生效；并发槽改为执行时获取。
 - Worker 按 API Key 轮转取任务：每次扫描只看每个 Key 最早的一条排队任务，先占到该 Key 的并发槽再领取。某个 Key 的并发被自身请求（如长流式连接）占满时，它的任务留在队列里，Worker 转而执行其他 Key 的任务，不会原地等待。
-- 单个 API Key 最多同时有 `IMAGE_JOB_MAX_QUEUED_PER_KEY` 个排队任务（默认 1000，`0` 不限制），超出时创建接口返回 429 并带 `Retry-After`。
-- 排队超过 `IMAGE_JOB_MAX_QUEUE_WAIT` 仍未开始的任务标记为失败并清理落盘的参考图（默认 `24h`，`0` 关闭，最小 `1m`，Go duration 格式）。这类任务从未请求上游，可直接重试。
+- 单个 API Key 最多同时有 `IMAGE_JOB_MAX_QUEUED_PER_KEY` 个排队任务（默认 8，`0` 不限制），超出时创建接口返回 429 并带 `Retry-After`。调用方可在创建阶段切换其他渠道，避免接收无法及时执行的任务。
+- 排队超过 `IMAGE_JOB_MAX_QUEUE_WAIT` 仍未开始的任务标记为失败并清理落盘的参考图（默认 `10m`，`0` 关闭，最小 `1m`，Go duration 格式）。这类任务从未请求上游，可直接重试。运行中的任务不受排队超时影响。
 - 参考图 URL 在入队时只保存字符串，不访问远程服务器、不转 Base64。原有下载地址安全检查在 Worker 执行时保留。
 - data URL 上传先落入 `IMAGE_ASSET_DIR/queue-inputs`（默认 `/data/images/queue-inputs`），数据库只保存内部文件标识。正常执行结束清理临时文件。需要持久化该目录，不能把它放在重建后消失的容器层。
 - 外部创建接口返回小回执 `{"job":{"id":42,"status":"queued"}}`。旧详情查询保持原有字段，精简查询仍为 `/v1/images/jobs/:id/result`。已生成图片仍使用现有图库文件/对象存储和 `assets[].proxy_url`。
