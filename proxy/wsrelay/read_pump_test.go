@@ -28,7 +28,17 @@ func newReadPumpTestConnection(t *testing.T, serve func(*websocket.Conn)) (*Mana
 	return newReadPumpTestConnectionWithUpgrader(t, websocket.Upgrader{}, serve)
 }
 
+func newReadPumpTestConnectionWithAccount(t *testing.T, serve func(*websocket.Conn), account *auth.Account) (*Manager, *WsConnection) {
+	t.Helper()
+	return newReadPumpTestConnectionWithUpgraderAndAccount(t, websocket.Upgrader{}, serve, account)
+}
+
 func newReadPumpTestConnectionWithUpgrader(t *testing.T, upgrader websocket.Upgrader, serve func(*websocket.Conn)) (*Manager, *WsConnection) {
+	t.Helper()
+	return newReadPumpTestConnectionWithUpgraderAndAccount(t, upgrader, serve, nil)
+}
+
+func newReadPumpTestConnectionWithUpgraderAndAccount(t *testing.T, upgrader websocket.Upgrader, serve func(*websocket.Conn), account *auth.Account) (*Manager, *WsConnection) {
 	t.Helper()
 
 	ready := make(chan struct{})
@@ -56,6 +66,7 @@ func newReadPumpTestConnectionWithUpgrader(t *testing.T, upgrader websocket.Upgr
 	session := NewSession(1, manager)
 	session.SetConnected(true)
 	wc := NewWsConnection(conn, session, wsURL)
+	wc.account = account
 	wc.PoolKey = key
 	wc.onReadFailure = manager.DiscardConnection
 	wc.installControlHandlers()
@@ -344,9 +355,9 @@ func TestReadPumpProbeDoesNotWaitForDataWriteLock(t *testing.T) {
 
 func TestReadMessageLivenessUsesRecentInboundWithoutExtraProbe(t *testing.T) {
 	serverReady := make(chan struct{})
+	startHeartbeats := make(chan struct{})
 	clientProbe := make(chan string, 1)
 	stop := make(chan struct{})
-	t.Cleanup(func() { close(stop) })
 
 	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
 		defaultPingHandler := conn.PingHandler()
@@ -366,6 +377,11 @@ func TestReadMessageLivenessUsesRecentInboundWithoutExtraProbe(t *testing.T) {
 		}()
 		close(serverReady)
 
+		select {
+		case <-startHeartbeats:
+		case <-stop:
+			return
+		}
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		for i := 0; i < 8; i++ {
@@ -384,10 +400,15 @@ func TestReadMessageLivenessUsesRecentInboundWithoutExtraProbe(t *testing.T) {
 		}
 		<-stop
 	})
+	t.Cleanup(func() { close(stop) })
 
 	<-serverReady
 	commitReadPumpTestLease(t, wc, "recent-inbound")
-	messageType, payload, err := wc.readMessageWithLiveness(30*time.Millisecond, 25*time.Millisecond, 100*time.Millisecond, time.Minute)
+	close(startHeartbeats)
+	waitForReadPumpCondition(t, func() bool { return wc.lastInbound.Load() != 0 }, "initial inbound heartbeat was not consumed")
+	// Heartbeats must be observed before checking recency. Leave enough room
+	// for timer jitter on loaded Windows and race-test runners.
+	messageType, payload, err := wc.readMessageWithLiveness(30*time.Millisecond, 250*time.Millisecond, 100*time.Millisecond, time.Minute)
 	if err != nil {
 		t.Fatalf("read long-running response with inbound heartbeats: %v", err)
 	}
@@ -1362,6 +1383,51 @@ func TestReadPumpDropsIdleMetadataFrame(t *testing.T) {
 				t.Fatalf("BeginReadLease after idle metadata frame: %v", err)
 			}
 		})
+	}
+}
+
+func TestReadPumpNotifiesIdleMetadataObserver(t *testing.T) {
+	got := make(chan struct {
+		accountID int64
+		eventType string
+		payload   string
+	}, 1)
+	SetIdleMetadataObserver(func(account *auth.Account, eventType string, payload []byte) {
+		var accountID int64
+		if account != nil {
+			accountID = account.DBID
+		}
+		got <- struct {
+			accountID int64
+			eventType string
+			payload   string
+		}{accountID: accountID, eventType: eventType, payload: string(payload)}
+	})
+	t.Cleanup(func() { SetIdleMetadataObserver(nil) })
+
+	holdOpen := make(chan struct{})
+	t.Cleanup(func() { close(holdOpen) })
+	newReadPumpTestConnectionWithAccount(t, func(conn *websocket.Conn) {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":42}}}`)); err != nil {
+			t.Errorf("write idle metadata frame: %v", err)
+			return
+		}
+		<-holdOpen
+	}, &auth.Account{DBID: 42})
+
+	select {
+	case event := <-got:
+		if event.accountID != 42 {
+			t.Fatalf("observer account = %d, want 42", event.accountID)
+		}
+		if event.eventType != "codex.rate_limits" {
+			t.Fatalf("observer event type = %q", event.eventType)
+		}
+		if !strings.Contains(event.payload, `"used_percent":42`) {
+			t.Fatalf("observer payload = %q", event.payload)
+		}
+	case <-time.After(readPumpTestTimeout):
+		t.Fatal("idle metadata observer was not notified")
 	}
 }
 

@@ -52,10 +52,17 @@ func TestMainFirstStartPersistsWebSocketRetentionDefaults(t *testing.T) {
 		if stopped {
 			return
 		}
-		_ = command.Process.Signal(os.Interrupt)
+		shutdownSignal := os.Interrupt
+		if runtime.GOOS == "windows" {
+			// Windows cannot send os.Interrupt; this test checks persisted startup settings.
+			shutdownSignal = os.Kill
+		}
+		if err := command.Process.Signal(shutdownSignal); err != nil {
+			t.Errorf("stop isolated first-start subprocess: %v", err)
+		}
 		select {
 		case err := <-done:
-			if err != nil {
+			if err != nil && shutdownSignal != os.Kill {
 				t.Errorf("isolated first-start subprocess failed during shutdown: %v", err)
 			}
 		case <-time.After(5 * time.Second):

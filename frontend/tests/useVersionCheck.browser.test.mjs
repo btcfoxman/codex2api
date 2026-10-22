@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { normalize } from 'node:path'
 import { build } from 'vite'
 import { chromium } from 'playwright'
 
@@ -23,7 +24,7 @@ before(async () => {
       enforce: 'pre',
       resolveId(id, importer) {
         if (id === 'virtual:version-check-harness') return '\0version-check-harness'
-        if (id === '../api' && importer === hookPath) return '\0version-check-api'
+        if (id === '../api' && importer && normalize(importer) === normalize(hookPath)) return '\0version-check-api'
       },
       load(id) {
         if (id === '\0version-check-api') {

@@ -64,7 +64,9 @@ func TestIntelligenceTimeoutKeepsPartialAnswerAsError(t *testing.T) {
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	// Include HTTP setup in the budget while leaving time to receive the delta
+	// before the deadline, including on loaded Windows and race-test runners.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	result := h.executeIntelligenceCheck(ctx, a, "gpt-4o-mini", "high", "answer")
 	if result.Complete || result.Error == "" || result.Output != "21" {
