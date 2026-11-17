@@ -123,6 +123,8 @@ jobs:
       run: go test -count=1 -timeout 8m ./...
     - name: Test deployment preservation and rollback with synthetic data
       run: python3 -m unittest discover -s scripts -p 'test_deploy_release.py' -v
+      env:
+        CODEX_TEST_DOCKER_COMPOSE: '1'
     - name: Verify modules and backend build
       run: 'go mod verify
 

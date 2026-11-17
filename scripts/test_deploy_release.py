@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import types
 import unittest
@@ -205,6 +206,68 @@ class HelpersTest(unittest.TestCase):
 
 
 class StateTest(unittest.TestCase):
+    def staged_receipt_fixture(self, directory, state=None):
+        task = self.make_release(deploy_path=directory)
+        task.compose_file.write_text("services: {}\n")
+        (Path(directory) / ".env").write_text("SYNTHETIC=only\n")
+        task.compose_hash, task.env_hash = release.file_hash(task.compose_file), release.file_hash(Path(directory) / ".env")
+        task.info = {"Config": {"Env": []}, "Mounts": []}
+        task.compose = mock.Mock(side_effect=["", "replacement-id\n"])
+        target = {"Id": "sha256:target", "Config": {"Entrypoint": ["/usr/local/bin/codex2api"],
+                  "Cmd": ["--literal=$REFERENCE"]}}
+        actual = {"Id": "replacement-id", "Image": target["Id"], "Config": {"Env": []}, "Mounts": [],
+                  "State": state or {"Running": True, "Restarting": False, "Pid": 123}}
+        with mock.patch("deploy_release.docker_json", return_value=[actual]):
+            task.staged_start(task.args.image, target, "a" * 32)
+        return json.loads((Path(directory) / ".codex2api-release.json").read_text())
+
+    def test_staged_receipt_escapes_all_runtime_dollars_for_compose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.staged_receipt_fixture(directory)
+            wrapped = payload["services"]["codex2api"]["entrypoint"]
+            self.assertEqual(wrapped[2], release.WAIT_ENTRYPOINT.replace("$", "$$"))
+            self.assertEqual(wrapped[-1], "--literal=$$REFERENCE")
+            self.assertIn('"$$n"', wrapped[2])
+
+    @unittest.skipUnless(os.getenv("CODEX_TEST_DOCKER_COMPOSE") == "1", "real Compose rendering is enabled in CI")
+    def test_real_compose_render_preserves_runtime_entrypoint_without_host_interpolation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.staged_receipt_fixture(directory)
+            environment = os.environ.copy()
+            environment.update(n="HOST_VALUE_MUST_NOT_ENTER_SHIM", REFERENCE="HOST_VALUE_MUST_NOT_ENTER_ARGUMENT")
+            rendered = subprocess.run(["docker", "compose", "-p", "release-shim-test", "-f", "-",
+                                       "config", "--format", "json"], input=json.dumps(payload),
+                                      text=True, capture_output=True, env=environment, timeout=30)
+            self.assertEqual(rendered.returncode, 0, "Compose configuration rendering failed")
+            invocation = json.loads(rendered.stdout)["services"]["codex2api"]["entrypoint"]
+            self.assertEqual(invocation[2], release.WAIT_ENTRYPOINT)
+            self.assertEqual(invocation[-1], "--literal=$REFERENCE")
+
+    def test_restarting_or_missing_pid_replacement_is_rejected_before_namespace_access(self):
+        for state in ({"Running": True, "Restarting": True, "Pid": 123},
+                      {"Running": True, "Restarting": False, "Pid": 0}):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(release.ReleaseError, "replacement_service_not_stably_running"):
+                    self.staged_receipt_fixture(directory, state)
+
+    def test_unexpected_diagnostics_never_include_exception_text_or_locals(self):
+        task = mock.Mock()
+        task.args.inspect = False
+        task.summary = {"operation": "deploy"}
+        task.deploy.side_effect = FileNotFoundError("PRIVATE_ADMIN_SECRET_AND_SIGNED_URL")
+        output = io.StringIO()
+        with mock.patch("deploy_release.Release", return_value=task), \
+             mock.patch("deploy_release.parse_args", return_value=argparse.Namespace()), \
+             mock.patch("deploy_release.signal.signal"), contextlib.redirect_stdout(output):
+            self.assertEqual(release.main([]), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["exception_type"], "FileNotFoundError")
+        self.assertNotIn("PRIVATE_ADMIN_SECRET_AND_SIGNED_URL", output.getvalue())
+        for frame in result["exception_frames"]:
+            self.assertEqual(set(frame), {"file", "line", "function"})
+            self.assertNotIn("/", frame["file"])
+            self.assertNotIn("\\", frame["file"])
+
     def test_coordinated_idle_cannot_bypass_any_generation_or_queue_counter(self):
         for field in ("active_requests", "queued_image_jobs", "running_image_jobs"):
             with self.subTest(field=field):
@@ -402,7 +465,7 @@ class StateTest(unittest.TestCase):
             wrapped = ["/bin/sh", "-c", release.WAIT_ENTRYPOINT, "release-entrypoint",
                        "/tmp/codex-release-%s.ready" % ("a" * 32)] + defaults
             receipt.write_text(json.dumps({"services": {"codex2api": {
-                "entrypoint": wrapped, "command": []}}}))
+                "entrypoint": [item.replace("$", "$$") for item in wrapped], "command": []}}}))
             task.info = {"Config": {"Entrypoint": wrapped, "Cmd": [], "Labels": {
                 "com.docker.compose.project.config_files": "%s,%s" % (task.compose_file, receipt),
                 "com.docker.compose.project.working_dir": directory,
@@ -415,6 +478,27 @@ class StateTest(unittest.TestCase):
                 "entrypoint": wrapped, "command": []}}}))
             with self.assertRaisesRegex(release.ReleaseError, "unsupported_custom_entrypoint_command"):
                 task.validate_original_config(image)
+
+    def test_default_image_invocation_receipt_from_recovery_is_supported_but_not_custom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = self.make_release(deploy_path=directory)
+            task.compose_file.write_text("services: {}\n")
+            receipt = Path(directory) / ".codex2api-release.json"
+            defaults = ["/usr/local/bin/codex2api"]
+            for explicit in (False, True):
+                managed = {"image": task.args.image, "pull_policy": "never"}
+                if explicit:
+                    managed.update(entrypoint=defaults, command=[])
+                receipt.write_text(json.dumps({"services": {"codex2api": managed}}))
+                task.info = {"Config": {"Entrypoint": defaults, "Cmd": [], "Labels": {
+                    "com.docker.compose.project.config_files": "%s,%s" % (task.compose_file, receipt),
+                    "com.docker.compose.project.working_dir": directory,
+                    "com.docker.compose.service": "codex2api"}}}
+                task.validate_original_config({"Config": {"Entrypoint": defaults, "Cmd": []}})
+            managed["entrypoint"] = ["/custom-launcher"]
+            receipt.write_text(json.dumps({"services": {"codex2api": managed}}))
+            with self.assertRaisesRegex(release.ReleaseError, "unsupported_custom_entrypoint_command"):
+                task.validate_original_config({"Config": {"Entrypoint": defaults, "Cmd": []}})
 
     def test_failed_release_rolls_back_image_without_restoring_database(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 
 
@@ -556,8 +557,14 @@ class Release:
             raise ReleaseError("unsupported_image_entrypoint")
         marker = "/tmp/codex-release-%s.ready" % token
         override = self.path / ".codex2api-release.json"
+        # Compose interpolates every string value before creating the container.
+        # Escape all dollars, including image-default arguments, so shell-local
+        # variables such as $n survive into the actual runtime entrypoint.
+        runtime_entrypoint = ["/bin/sh", "-c", WAIT_ENTRYPOINT, "release-entrypoint", marker] + entry + command
+        if any(not isinstance(item, str) for item in runtime_entrypoint):
+            raise ReleaseError("unsupported_image_entrypoint")
         payload = {"services": {self.service: {"image": image, "pull_policy": "never",
-                   "entrypoint": ["/bin/sh", "-c", WAIT_ENTRYPOINT, "release-entrypoint", marker] + entry + command,
+                   "entrypoint": [item.replace("$", "$$") for item in runtime_entrypoint],
                    "command": []}}}
         override.write_text(json.dumps(payload))
         os.chmod(override, 0o600)
@@ -568,7 +575,11 @@ class Release:
             if len(ids) != 1:
                 raise ReleaseError("replacement_service_unavailable")
             info = docker_json(self.runner, "inspect", ids[0])[0]
-            if not info.get("State", {}).get("Running") or info.get("Image") != image_info["Id"]:
+            state = info.get("State", {})
+            if (not state.get("Running") or state.get("Restarting") or
+                type(state.get("Pid")) is not int or state["Pid"] <= 0):
+                raise ReleaseError("replacement_service_not_stably_running")
+            if info.get("Image") != image_info["Id"]:
                 raise ReleaseError("replacement_image_mismatch")
             if mount_signature(info) != mount_signature(self.info):
                 raise ReleaseError("persistent_mounts_changed")
@@ -604,14 +615,22 @@ class Release:
         else:
             try:
                 managed = json.loads(receipt.read_text())["services"][self.service]
-                wrapped = managed["entrypoint"]
-            except (OSError, ValueError, KeyError, TypeError):
+                raw_entry = managed.get("entrypoint", entry)
+                raw_command = managed.get("command", command)
+                if not isinstance(raw_entry, list) or not isinstance(raw_command, list):
+                    raise ValueError("invalid managed invocation")
+                wrapped = [item.replace("$$", "$") for item in raw_entry]
+                managed_command = [item.replace("$$", "$") for item in raw_command]
+                normal = ((actual.get("Entrypoint") or []) == entry and
+                          (actual.get("Cmd") or []) == command and wrapped == entry and
+                          managed_command == command)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 raise ReleaseError("managed_release_receipt_invalid") from None
-            if (not isinstance(wrapped, list) or len(wrapped) < 5 or
+            if not normal and (len(wrapped) < 5 or
                 wrapped[:4] != ["/bin/sh", "-c", WAIT_ENTRYPOINT, "release-entrypoint"] or
                 not re.fullmatch(r"/tmp/codex-release-[0-9a-f]{32}\.ready", wrapped[4]) or
                 wrapped[5:] != entry + command or actual.get("Entrypoint") != wrapped or
-                (actual.get("Cmd") or []) != [] or managed.get("command") != []):
+                (actual.get("Cmd") or []) != [] or managed_command != []):
                 raise ReleaseError("unsupported_custom_entrypoint_command")
         self.compose_hash = file_hash(self.compose_file)
 
@@ -883,8 +902,15 @@ def main(argv=None):
         report["ok"] = True
     except ReleaseError as exc:
         report["error"] = str(exc)
-    except Exception:
+    except Exception as exc:
         report["error"] = "unexpected_failure_details_suppressed"
+        report["exception_type"] = type(exc).__name__
+        # Never include exception text, source lines, frame locals, or full
+        # paths: these may contain registry tokens, .env values or signed URLs.
+        report["exception_frames"] = [
+            {"file": Path(frame.f_code.co_filename).name,
+             "line": line, "function": frame.f_code.co_name}
+            for frame, line in traceback.walk_tb(exc.__traceback__)][-5:]
     print(json.dumps(report, sort_keys=True, ensure_ascii=True))
     return 0 if report.get("ok") else 1
 

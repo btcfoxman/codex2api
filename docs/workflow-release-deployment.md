@@ -22,6 +22,10 @@
 
 防护使用持续持有的网络命名空间文件描述符，清理 watchdog 继承该描述符，避免原 PID 退出或复用后误操作其他命名空间。部署目录永久保留 `.codex2api-release.json` 发布回执，不修改应用 `.env`。之后手工操作应使用 `docker compose -f docker-compose.yml -f .codex2api-release.json up -d --no-build --no-deps codex2api`，实际文件名及服务名按原配置替换，确保继续使用已验证的 digest；单独使用原 compose 可能恢复其默认镜像标签。
 
+回执内启动参数使用 Compose 的 `$$` 转义；容器实际收到单个 `$`，避免 `$n` 等 shell 局部变量被部署环境提前替换。再次部署会先解码回执再核对实际启动参数，也接受由相同镜像原始默认启动入口生成的恢复回执，仍拒绝任意自定义入口。重启中或 PID 无效的替代容器不会进入命名空间操作。意外异常仅记录类型及栈的文件名、行号和函数名，不输出异常文本、完整路径、源码或局部变量。
+
 旧版本 Grok 异步视频任务的账号绑定只保存在运行时缓存。若目标使用 memory 缓存且存在 Grok 账号，现有接口无法证明这些异步任务已结束，脚本会报告风险并拒绝自动切换；不能用 HTTP 在途为零代替这项核对。
 
 脚本回归测试只使用合成 SQLite 和模拟命令，执行于 GitHub runner：`python -m unittest discover -s scripts -p 'test_deploy_release.py' -v`。
+
+CI 另设置 `CODEX_TEST_DOCKER_COMPOSE=1`，用真实 `docker compose config --format json` 验证回执插值后的启动参数；此检查不创建容器、不生成付费任务。本机无 Docker 时该项跳过，不安装 Docker 或构建依赖。
