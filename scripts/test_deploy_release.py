@@ -14,7 +14,89 @@ from unittest import mock
 import deploy_release as release
 
 
+def tcp_row(state, *, tx="00000000", rx="00000000", inode="0", ipv6=False):
+    local = "0" * 32 if ipv6 else "00000000"
+    remote = "00000000000000000000000001000000" if ipv6 else "0100007F"
+    return ("0: %s:1F90 %s:FFFF %s %s:%s 00:00000000 00000000 1000 0 %s" %
+            (local, remote, state, tx, rx, inode))
+
+
+def write_tcp_fixture(directory, rows, ipv6=False):
+    net = Path(directory) / "99" / "net"
+    net.mkdir(parents=True, exist_ok=True)
+    for name in ("tcp", "tcp6"):
+        selected = rows if name == ("tcp6" if ipv6 else "tcp") else []
+        (net / name).write_text("header\n" + "\n".join(selected))
+
+
 class HelpersTest(unittest.TestCase):
+    def test_coordinated_idle_explicitly_allows_only_empty_established_connections(self):
+        for ipv6 in (False, True):
+            with self.subTest(ipv6=ipv6), tempfile.TemporaryDirectory() as directory:
+                write_tcp_fixture(directory, [tcp_row("01", inode="12345", ipv6=ipv6)], ipv6)
+                self.assertEqual(release.socket_counts(99, 8080, Path(directory))[0], 1)
+                self.assertEqual(release.socket_counts(99, 8080, Path(directory), coordinated_idle=True)[0], 0)
+
+    def test_coordinated_idle_never_ignores_buffered_or_ambiguous_sockets(self):
+        rows = [tcp_row("01", tx="00000001"), tcp_row("01", rx="00000001"),
+                tcp_row("0A", rx="00000001"), tcp_row("05", inode="12345")]
+        rows += [tcp_row(state) for state in ("02", "03", "08", "0C", "FF")]
+        with tempfile.TemporaryDirectory() as directory:
+            write_tcp_fixture(directory, rows)
+            self.assertEqual(release.socket_counts(99, 8080, Path(directory), coordinated_idle=True)[0], len(rows))
+
+    def test_coordinated_idle_metadata_parse_failure_remains_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_tcp_fixture(directory, [tcp_row("01", inode="invalid")])
+            with self.assertRaisesRegex(release.ReleaseError, "service_socket_state_unavailable"):
+                release.socket_counts(99, 8080, Path(directory), coordinated_idle=True)
+
+    def test_drained_unowned_closing_sockets_are_ignored_in_both_families(self):
+        for ipv6 in (False, True):
+            with self.subTest(ipv6=ipv6), tempfile.TemporaryDirectory() as directory:
+                rows = [tcp_row(state, ipv6=ipv6) for state in ("04", "05", "09", "0B")]
+                write_tcp_fixture(directory, rows, ipv6)
+                self.assertEqual(release.socket_counts(99, 8080, Path(directory)), (0, False))
+                inventory = release.socket_inventory(99, 8080, Path(directory))
+                self.assertEqual(sum(inventory.values()), 4)
+                self.assertTrue(all(key.endswith("_inode_owned0") for key in inventory))
+
+    def test_owned_closing_sockets_still_block_even_with_empty_queues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_tcp_fixture(directory, [tcp_row(state, inode="12345") for state in ("04", "05", "09", "0B")])
+            self.assertEqual(release.socket_counts(99, 8080, Path(directory))[0], 4)
+            inventory = release.socket_inventory(99, 8080, Path(directory))
+            self.assertTrue(all(key.endswith("_inode_owned1") for key in inventory))
+            self.assertNotIn("12345", json.dumps(inventory))
+
+    def test_closing_sockets_with_unacknowledged_or_unread_bytes_still_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_tcp_fixture(directory, [tcp_row("05", tx="00000001"), tcp_row("05", rx="00000001")])
+            self.assertEqual(release.socket_counts(99, 8080, Path(directory))[0], 2)
+
+    def test_loopback_established_ws_or_http_connections_are_never_exempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_tcp_fixture(directory, [tcp_row("01", inode="0")])
+            self.assertEqual(release.socket_counts(99, 8080, Path(directory))[0], 1)
+            self.assertEqual(release.socket_inventory(99, 8080, Path(directory)),
+                             {"01_loopback_rx0_tx0_inode_owned0": 1})
+
+    def test_half_open_and_close_wait_are_not_kernel_teardown_exemptions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_tcp_fixture(directory, [tcp_row(state) for state in ("02", "03", "08")])
+            self.assertEqual(release.socket_counts(99, 8080, Path(directory))[0], 3)
+
+    def test_malformed_closing_metadata_fails_closed(self):
+        rows = [tcp_row("05").rsplit(" ", 1)[0], tcp_row("05", tx="invalid"),
+                tcp_row("05", inode="invalid")]
+        for row in rows:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as directory:
+                write_tcp_fixture(directory, [row])
+                with self.assertRaisesRegex(release.ReleaseError, "service_socket_state_unavailable"):
+                    release.socket_counts(99, 8080, Path(directory))
+                with self.assertRaisesRegex(release.ReleaseError, "service_socket_inventory_unavailable"):
+                    release.socket_inventory(99, 8080, Path(directory))
+
     def create_identity_database(self, path):
         with contextlib.closing(sqlite3.connect(path)) as db:
             for statement in (
@@ -123,6 +205,50 @@ class HelpersTest(unittest.TestCase):
 
 
 class StateTest(unittest.TestCase):
+    def test_coordinated_idle_cannot_bypass_any_generation_or_queue_counter(self):
+        for field in ("active_requests", "queued_image_jobs", "running_image_jobs"):
+            with self.subTest(field=field):
+                task = self.make_release(coordinated_idle=True)
+                state = {"active_requests": 0, "queued_image_jobs": 0,
+                         "running_image_jobs": 0, "blocking_service_connections": 0}
+                state[field] = 1
+                task.state = mock.Mock(return_value=({}, state))
+                with mock.patch("deploy_release.time.monotonic", side_effect=[0, 1, 6]), mock.patch("deploy_release.time.sleep"):
+                    with self.assertRaisesRegex(release.ReleaseError, "no_restart_performed"):
+                        task.wait_idle()
+                task.runner.run.assert_not_called()
+
+    def test_coordinated_idle_final_busy_check_prevents_any_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / ".env").write_text("ADMIN_SECRET=synthetic-only\n")
+            task = self.make_release(deploy_path=directory, coordinated_idle=True)
+            task.runner.env = {"DOCKER_HOST": "unix:///var/run/docker.sock"}
+            task.info = {"Id": "old", "Image": "sha256:old", "Config": {},
+                         "State": {"Pid": 99}, "Mounts": [
+                             {"Source": directory, "Destination": "/data", "RW": True}]}
+            task.locate = mock.Mock()
+            task.validate_original_config = mock.Mock()
+            task.port = 8080
+            task.gate_preflight = mock.Mock(return_value={"ipv6_firewall_required": False})
+            task.get_json = mock.Mock(side_effect=[{"status": "ok", "build_version": "old-version"},
+                {"database": {"driver": "sqlite", "location": "/data/main.db", "healthy": True}}])
+            task.memory_video_risk = mock.Mock(return_value=False)
+            task.pull = mock.Mock(return_value={"Id": "sha256:new"})
+            task.wait_idle = mock.Mock()
+            task.backup = mock.Mock()
+            task.state = mock.Mock(return_value=({}, {"active_requests": 1, "running_image_jobs": 0,
+                                                      "queued_image_jobs": 0, "blocking_service_connections": 0}))
+            task.staged_start = mock.Mock()
+            fake_fcntl = types.SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=mock.Mock())
+            with mock.patch.dict("sys.modules", {"fcntl": fake_fcntl}), \
+                 mock.patch("deploy_release.docker_json", return_value=[{"Id": "sha256:old"}]), \
+                 mock.patch("deploy_release.Fence"):
+                with self.assertRaisesRegex(release.ReleaseError, "service_became_busy_no_restart_performed"):
+                    task.deploy()
+            task.staged_start.assert_not_called()
+            self.assertNotIn("rollback_attempted", task.summary)
+
     def make_release(self, **kwargs):
         params = dict(deploy_path=".", compose_file="docker-compose.yml", service="codex2api",
                       inspect=False, image="ghcr.io/btcfoxman/codex2api@sha256:" + "a" * 64,
@@ -169,7 +295,8 @@ class StateTest(unittest.TestCase):
     def test_inspect_does_not_invoke_deploy_pull_fence_or_backup(self):
         task = self.make_release(inspect=True)
         task.info = {"Config": {"Env": ["ADMIN_SECRET=do-not-print", "DATABASE_DRIVER=sqlite"]},
-                     "Image": "sha256:123", "Mounts": [{"Destination": "/data"}]}
+                     "Image": "sha256:123", "Mounts": [{"Destination": "/data"}], "State": {"Pid": 99}}
+        task.port = 8080
         task.admin_secret = "do-not-print"
         task.locate = mock.Mock()
         task.get_json = mock.Mock(side_effect=[{"status": "ok", "build_version": "b" * 40},
@@ -177,7 +304,8 @@ class StateTest(unittest.TestCase):
         task.gate_preflight = mock.Mock(side_effect=release.ReleaseError("command_failed"))
         task.image_jobs = mock.Mock(return_value={"running": 1})
         task.memory_video_risk = mock.Mock(return_value=False)
-        result = task.inspect()
+        with mock.patch("deploy_release.socket_inventory", return_value={}):
+            result = task.inspect()
         task.runner.run.assert_not_called()
         self.assertEqual(result["active_requests"], 2)
         self.assertNotIn("do-not-print", json.dumps(result))

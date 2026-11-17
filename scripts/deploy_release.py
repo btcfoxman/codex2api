@@ -65,8 +65,8 @@ def immutable_image(value):
     return value
 
 
-def socket_counts(pid, port, proc_root=Path("/proc")):
-    """Count service sockets, including half-open and closing live sockets."""
+def socket_counts(pid, port, proc_root=Path("/proc"), *, coordinated_idle=False):
+    """Count live/owned service sockets; ignore only drained kernel teardown."""
     busy = 0
     ipv6_listener = False
     for name in ("tcp", "tcp6"):
@@ -77,37 +77,68 @@ def socket_counts(pid, port, proc_root=Path("/proc")):
             lines = path.read_text().splitlines()[1:]
             for line in lines:
                 fields = line.split()
-                if len(fields) < 4 or int(fields[1].rsplit(":", 1)[1], 16) != port:
+                if len(fields) < 4:
+                    raise ValueError("incomplete TCP row")
+                if int(fields[1].rsplit(":", 1)[1], 16) != port:
                     continue
                 state = fields[3]
                 if name == "tcp6" and state == "0A":
                     ipv6_listener = True
-                if state not in ("0A", "06", "07"):
-                    busy += 1
-        except (OSError, ValueError):
+                if coordinated_idle:
+                    tx, rx = (int(value, 16) for value in fields[4].split(":"))
+                    inode = int(fields[9])
+                    if tx < 0 or rx < 0 or inode < 0:
+                        raise ValueError("invalid TCP metadata")
+                    if tx or rx:
+                        busy += 1
+                        continue
+                    # Explicit coordinated idle permits graceful shutdown of
+                    # empty HTTP keepalive sockets. Pending handshakes, unknown
+                    # states, CLOSE_WAIT and owned half-closes remain blockers.
+                    if state in ("0A", "06", "07", "01"):
+                        continue
+                if state in ("0A", "06", "07"):
+                    continue
+                if state in ("04", "05", "09", "0B"):
+                    # A completed Connection:close probe can leave an orphaned
+                    # FIN_WAIT2 socket. Exclude it only when no userspace socket
+                    # owns it and neither queue contains bytes. Keep half-closed
+                    # owned connections and all pending payload protected.
+                    tx, rx = (int(value, 16) for value in fields[4].split(":"))
+                    inode = int(fields[9])
+                    if inode == 0 and tx == 0 and rx == 0:
+                        continue
+                busy += 1
+        except (OSError, ValueError, IndexError):
             raise ReleaseError("service_socket_state_unavailable") from None
     return busy, ipv6_listener
 
 
-def socket_inventory(pid, port):
+def socket_inventory(pid, port, proc_root=Path("/proc")):
     """Only aggregate transport state; never expose client addresses."""
     counts = {}
     for filename in ("tcp", "tcp6"):
-        path = Path("/proc") / str(pid) / "net" / filename
+        path = proc_root / str(pid) / "net" / filename
         if not path.exists():
             continue
-        for line in path.read_text().splitlines()[1:]:
-            fields = line.split()
-            if int(fields[1].rsplit(":", 1)[1], 16) != port:
-                continue
-            remote = bytes.fromhex(fields[2].split(":", 1)[0])
-            packed = b"".join(remote[i:i+4][::-1] for i in range(0, len(remote), 4))
-            address = ipaddress.ip_address(packed)
-            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-                address = address.ipv4_mapped
-            tx, rx = (int(value, 16) for value in fields[4].split(":"))
-            key = "%s_%s_rx%d_tx%d" % (fields[3], "loopback" if address.is_loopback else "external", bool(rx), bool(tx))
-            counts[key] = counts.get(key, 0) + 1
+        try:
+            for line in path.read_text().splitlines()[1:]:
+                fields = line.split()
+                if int(fields[1].rsplit(":", 1)[1], 16) != port:
+                    continue
+                remote = bytes.fromhex(fields[2].split(":", 1)[0])
+                packed = b"".join(remote[i:i+4][::-1] for i in range(0, len(remote), 4))
+                address = ipaddress.ip_address(packed)
+                if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                    address = address.ipv4_mapped
+                tx, rx = (int(value, 16) for value in fields[4].split(":"))
+                inode_owned = int(fields[9]) != 0
+                key = "%s_%s_rx%d_tx%d_inode_owned%d" % (
+                    fields[3], "loopback" if address.is_loopback else "external",
+                    bool(rx), bool(tx), inode_owned)
+                counts[key] = counts.get(key, 0) + 1
+        except (OSError, ValueError, IndexError):
+            raise ReleaseError("service_socket_inventory_unavailable") from None
     return counts
 
 
@@ -326,7 +357,8 @@ class Release:
         self.service = args.service
         self.summary = {"operation": "inspect" if args.inspect else "deploy",
                         "environment": "SSH-JP", "build_on_target": False,
-                        "database_restored": False}
+                        "database_restored": False,
+                        "idle_policy": "coordinated" if getattr(args, "coordinated_idle", False) else "strict"}
         self.info = None
         self.admin_secret = ""
 
@@ -423,8 +455,11 @@ class Release:
         if type(active) is not int or active < 0:
             raise ReleaseError("active_request_state_unavailable")
         counts = self.image_jobs(runtime)
-        sockets, _ = socket_counts((info or self.info)["State"]["Pid"], self.port)
-        return runtime, {"active_requests": active, "service_connections": sockets,
+        coordinated = getattr(self.args, "coordinated_idle", False)
+        sockets, _ = socket_counts((info or self.info)["State"]["Pid"], self.port,
+                                   coordinated_idle=coordinated)
+        socket_field = "blocking_service_connections" if coordinated else "service_connections"
+        return runtime, {"active_requests": active, socket_field: sockets,
                          "queued_image_jobs": counts.get("queued", 0),
                          "running_image_jobs": counts.get("running", 0)}
 
@@ -817,6 +852,9 @@ def parse_args(argv=None):
     parser.add_argument("--idle-timeout", type=int, default=180)
     parser.add_argument("--health-timeout", type=int, default=300)
     parser.add_argument("--pull-timeout", type=int, default=180)
+    parser.add_argument("--coordinated-idle", action="store_true",
+                        default=os.getenv("CODEX_DEPLOY_COORDINATED_IDLE", "") == "1",
+                        help="Allow graceful close of empty established sockets after active work drains")
     args = parser.parse_args(argv)
     if not args.deploy_path:
         raise ReleaseError("deploy_path_required")

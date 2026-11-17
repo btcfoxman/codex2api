@@ -18,6 +18,8 @@
 
 所有入口防护均在 `finally` 清理，另有独立超时清理 watchdog，处理 SSH 会话异常断开。已有长时间保活或 WebSocket 连接也会阻止严格切换，需要它们自然结束；脚本不会强断这些连接。应用升级可能迁移数据，镜像回滚不能代替数据库兼容性核对。
 
+默认保留上述严格模式。工作流可以显式传入 `--coordinated-idle` 或 `CODEX_DEPLOY_COORDINATED_IDLE=1` 使用协调空闲切换：账号在途、图片排队及执行计数仍须连续三次全部为零，所有服务套接字收发队列均须为空，只允许空缓冲 ESTABLISHED 或已确认的内核收尾连接；握手、CLOSE_WAIT、未知状态及未能解析的元数据仍阻断。备份后再次复核，任何生成或队列重新变忙都不重启。该模式使用应用正常 Shutdown 关闭空闲 HTTP 保活连接，不使用 `ss -K`、强杀或终止生成任务。审计显示 `idle_policy=coordinated` 与 `blocking_service_connections`，不宣称所有 HTTP 套接字已经归零。
+
 防护使用持续持有的网络命名空间文件描述符，清理 watchdog 继承该描述符，避免原 PID 退出或复用后误操作其他命名空间。部署目录永久保留 `.codex2api-release.json` 发布回执，不修改应用 `.env`。之后手工操作应使用 `docker compose -f docker-compose.yml -f .codex2api-release.json up -d --no-build --no-deps codex2api`，实际文件名及服务名按原配置替换，确保继续使用已验证的 digest；单独使用原 compose 可能恢复其默认镜像标签。
 
 旧版本 Grok 异步视频任务的账号绑定只保存在运行时缓存。若目标使用 memory 缓存且存在 Grok 账号，现有接口无法证明这些异步任务已结束，脚本会报告风险并拒绝自动切换；不能用 HTTP 在途为零代替这项核对。
