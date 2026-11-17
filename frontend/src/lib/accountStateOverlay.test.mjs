@@ -195,15 +195,15 @@ test("marker-only rendering stays in normal flow and is passed through", () => {
   );
 });
 
-test("pull request CI runs frontend regression tests", () => {
+test("release verification runs frontend regression tests", () => {
   const workflowSource = readFileSync(
-    new URL("../../../.github/workflows/pr-check.yml", import.meta.url),
+    new URL("../../../.github/workflows/production-docker.yml", import.meta.url),
     "utf8",
   );
   const frontendJob = sourceSlice(
     workflowSource.replace(/\r\n/g, "\n"),
-    "  frontend:\n",
-    "  golangci-lint:\n",
+    "  verify-frontend:\n",
+    "  verify-golangci-lint:\n",
   );
 
   assert.match(

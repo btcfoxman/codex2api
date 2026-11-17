@@ -209,7 +209,7 @@ RENDER_DEPLOY_HOOK_URL=<Render Deploy Hook URL>
 也可以手动触发镜像构建工作流，镜像推送成功后会自动进入 Render 部署工作流：
 
 ```bash
-gh workflow run docker-image.yml
+gh workflow run production-docker.yml -f operation=deploy
 ```
 
 如果只想让 Render 重新拉取当前 `latest` 镜像，也可以单独触发 Render 部署工作流：
