@@ -17,8 +17,9 @@ Fork integrations retained:
 - One bounded retry for remote-asset HTTP 407 across Responses, Compact and Chat,
   with account release and both original/translated request bodies updated.
 - SQLite connection handling and retry spool cleanup.
-- The fork's production workflow and deployment target; the upstream image
-  publishing workflow remains removed.
+- The fork's production workflow and deployment target. Upstream workflow
+  files are removed; all verification gates live in the single self-managed
+  production build/deploy workflow.
 
 The upstream heartbeat tests supersede the equivalent fork fix and require a
 complete independent SSE keepalive within the upstream silence window.

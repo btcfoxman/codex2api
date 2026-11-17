@@ -10,6 +10,7 @@ import (
 
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
@@ -98,6 +99,8 @@ func (h *Handler) buildRuntimeStatus(ctx context.Context, r *http.Request) runti
 		ImageStorage: imageStorage,
 		AdminAuth:    adminAuth,
 		Checks:       checks,
+
+		OutputGuardReady: proxy.IsOutputGuardReady(),
 	}
 }
 

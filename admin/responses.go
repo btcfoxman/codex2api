@@ -278,6 +278,8 @@ type runtimeStatusResponse struct {
 	ImageStorage runtimeImageStorageResponse  `json:"image_storage"`
 	AdminAuth    runtimeAdminAuthResponse     `json:"admin_auth"`
 	Checks       []runtimeCheckResponse       `json:"checks"`
+
+	OutputGuardReady bool `json:"output_guard_ready"`
 }
 
 type runtimeCheckResponse struct {

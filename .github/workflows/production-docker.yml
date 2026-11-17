@@ -1,28 +1,13 @@
 name: Production Docker Deploy
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-    inputs:
-      operation:
-        description: Inspect without changing the server, or deploy after all verification
-        type: choice
-        options: [inspect, deploy]
-        default: inspect
-
 permissions:
   contents: read
   packages: write
-
 concurrency:
   group: production-codex2api
   cancel-in-progress: false
-
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-
 jobs:
   inspect:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'inspect'
@@ -30,104 +15,330 @@ jobs:
     timeout-minutes: 5
     environment: SSH-JP
     steps:
-      - uses: actions/checkout@v5
-      - name: Encode the reviewed deployment program
-        id: payload
-        run: echo "script=$(base64 -w0 scripts/deploy_release.py)" >> "$GITHUB_OUTPUT"
-      - name: Inspect or deploy the published image via SSH
-        uses: appleboy/ssh-action@v1.0.3
+    - uses: actions/checkout@v5
+    - name: Encode the reviewed deployment program
+      id: payload
+      run: echo "script=$(base64 -w0 scripts/deploy_release.py)" >> "$GITHUB_OUTPUT"
+    - name: Inspect or deploy the published image via SSH
+      uses: appleboy/ssh-action@v1.0.3
+      env:
+        DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        DEPLOY_COMPOSE_FILE: ${{ secrets.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
+        DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE || 'codex2api' }}
+        RELEASE_SHA: ${{ github.sha }}
+        RELEASE_IMAGE: ''
+        DEPLOY_OPERATION: ${{ inputs.operation || 'deploy' }}
+        GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+        GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+        DEPLOY_PROGRAM: ${{ steps.payload.outputs.script }}
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.DEPLOY_SSH_KEY }}
+        port: ${{ secrets.DEPLOY_PORT || 22 }}
+        command_timeout: 40m
+        script_stop: true
+        envs: DEPLOY_PATH,DEPLOY_COMPOSE_FILE,DEPLOY_SERVICE,RELEASE_SHA,RELEASE_IMAGE,DEPLOY_OPERATION,GHCR_USERNAME,GHCR_TOKEN,DEPLOY_PROGRAM
+        script: 'python3 -c ''import base64,os; exec(compile(base64.b64decode(os.environ["DEPLOY_PROGRAM"]), "deploy_release.py",
+          "exec"))''
+
+          '
+  verify-frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+    - name: Set up Node.js
+      uses: actions/setup-node@v5
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
+    - name: Install frontend dependencies
+      working-directory: frontend
+      run: npm ci
+    - name: Test frontend
+      working-directory: frontend
+      run: npm test
+    - name: Typecheck frontend
+      working-directory: frontend
+      run: npm run typecheck
+    - name: Install Chromium for SVG export regression tests
+      working-directory: frontend
+      run: npx playwright install --with-deps chromium
+    - name: Test SVG export in the browser
+      working-directory: frontend
+      run: npm run test:svg
+    - name: Test intelligence checks in the browser
+      working-directory: frontend
+      run: npm run test:intelligence
+    - name: Test API key account portal in the browser
+      working-directory: frontend
+      run: npm run test:key-usage
+    - name: Test version checks and Kiro account controls in the browser
+      working-directory: frontend
+      run: 'npm run test:version
+
+        node --experimental-strip-types --test tests/kiroAccounts.browser.test.mjs
+
+        '
+    - name: Build frontend
+      working-directory: frontend
+      env:
+        VITE_APP_VERSION: ${{ github.head_ref || github.ref_name }}
+      run: npm run build
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
+  verify-golangci-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+    - name: Create frontend dist placeholder
+      run: mkdir -p frontend/dist && touch frontend/dist/placeholder
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: v2.9
+        args: --enable-only=govet --timeout=10m ./...
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
+  verify-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+    - name: Create frontend dist placeholder
+      run: mkdir -p frontend/dist && touch frontend/dist/placeholder
+    - name: Run Go tests
+      run: go test -count=1 -timeout 8m ./...
+    - name: Test deployment preservation and rollback with synthetic data
+      run: python3 -m unittest discover -s scripts -p 'test_deploy_release.py' -v
+    - name: Verify modules and backend build
+      run: 'go mod verify
+
+        go build -o /tmp/codex2api-check .
+
+        '
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
+  verify-postgres-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:18-alpine
         env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          DEPLOY_COMPOSE_FILE: ${{ secrets.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
-          DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE || 'codex2api' }}
-          RELEASE_SHA: ${{ github.sha }}
-          RELEASE_IMAGE: ""
-          DEPLOY_OPERATION: ${{ inputs.operation || 'deploy' }}
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
-          DEPLOY_PROGRAM: ${{ steps.payload.outputs.script }}
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT || 22 }}
-          command_timeout: 40m
-          script_stop: true
-          envs: DEPLOY_PATH,DEPLOY_COMPOSE_FILE,DEPLOY_SERVICE,RELEASE_SHA,RELEASE_IMAGE,DEPLOY_OPERATION,GHCR_USERNAME,GHCR_TOKEN,DEPLOY_PROGRAM
-          script: |
-            python3 -c 'import base64,os; exec(compile(base64.b64decode(os.environ["DEPLOY_PROGRAM"]), "deploy_release.py", "exec"))'
-
-  verify:
+          POSTGRES_USER: codex2api_test
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: codex2api_test
+        ports:
+        - 5432:5432
+        options: --health-cmd "pg_isready -U codex2api_test -d codex2api_test" --health-interval 5s --health-timeout 5s --health-retries
+          10
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+    - name: Test PostgreSQL compatibility and pending-account transactions
+      env:
+        CODEX2API_TEST_POSTGRES_DSN: postgres://codex2api_test:test-only@localhost:5432/codex2api_test?sslmode=disable
+      run: go test -race -count=1 ./database -run '^(TestPostgresTraceAndCapabilities|TestIntelligenceCheckPostgres|TestPendingAccountTransaction|TestKeyUsageAccountPermissionsPostgres)$'
     if: github.event_name == 'push' || inputs.operation == 'deploy'
-    uses: ./.github/workflows/pr-check.yml
+  verify-upgrade-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+    - name: Build previous and candidate versions on the runner
+      run: 'set -euo pipefail
 
-  security:
+        git worktree add --detach /tmp/codex-previous cad56885e7cc82770bef4b0193304cb92d2de352
+
+        mkdir -p /tmp/codex-previous/frontend/dist frontend/dist
+
+        touch /tmp/codex-previous/frontend/dist/placeholder frontend/dist/placeholder
+
+        (cd /tmp/codex-previous && go build -o /tmp/codex-old .)
+
+        go build -o /tmp/codex-new .
+
+        '
+    - name: Upgrade a synthetic previous SQLite database twice
+      run: python3 .github/scripts/test_upgrade_migration.py --old-binary /tmp/codex-old --new-binary /tmp/codex-new
     if: github.event_name == 'push' || inputs.operation == 'deploy'
-    uses: ./.github/workflows/security-scan.yml
+  verify-test-race:
+    name: test-race (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: proxy-a-g
+        - name: proxy-h-z
+        - name: admin
+        - name: database
+        - name: promptfilter
+        - name: rest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+    - name: Create frontend dist placeholder
+      run: mkdir -p frontend/dist && touch frontend/dist/placeholder
+    - name: Run Go tests with race detector
+      run: 'set -euo pipefail
 
+        args="$(bash .github/scripts/go-race-packages.sh ''${{ matrix.name }}'')"
+
+        # shellcheck disable=SC2086
+
+        go test -race -count=1 -timeout 12m $args
+
+        '
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
+  security-backend-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+    - name: Create frontend dist placeholder
+      run: mkdir -p frontend/dist && touch frontend/dist/placeholder
+    - name: Run govulncheck
+      run: "set -euo pipefail\nif [ \"${{ github.event_name }}\" = \"schedule\" ]; then\n  go install golang.org/x/vuln/cmd/govulncheck@latest\n\
+        else\n  go install golang.org/x/vuln/cmd/govulncheck@v1.7.0\nfi\ngovulncheck ./...\n"
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
+  security-frontend-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+    - name: Set up Node.js
+      uses: actions/setup-node@v5
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: frontend/package-lock.json
+    - name: Install frontend dependencies
+      working-directory: frontend
+      run: npm ci
+    - name: Run npm audit
+      working-directory: frontend
+      run: node scripts/audit-gate.mjs
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
   build-and-push:
-    needs: [verify, security]
+    needs:
+    - verify-frontend
+    - verify-golangci-lint
+    - verify-test
+    - verify-postgres-compatibility
+    - verify-upgrade-compatibility
+    - verify-test-race
+    - security-backend-security
+    - security-frontend-security
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
       image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and publish verified images
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          build-args: BUILD_VERSION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
+    - uses: actions/checkout@v5
+    - uses: docker/setup-qemu-action@v3
+    - uses: docker/setup-buildx-action@v3
+    - uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and publish verified images
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+
+          '
+        labels: 'org.opencontainers.image.revision=${{ github.sha }}
+
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+          '
+        build-args: BUILD_VERSION=${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        provenance: false
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: SSH-JP
     steps:
-      - uses: actions/checkout@v5
-      - name: Encode the reviewed deployment program
-        id: payload
-        run: echo "script=$(base64 -w0 scripts/deploy_release.py)" >> "$GITHUB_OUTPUT"
-      - name: Inspect or deploy the published image via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          DEPLOY_COMPOSE_FILE: ${{ secrets.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
-          DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE || 'codex2api' }}
-          RELEASE_SHA: ${{ github.sha }}
-          RELEASE_IMAGE: ${{ needs.build-and-push.outputs.image }}
-          DEPLOY_OPERATION: ${{ inputs.operation || 'deploy' }}
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
-          DEPLOY_PROGRAM: ${{ steps.payload.outputs.script }}
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT || 22 }}
-          command_timeout: 40m
-          script_stop: true
-          envs: DEPLOY_PATH,DEPLOY_COMPOSE_FILE,DEPLOY_SERVICE,RELEASE_SHA,RELEASE_IMAGE,DEPLOY_OPERATION,GHCR_USERNAME,GHCR_TOKEN,DEPLOY_PROGRAM
-          script: |
-            python3 -c 'import base64,os; exec(compile(base64.b64decode(os.environ["DEPLOY_PROGRAM"]), "deploy_release.py", "exec"))'
+    - uses: actions/checkout@v5
+    - name: Encode the reviewed deployment program
+      id: payload
+      run: echo "script=$(base64 -w0 scripts/deploy_release.py)" >> "$GITHUB_OUTPUT"
+    - name: Inspect or deploy the published image via SSH
+      uses: appleboy/ssh-action@v1.0.3
+      env:
+        DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        DEPLOY_COMPOSE_FILE: ${{ secrets.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
+        DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE || 'codex2api' }}
+        RELEASE_SHA: ${{ github.sha }}
+        RELEASE_IMAGE: ${{ needs.build-and-push.outputs.image }}
+        DEPLOY_OPERATION: ${{ inputs.operation || 'deploy' }}
+        GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+        GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+        DEPLOY_PROGRAM: ${{ steps.payload.outputs.script }}
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.DEPLOY_SSH_KEY }}
+        port: ${{ secrets.DEPLOY_PORT || 22 }}
+        command_timeout: 40m
+        script_stop: true
+        envs: DEPLOY_PATH,DEPLOY_COMPOSE_FILE,DEPLOY_SERVICE,RELEASE_SHA,RELEASE_IMAGE,DEPLOY_OPERATION,GHCR_USERNAME,GHCR_TOKEN,DEPLOY_PROGRAM
+        script: 'python3 -c ''import base64,os; exec(compile(base64.b64decode(os.environ["DEPLOY_PROGRAM"]), "deploy_release.py",
+          "exec"))''
+
+          '
+'on':
+  push:
+    branches:
+    - main
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Inspect without changing the server, or deploy after all verification
+        type: choice
+        options:
+        - inspect
+        - deploy
+        default: inspect
