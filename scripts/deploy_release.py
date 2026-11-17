@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -86,6 +87,28 @@ def socket_counts(pid, port, proc_root=Path("/proc")):
         except (OSError, ValueError):
             raise ReleaseError("service_socket_state_unavailable") from None
     return busy, ipv6_listener
+
+
+def socket_inventory(pid, port):
+    """Only aggregate transport state; never expose client addresses."""
+    counts = {}
+    for filename in ("tcp", "tcp6"):
+        path = Path("/proc") / str(pid) / "net" / filename
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines()[1:]:
+            fields = line.split()
+            if int(fields[1].rsplit(":", 1)[1], 16) != port:
+                continue
+            remote = bytes.fromhex(fields[2].split(":", 1)[0])
+            packed = b"".join(remote[i:i+4][::-1] for i in range(0, len(remote), 4))
+            address = ipaddress.ip_address(packed)
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                address = address.ipv4_mapped
+            tx, rx = (int(value, 16) for value in fields[4].split(":"))
+            key = "%s_%s_rx%d_tx%d" % (fields[3], "loopback" if address.is_loopback else "external", bool(rx), bool(tx))
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def mapped_path(info, value):
@@ -746,6 +769,7 @@ class Release:
 
     def inspect(self):
         self.locate()
+        self.summary["socket_inventory"] = socket_inventory(self.info["State"]["Pid"], self.port)
         env = container_env(self.info)
         self.summary.update({"container_running": True,
                              "current_image_id": self.info.get("Image", ""),
