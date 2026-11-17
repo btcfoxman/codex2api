@@ -532,6 +532,35 @@ class StateTest(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, "unsupported_custom_entrypoint_command"):
                 task.validate_original_config({"Config": {"Entrypoint": defaults, "Cmd": []}})
 
+    def test_completed_receipt_rebuilds_without_marker_and_accepts_only_owned_live_bootstrap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = self.make_release(deploy_path=directory)
+            task.compose_file.write_text("services: {}\n")
+            defaults, command = ["/usr/local/bin/codex2api"], ["--literal=$REFERENCE"]
+            image = {"Config": {"Entrypoint": defaults, "Cmd": command}}
+            task.persist_normal_receipt(task.args.image, image)
+            receipt = Path(directory) / ".codex2api-release.json"
+            persisted = json.loads(receipt.read_text())["services"]["codex2api"]
+            self.assertEqual(persisted["entrypoint"], defaults)
+            self.assertEqual(persisted["command"], ["--literal=$$REFERENCE"])
+            self.assertNotIn("codex-release-", receipt.read_text())
+            self.assertNotIn(release.WAIT_ENTRYPOINT, receipt.read_text())
+            labels = {"com.docker.compose.project.config_files": "%s,%s" % (task.compose_file, receipt),
+                      "com.docker.compose.project.working_dir": directory,
+                      "com.docker.compose.service": "codex2api"}
+            bootstrap = ["/bin/sh", "-c", release.WAIT_ENTRYPOINT, "release-entrypoint",
+                         "/tmp/codex-release-%s.ready" % ("a" * 32)] + defaults + command
+            for invocation, arguments in ((bootstrap, []), (defaults, command)):
+                task.info = {"Config": {"Entrypoint": invocation, "Cmd": arguments, "Labels": labels}}
+                task.validate_original_config(image)
+            for index, replacement in ((2, "exec arbitrary-shell"), (4, "/tmp/unowned.ready"),
+                                       (5, "/custom-launcher")):
+                tampered = list(bootstrap)
+                tampered[index] = replacement
+                task.info = {"Config": {"Entrypoint": tampered, "Cmd": [], "Labels": labels}}
+                with self.assertRaisesRegex(release.ReleaseError, "unsupported_custom_entrypoint_command"):
+                    task.validate_original_config(image)
+
     def test_failed_release_rolls_back_image_without_restoring_database(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
@@ -563,11 +592,15 @@ class StateTest(unittest.TestCase):
             task.verify_health = mock.Mock(side_effect=[release.ReleaseError("new_health_failed"), None])
             fake_fcntl = types.SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=mock.Mock())
             with mock.patch.dict("sys.modules", {"fcntl": fake_fcntl}), \
-                 mock.patch("deploy_release.docker_json", return_value=[{"Id": "sha256:old"}]), \
+                 mock.patch("deploy_release.docker_json", return_value=[{"Id": "sha256:old", "Config": {
+                     "Entrypoint": ["/usr/local/bin/codex2api"], "Cmd": []}}]), \
                  mock.patch("deploy_release.Fence"):
                 with self.assertRaisesRegex(release.ReleaseError, "new_health_failed"):
                     task.deploy()
             self.assertTrue(task.summary["rollback_healthy"])
+            persisted = json.loads((path / ".codex2api-release.json").read_text())["services"]["codex2api"]
+            self.assertEqual(persisted["entrypoint"], ["/usr/local/bin/codex2api"])
+            self.assertEqual(persisted["command"], [])
             self.assertFalse(task.summary["database_restored"])
             self.assertEqual(database.read_text(), "migrated state must survive rollback")
             self.assertEqual(task.staged_start.call_count, 2)

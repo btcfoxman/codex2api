@@ -594,6 +594,26 @@ class Release:
             # must include it to keep the verified immutable image selection.
             self.summary["release_receipt"] = override.name
 
+    def persist_normal_receipt(self, image, image_info):
+        """A future force-recreate must not depend on an old container marker."""
+        config = image_info.get("Config", {})
+        entry, command = config.get("Entrypoint") or [], config.get("Cmd") or []
+        if (not isinstance(entry, list) or not isinstance(command, list) or not entry + command or
+            any(not isinstance(item, str) for item in entry + command)):
+            raise ReleaseError("unsupported_image_entrypoint")
+        receipt = self.path / ".codex2api-release.json"
+        pending = self.path / (".codex2api-release-%s.pending" % uuid.uuid4().hex)
+        payload = {"services": {self.service: {"image": image, "pull_policy": "never",
+                   "entrypoint": [item.replace("$", "$$") for item in entry],
+                   "command": [item.replace("$", "$$") for item in command]}}}
+        try:
+            pending.write_text(json.dumps(payload))
+            os.chmod(pending, 0o600)
+            os.replace(pending, receipt)
+        finally:
+            pending.unlink(missing_ok=True)
+        self.summary.update(release_receipt=receipt.name, receipt_uses_default_invocation=True)
+
     def validate_original_config(self, old_image):
         labels = self.info.get("Config", {}).get("Labels", {}) or {}
         files = [str(Path(item).resolve()) for item in
@@ -621,16 +641,21 @@ class Release:
                     raise ValueError("invalid managed invocation")
                 wrapped = [item.replace("$$", "$") for item in raw_entry]
                 managed_command = [item.replace("$$", "$") for item in raw_command]
-                normal = ((actual.get("Entrypoint") or []) == entry and
-                          (actual.get("Cmd") or []) == command and wrapped == entry and
-                          managed_command == command)
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 raise ReleaseError("managed_release_receipt_invalid") from None
-            if not normal and (len(wrapped) < 5 or
-                wrapped[:4] != ["/bin/sh", "-c", WAIT_ENTRYPOINT, "release-entrypoint"] or
-                not re.fullmatch(r"/tmp/codex-release-[0-9a-f]{32}\.ready", wrapped[4]) or
-                wrapped[5:] != entry + command or actual.get("Entrypoint") != wrapped or
-                (actual.get("Cmd") or []) != [] or managed_command != []):
+            def owned_bootstrap(arguments):
+                return (isinstance(arguments, list) and len(arguments) >= 5 and
+                    arguments[:4] == ["/bin/sh", "-c", WAIT_ENTRYPOINT, "release-entrypoint"] and
+                    isinstance(arguments[4], str) and
+                    re.fullmatch(r"/tmp/codex-release-[0-9a-f]{32}\.ready", arguments[4]) is not None and
+                    arguments[5:] == entry + command)
+            actual_entry, actual_command = actual.get("Entrypoint") or [], actual.get("Cmd") or []
+            receipt_default = wrapped == entry and managed_command == command
+            actual_default = actual_entry == entry and actual_command == command
+            actual_bootstrap = owned_bootstrap(actual_entry) and actual_command == []
+            legacy_bootstrap = (owned_bootstrap(wrapped) and managed_command == [] and
+                                actual_bootstrap and actual_entry == wrapped)
+            if not ((receipt_default and (actual_default or actual_bootstrap)) or legacy_bootstrap):
                 raise ReleaseError("unsupported_custom_entrypoint_command")
         self.compose_hash = file_hash(self.compose_file)
 
@@ -727,6 +752,7 @@ class Release:
                     current_db = mapped_path(new, new_runtime.get("database", {}).get("location", ""))
                     self.summary["preserved_records"] = verify_records(
                         current_db, self.database_baseline, self.stable_fingerprints)
+                    self.persist_normal_receipt(self.args.image, target_image)
                     self.summary.update(deployed=True, deployed_version=self.args.expected_version,
                                         image_id=new["Image"], preserved_env=True,
                                         preserved_mounts=True, database_restored=False)
@@ -740,6 +766,7 @@ class Release:
                                                 self.args.health_timeout + 120).install())
                             self.runner.run(["docker", "exec", restored["Id"], "touch", marker])
                             self.verify_health(restored, old_health["build_version"])
+                            self.persist_normal_receipt(old_tag, old_image)
                             self.summary["rollback_healthy"] = True
                         except BaseException:
                             self.summary["rollback_healthy"] = False
