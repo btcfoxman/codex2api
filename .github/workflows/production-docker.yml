@@ -2,125 +2,132 @@ name: Production Docker Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Inspect without changing the server, or deploy after all verification
+        type: choice
+        options: [inspect, deploy]
+        default: inspect
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: production-docker-${{ github.ref }}
-  cancel-in-progress: true
+  group: production-codex2api
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  inspect:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'inspect'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: SSH-JP
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Encode the reviewed deployment program
+        id: payload
+        run: echo "script=$(base64 -w0 scripts/deploy_release.py)" >> "$GITHUB_OUTPUT"
+      - name: Inspect or deploy the published image via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_COMPOSE_FILE: ${{ secrets.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
+          DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE || 'codex2api' }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_IMAGE: ""
+          DEPLOY_OPERATION: ${{ inputs.operation || 'deploy' }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+          DEPLOY_PROGRAM: ${{ steps.payload.outputs.script }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          command_timeout: 40m
+          script_stop: true
+          envs: DEPLOY_PATH,DEPLOY_COMPOSE_FILE,DEPLOY_SERVICE,RELEASE_SHA,RELEASE_IMAGE,DEPLOY_OPERATION,GHCR_USERNAME,GHCR_TOKEN,DEPLOY_PROGRAM
+          script: |
+            python3 -c 'import base64,os; exec(compile(base64.b64decode(os.environ["DEPLOY_PROGRAM"]), "deploy_release.py", "exec"))'
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+  verify:
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
+    uses: ./.github/workflows/pr-check.yml
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+  security:
+    if: github.event_name == 'push' || inputs.operation == 'deploy'
+    uses: ./.github/workflows/security-scan.yml
 
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
+  build-and-push:
+    needs: [verify, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,prefix=sha-
-
-      - name: Build and push Docker image
+      - name: Build and publish verified images
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: BUILD_VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
 
   deploy:
-    runs-on: ubuntu-latest
     needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: SSH-JP
     steps:
-      - name: Deploy via SSH
+      - uses: actions/checkout@v5
+      - name: Encode the reviewed deployment program
+        id: payload
+        run: echo "script=$(base64 -w0 scripts/deploy_release.py)" >> "$GITHUB_OUTPUT"
+      - name: Inspect or deploy the published image via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_COMPOSE_FILE: ${{ secrets.DEPLOY_COMPOSE_FILE || 'docker-compose.yml' }}
+          DEPLOY_SERVICE: ${{ secrets.DEPLOY_SERVICE || 'codex2api' }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_IMAGE: ${{ needs.build-and-push.outputs.image }}
+          DEPLOY_OPERATION: ${{ inputs.operation || 'deploy' }}
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+          DEPLOY_PROGRAM: ${{ steps.payload.outputs.script }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
+          command_timeout: 40m
           script_stop: true
+          envs: DEPLOY_PATH,DEPLOY_COMPOSE_FILE,DEPLOY_SERVICE,RELEASE_SHA,RELEASE_IMAGE,DEPLOY_OPERATION,GHCR_USERNAME,GHCR_TOKEN,DEPLOY_PROGRAM
           script: |
-            set -e
-
-            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
-            COMPOSE_FILE="${{ secrets.DEPLOY_COMPOSE_FILE }}"
-            DEPLOY_SERVICE="${{ secrets.DEPLOY_SERVICE }}"
-            GHCR_USERNAME="${{ secrets.GHCR_USERNAME || github.actor }}"
-            GHCR_TOKEN="${{ secrets.GHCR_TOKEN || github.token }}"
-            IMAGE_REGISTRY="${{ env.REGISTRY }}"
-            IMAGE_NAMESPACE="${{ github.repository_owner }}"
-            IMAGE_NAME="${{ github.event.repository.name }}"
-            IMAGE_TAG="latest"
-
-            if [ -z "$DEPLOY_PATH" ]; then
-              echo "DEPLOY_PATH is required"
-              exit 1
-            fi
-
-            if [ -z "$COMPOSE_FILE" ]; then
-              COMPOSE_FILE="docker-compose.yml"
-            fi
-
-            if [ -z "$DEPLOY_SERVICE" ]; then
-              DEPLOY_SERVICE="codex2api"
-            fi
-
-            cd "$DEPLOY_PATH"
-
-            if [ -z "$GHCR_USERNAME" ] || [ -z "$GHCR_TOKEN" ]; then
-              echo "GHCR credentials are required"
-              exit 1
-            fi
-
-            echo "$GHCR_TOKEN" | docker login "$IMAGE_REGISTRY" -u "$GHCR_USERNAME" --password-stdin
-            trap 'docker logout "$IMAGE_REGISTRY" >/dev/null 2>&1 || true' EXIT
-
-            IMAGE_REGISTRY="$IMAGE_REGISTRY" \
-            IMAGE_NAMESPACE="$IMAGE_NAMESPACE" \
-            IMAGE_NAME="$IMAGE_NAME" \
-            IMAGE_TAG="$IMAGE_TAG" \
-              docker compose -f "$COMPOSE_FILE" pull "$DEPLOY_SERVICE"
-
-            IMAGE_REGISTRY="$IMAGE_REGISTRY" \
-            IMAGE_NAMESPACE="$IMAGE_NAMESPACE" \
-            IMAGE_NAME="$IMAGE_NAME" \
-            IMAGE_TAG="$IMAGE_TAG" \
-              docker compose -f "$COMPOSE_FILE" up -d "$DEPLOY_SERVICE"
-
-            docker compose -f "$COMPOSE_FILE" ps "$DEPLOY_SERVICE"
+            python3 -c 'import base64,os; exec(compile(base64.b64decode(os.environ["DEPLOY_PROGRAM"]), "deploy_release.py", "exec"))'

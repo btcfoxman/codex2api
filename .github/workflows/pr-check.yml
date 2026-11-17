@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   workflow_call:
   pull_request:
     paths-ignore:
@@ -145,6 +146,27 @@ jobs:
         env:
           CODEX2API_TEST_POSTGRES_DSN: postgres://codex2api_test:test-only@localhost:5432/codex2api_test?sslmode=disable
         run: go test -race -count=1 ./database -run '^(TestPostgresTraceAndCapabilities|TestIntelligenceCheckPostgres|TestPendingAccountTransaction|TestKeyUsageAccountPermissionsPostgres)$'
+
+  upgrade-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build previous and candidate versions on the runner
+        run: |
+          set -euo pipefail
+          git worktree add --detach /tmp/codex-previous cad56885e7cc82770bef4b0193304cb92d2de352
+          mkdir -p /tmp/codex-previous/frontend/dist frontend/dist
+          touch /tmp/codex-previous/frontend/dist/placeholder frontend/dist/placeholder
+          (cd /tmp/codex-previous && go build -o /tmp/codex-old .)
+          go build -o /tmp/codex-new .
+      - name: Upgrade a synthetic previous SQLite database twice
+        run: python3 .github/scripts/test_upgrade_migration.py --old-binary /tmp/codex-old --new-binary /tmp/codex-new
 
   test-race:
     name: test-race (${{ matrix.name }})
