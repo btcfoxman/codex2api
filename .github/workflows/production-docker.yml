@@ -3,7 +3,7 @@ permissions:
   contents: read
   packages: write
 concurrency:
-  group: production-codex2api
+  group: codex-compose-engine-contract-proof
   cancel-in-progress: false
 env:
   REGISTRY: ghcr.io
@@ -332,6 +332,16 @@ jobs:
           "exec"))''
 
           '
+  compose-engine-contract:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'contract'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v5
+    - name: Run deployment tests including actual Engine arguments without starting the fixture
+      env:
+        CODEX_TEST_DOCKER_COMPOSE: '1'
+      run: python3 -m unittest discover -s scripts -p 'test_deploy_release.py' -v
 'on':
   push:
     branches:
@@ -344,4 +354,5 @@ jobs:
         options:
         - inspect
         - deploy
+        - contract
         default: inspect
