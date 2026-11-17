@@ -1,4 +1,4 @@
-"""Synthetic deployment regression tests; no daemon, network, or real secrets."""
+"""Synthetic tests plus an opt-in CI-only Docker create/inspect regression."""
 import argparse
 import contextlib
 import io
@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import types
 import unittest
+import uuid
 from unittest import mock
 
 import deploy_release as release
@@ -229,19 +230,50 @@ class StateTest(unittest.TestCase):
             self.assertEqual(wrapped[-1], "--literal=$$REFERENCE")
             self.assertIn('"$$n"', wrapped[2])
 
-    @unittest.skipUnless(os.getenv("CODEX_TEST_DOCKER_COMPOSE") == "1", "real Compose rendering is enabled in CI")
+    @unittest.skipUnless(os.getenv("CODEX_TEST_DOCKER_COMPOSE") == "1", "real Compose engine verification is enabled in CI")
     def test_real_compose_render_preserves_runtime_entrypoint_without_host_interpolation(self):
         with tempfile.TemporaryDirectory() as directory:
             payload = self.staged_receipt_fixture(directory)
+            # Official, disposable fixture only. No application build, process
+            # start, API request, server connection, or user data is involved.
+            fixture_image = "docker.io/library/alpine:3.22"
+            payload["services"]["codex2api"]["image"] = fixture_image
+            project = "codex-shim-test-" + uuid.uuid4().hex[:12]
+            compose_file = Path(directory) / "engine-fixture.json"
+            compose_file.write_text(json.dumps(payload))
             environment = os.environ.copy()
             environment.update(n="HOST_VALUE_MUST_NOT_ENTER_SHIM", REFERENCE="HOST_VALUE_MUST_NOT_ENTER_ARGUMENT")
-            rendered = subprocess.run(["docker", "compose", "-p", "release-shim-test", "-f", "-",
-                                       "config", "--format", "json"], input=json.dumps(payload),
-                                      text=True, capture_output=True, env=environment, timeout=30)
-            self.assertEqual(rendered.returncode, 0, "Compose configuration rendering failed")
-            invocation = json.loads(rendered.stdout)["services"]["codex2api"]["entrypoint"]
-            self.assertEqual(invocation[2], release.WAIT_ENTRYPOINT)
-            self.assertEqual(invocation[-1], "--literal=$REFERENCE")
+            compose = ["docker", "compose", "-p", project, "-f", str(compose_file)]
+            def run(command, timeout=30):
+                return subprocess.run(command, text=True, capture_output=True,
+                                      env=environment, timeout=timeout)
+            pulled = run(["docker", "pull", fixture_image], timeout=120)
+            self.assertEqual(pulled.returncode, 0, "Official Alpine fixture pull failed")
+            try:
+                rendered = run(compose + ["config", "--format", "json"])
+                self.assertEqual(rendered.returncode, 0, "Compose configuration rendering failed")
+                model = json.loads(rendered.stdout)["services"]["codex2api"]["entrypoint"]
+                # Canonical Compose output retains escapes for a second parse;
+                # it is not the Engine argv. Verify the actual container below.
+                self.assertEqual(model, payload["services"]["codex2api"]["entrypoint"])
+                created = run(compose + ["create", "--no-build", "--pull", "never", "codex2api"], timeout=60)
+                self.assertEqual(created.returncode, 0, "Compose fixture create failed")
+                listed = run(compose + ["ps", "-a", "-q", "codex2api"])
+                self.assertEqual(listed.returncode, 0, "Compose fixture lookup failed")
+                ids = listed.stdout.split()
+                self.assertEqual(len(ids), 1, "Expected exactly one unique fixture container")
+                inspected = run(["docker", "inspect", ids[0]])
+                self.assertEqual(inspected.returncode, 0, "Fixture Engine inspection failed")
+                container = json.loads(inspected.stdout)[0]
+                self.assertFalse(container["State"]["Running"], "Fixture must never start")
+                self.assertEqual(container["Config"]["Entrypoint"],
+                                 [item.replace("$$", "$") for item in model])
+                self.assertEqual(container["Config"]["Entrypoint"][2], release.WAIT_ENTRYPOINT)
+                self.assertEqual(container["Config"]["Entrypoint"][-1], "--literal=$REFERENCE")
+                self.assertEqual(container["Config"]["Cmd"] or [], [])
+            finally:
+                cleaned = run(compose + ["down", "--remove-orphans", "--timeout", "1"], timeout=60)
+                self.assertEqual(cleaned.returncode, 0, "Unique Compose fixture cleanup failed")
 
     def test_restarting_or_missing_pid_replacement_is_rejected_before_namespace_access(self):
         for state in ({"Running": True, "Restarting": True, "Pid": 123},

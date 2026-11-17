@@ -28,4 +28,4 @@
 
 脚本回归测试只使用合成 SQLite 和模拟命令，执行于 GitHub runner：`python -m unittest discover -s scripts -p 'test_deploy_release.py' -v`。
 
-CI 另设置 `CODEX_TEST_DOCKER_COMPOSE=1`，用真实 `docker compose config --format json` 验证回执插值后的启动参数；此检查不创建容器、不生成付费任务。本机无 Docker 时该项跳过，不安装 Docker 或构建依赖。
+CI 另设置 `CODEX_TEST_DOCKER_COMPOSE=1`，先检查真实 `docker compose config --format json` 保留的可再次解析转义模型，再拉取官方 `docker.io/library/alpine:3.22` 夹具，以唯一项目名执行 `create --no-build --pull never`，从 Docker Engine 的 `Config.Entrypoint/Cmd` 核对最终单 `$` 参数。夹具不启动、不构建应用、不生成付费任务，并在 `finally` 仅清理本测试项目的容器及网络。本机无 Docker 时该项跳过，不安装 Docker 或构建依赖。
