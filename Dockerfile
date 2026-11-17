@@ -4,7 +4,7 @@
 # Stage 1: 构建前端 (React + Vite)
 # 前端产物是纯静态文件，只需构建一次，与目标平台无关
 # ============================================================
-FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 
 ARG BUILD_VERSION=dev
 
@@ -19,7 +19,7 @@ RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
 # Stage 2: 构建 Go 后端
 # 使用 BUILDPLATFORM 原生运行 + TARGETARCH 交叉编译
 # ============================================================
-FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine AS go-builder
 
 ARG TARGETARCH
 ARG BUILD_VERSION=dev

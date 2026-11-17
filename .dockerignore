@@ -25,6 +25,12 @@ Thumbs.db
 # Logs and local worktrees must not enter the build context.
 logs/
 *.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 .worktrees/
 .local/
 

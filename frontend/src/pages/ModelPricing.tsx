@@ -60,17 +60,18 @@ type Row = {
   media_unit?: MediaBillingUnit
 }
 type SourceFilter = 'all' | 'custom' | 'synced' | 'default' | 'unsaved'
-type ChannelFilter = 'all' | 'codex' | 'grok' | 'antigravity' | 'claude'
-const CHANNEL_ORDER: Array<Exclude<ChannelFilter, 'all'>> = ['codex', 'grok', 'antigravity', 'claude']
+type ChannelFilter = 'all' | 'codex' | 'grok' | 'antigravity' | 'claude' | 'kiro'
+const CHANNEL_ORDER: Array<Exclude<ChannelFilter, 'all'>> = ['codex', 'grok', 'antigravity', 'claude', 'kiro']
 const CHANNEL_LABEL: Record<Exclude<ChannelFilter, 'all'>, string> = {
   codex: 'Codex',
   grok: 'Grok',
   antigravity: 'Antigravity',
   claude: 'Claude',
+  kiro: 'Kiro',
 }
 function rowChannel(r: Row): Exclude<ChannelFilter, 'all'> {
   const c = (r.channel || '').toLowerCase()
-  if (c === 'grok' || c === 'antigravity' || c === 'claude') return c
+  if (c === 'grok' || c === 'antigravity' || c === 'claude' || c === 'kiro') return c
   return 'codex'
 }
 // 已见过的模型集(localStorage):用于给新出现的模型打"新"标。首次加载会播种、不标新。
@@ -703,6 +704,7 @@ export default function ModelPricing() {
   const [syncUrl, setSyncUrl] = useState('')
   const [defaultUrl, setDefaultUrl] = useState('')
   const [modelsDevUrl, setModelsDevUrl] = useState('')
+  const [litellmUrl, setLitellmUrl] = useState('')
   const [officialOpenAIUrl, setOfficialOpenAIUrl] = useState('')
   const [officialXAIUrl, setOfficialXAIUrl] = useState('')
   const [officialClaudeUrl, setOfficialClaudeUrl] = useState('')
@@ -742,6 +744,7 @@ export default function ModelPricing() {
       setRows(res.models)
       setDefaultUrl(res.default_sync_url)
       setModelsDevUrl(res.models_dev_url)
+      setLitellmUrl(res.litellm_url)
       setOfficialOpenAIUrl(res.official_openai_url)
       setOfficialXAIUrl(res.official_xai_url)
       setOfficialClaudeUrl(res.official_claude_url)
@@ -871,7 +874,7 @@ export default function ModelPricing() {
         include_grok: officialConfig.include_grok,
         include_claude: officialConfig.include_claude,
       })
-      showToast(t('settings.pricing.officialSyncDone', { applied: result.applied, skipped: result.skipped }))
+      showToast([t('settings.pricing.officialSyncDone', { applied: result.applied, skipped: result.skipped }), ...(result.notices ?? [])].join('；'))
       await load()
     } catch (error) {
       showToast(`${t('settings.pricing.syncFailed')}: ${getErrorMessage(error)}`, 'error')
@@ -899,7 +902,7 @@ export default function ModelPricing() {
 
   // 各 provider(渠道)模型数量:仅当存在多于一个渠道时才显示渠道过滤条。
   const channelCounts = useMemo(() => {
-    const m: Record<string, number> = { codex: 0, grok: 0, antigravity: 0, claude: 0 }
+    const m: Record<string, number> = { codex: 0, grok: 0, antigravity: 0, claude: 0, kiro: 0 }
     for (const r of rows) m[rowChannel(r)] += 1
     return m
   }, [rows])
@@ -1049,7 +1052,7 @@ export default function ModelPricing() {
         </>}
       />
       <ModelCatalogModal open={catalogOpen} onClose={() => setCatalogOpen(false)} rows={rows} newModels={newModels} query={catalogQuery} onQueryChange={setCatalogQuery} onJump={jumpToModel} onRefresh={() => void refreshCatalogModels()} refreshing={refreshingModels} refreshProgress={refreshProgress} onAcknowledge={acknowledgeNewModels} />
-      <PricingSyncPanel open={syncOpen} onClose={() => setSyncOpen(false)} syncUrl={syncUrl} onSyncUrlChange={setSyncUrl} urls={{ default: defaultUrl, modelsDev: modelsDevUrl, openAI: officialOpenAIUrl, xAI: officialXAIUrl, claude: officialClaudeUrl }} config={officialConfig} onConfigChange={setOfficialConfig} syncing={syncing} officialSyncing={officialSyncing} officialSaving={officialSaving} onSync={() => void sync()} onSyncOfficial={() => void syncOfficial()} onSaveOfficial={() => void saveOfficialConfig()} />
+      <PricingSyncPanel open={syncOpen} onClose={() => setSyncOpen(false)} syncUrl={syncUrl} onSyncUrlChange={setSyncUrl} urls={{ default: defaultUrl, litellm: litellmUrl, modelsDev: modelsDevUrl, openAI: officialOpenAIUrl, xAI: officialXAIUrl, claude: officialClaudeUrl }} config={officialConfig} onConfigChange={setOfficialConfig} syncing={syncing} officialSyncing={officialSyncing} officialSaving={officialSaving} onSync={() => void sync()} onSyncOfficial={() => void syncOfficial()} onSaveOfficial={() => void saveOfficialConfig()} />
       <StateShell variant="page" loading={loading && rows.length === 0} error={loadError && rows.length === 0 ? loadError : null} onRetry={() => void load()}>
         <div className="pricing-overview">
           <div className="pricing-metrics" role="group" aria-label={t('settings.pricing.sourceFilterLabel')}>

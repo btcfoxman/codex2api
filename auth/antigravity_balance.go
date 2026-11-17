@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"hash/fnv"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -10,6 +11,240 @@ import (
 
 	"github.com/codex2api/database"
 )
+
+// neutralQuotaPressure 是「关于额度一无所知」时的中性压力分：既不让无事实的账号
+// 白嫖最高分（0），也不让它凭空降权（1）。
+const neutralQuotaPressure = 0.5
+
+// quotaPressureWindows 是参与压力聚合的白名单窗口，顺序即加权求和的遍历顺序。
+// 白名单之外（daily/monthly/未知）不参与调度打分，与 NormalizeAntigravityWindow
+// 的白名单保持一致。
+var quotaPressureWindows = []string{"weekly", "5h"}
+
+// aggregateQuotaWindow 聚合一个白名单窗口的桶状态：
+//   - present=true：存在 presence 有效、数值合法且未过期的桶，value 取最小剩余；
+//   - exists=true：权威完整清单（summary_integrity）证实窗口存在，但数值/时效不可用；
+//   - 两者皆 false：缺席或存在性未知（调用方省略，不惩罚）。
+//
+// scope 限定参与聚合的桶（按请求模型的配额族），nil 表示整号所有桶。
+func aggregateQuotaWindow(snap *AntigravityQuotaSnapshot, window string, scope antigravityQuotaBucketScope, now time.Time) (value float64, present, exists bool) {
+	best := math.Inf(1)
+	foundAny := false
+	for _, g := range snap.Groups {
+		for _, b := range g.Buckets {
+			if scope != nil && !scope(b) {
+				continue
+			}
+			w, ok := NormalizeAntigravityWindow(b.Window)
+			if !ok || w != window {
+				continue
+			}
+			foundAny = true
+			if !b.FractionPresent || b.RemainingFraction == nil {
+				continue
+			}
+			v := *b.RemainingFraction
+			if v < 0.0 || v > 1.0 || math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			if !b.ObservedAt.IsZero() && now.After(b.ObservedAt.Add(time.Duration(b.TTLSeconds)*time.Second)) {
+				continue // 时效不可用
+			}
+			if v < best {
+				best = v
+			}
+			present = true
+		}
+	}
+	if present {
+		return best, true, false
+	}
+	if foundAny && snap.SourceMetadata["groups"].SummaryIntegrity {
+		return 0, false, true
+	}
+	return 0, false, false
+}
+
+// quotaPressureQuantum 是压力分的量化网格（1e-12）。
+//
+// 「1 - 剩余比例」与「多窗口平均」在二进制浮点下会留下末位漂移：两个剩余 0.8 的窗口
+// 求平均，裸结果是 0.19999999999999996 而不是 0.2。粒度 1e-12 比 usageWeight（0.5 量级）
+// 低十个数量级，不改变任何排序结论，但让同一额度事实恒得同一分数——选号同分依赖哈希
+// 打散，分数抖动会让同一批账号在两次选号间得到不同序。
+const quotaPressureQuantum = 1e12
+
+// quantizeQuotaPressure 把压力分对齐到 quotaPressureQuantum 网格。
+func quantizeQuotaPressure(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return neutralQuotaPressure
+	}
+	return math.Round(v*quotaPressureQuantum) / quotaPressureQuantum
+}
+
+// ComputeQuotaPressure 把 raw 配额快照折算成 [0,1] 的调度压力分，用于替换选号打分里
+// 的原 usage 项（Spec §7.1，同一个权重位，绝不与 usage 叠加成双罚）。
+//
+// 三态聚合：数值有效且未过期的窗口贡献 (1 - 剩余比例)；被权威完整清单证实存在但
+// 数值/时效不可用的窗口贡献中性分 0.5；缺席或存在性未知的窗口直接省略，不给本没有
+// 该窗口限制的账号凭空降权（Spec §7.2）。同窗口多桶取最小剩余（最紧桶决定压力）。
+func (snap *AntigravityQuotaSnapshot) ComputeQuotaPressure(now time.Time) float64 {
+	return snap.ComputeQuotaPressureForModel("", now)
+}
+
+// ComputeQuotaPressureForModel 是 ComputeQuotaPressure 的模型感知版本：只聚合 model
+// 所在配额族的桶（另含无法归族的保守桶），Claude 周配额见底不再拖低同号 Gemini 请求
+// 的排序，反之亦然。model 为空或无法归族时与整号口径一致。
+func (snap *AntigravityQuotaSnapshot) ComputeQuotaPressureForModel(model string, now time.Time) float64 {
+	if snap == nil {
+		return neutralQuotaPressure
+	}
+	var scope antigravityQuotaBucketScope
+	family := antigravityQuotaFamilyUnknown
+	if strings.TrimSpace(model) != "" {
+		scope, _ = antigravityQuotaScopeForModel(snap, model, true)
+		family = antigravityModelQuotaFamily(model)
+	}
+	var total, weight float64
+	for _, window := range quotaPressureWindows {
+		value, present, exists := aggregateQuotaWindow(snap, window, scope, now)
+		switch {
+		case present:
+			total += 1.0 - value
+			weight += 1.0
+		case exists:
+			total += neutralQuotaPressure // 证实存在但数值/时效不可用：中性分（Spec §7.2）
+			weight += 1.0
+		}
+		// absent / 存在性未知：省略，不给"无 5h 限制"的账号无端降权（Spec §7.2 修订）
+	}
+	if weight > 0 {
+		return quantizeQuotaPressure(total / weight)
+	}
+
+	// groups 完全不可用（无 summary、窗口全部未识别、quota 关闭期间）：
+	// 回退 models 级压力，只统计 presence 有效的条目，防止加权避让静默退化。
+	// 模型可归族时只取同族条目：其余族的余量与本次请求会扣的配额无关。
+	var modelSum float64
+	var modelCount int
+	for _, m := range snap.Models {
+		if family != antigravityQuotaFamilyUnknown && antigravityModelQuotaFamily(m.ModelID) != family {
+			continue
+		}
+		if m.FractionPresent && m.RemainingFraction != nil {
+			v := *m.RemainingFraction
+			if v >= 0.0 && v <= 1.0 && !math.IsNaN(v) && !math.IsInf(v, 0) {
+				modelSum += v
+				modelCount++
+			}
+		}
+	}
+	if modelCount > 0 {
+		return quantizeQuotaPressure(1.0 - (modelSum / float64(modelCount)))
+	}
+
+	// 全无事实：全局中性先验。
+	return neutralQuotaPressure
+}
+
+// antigravityQuotaPressureForScheduling 在账号读锁内取 raw 配额快照并就地折算压力分。
+//
+// SchemaVersion != 2（历史快照，presence 语义缺失、数值不可信）与完全无事实的快照一样
+// 返回中性 0.5：软打分可以吃不准的数，但不能拿不可信的数去系统性压低某个账号
+// （Spec §7.4）。压力分只在 Fresh 候选排序里消费，既有健康绑定复用分支不调用本方法，
+// 因此已绑定健康会话天然豁免（Spec §7.3）。
+//
+// model 是本次请求的 public model，压力分只看它所在配额族；为空时按整号聚合。
+func (a *Account) antigravityQuotaPressureForScheduling(model string, now time.Time) float64 {
+	if a == nil {
+		return neutralQuotaPressure
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	snap := a.AntigravityQuota
+	if snap.SchemaVersion != 2 {
+		return neutralQuotaPressure
+	}
+	return snap.ComputeQuotaPressureForModel(model, now)
+}
+
+// antigravityExpiryMinRemaining 是临期优先的存量下限：剩余不足 5% 的周配额冲刺价值
+// 很小，反而会把新会话压到一个随时触顶的号上。
+const antigravityExpiryMinRemaining = 0.05
+
+// antigravityExpiryMinHours 是紧急度分母的下限，避免离重置只剩几分钟时分数发散。
+const antigravityExpiryMinHours = 0.5
+
+// antigravityExpiryUrgency 计算账号在 model 所在配额族上的临期紧急度。
+//
+// 只看周窗口：5h 窗口每 5 小时就重置一次，恒处于「临近重置」，计入会让临期档常驻；
+// 周配额才是到期清零会造成实际浪费的那一份。同族多个周桶取最紧（剩余最少）的那个——
+// 能用掉的量受最紧桶约束。
+//
+// 返回 urgent=true 当且仅当：groups 元数据可信、模型可归族、同族 5h 桶未知为零、
+// 存在新鲜（未超 TTL）且数值合法的周桶、剩余 ≥ 5%、可信重置时刻在 (now, now+horizon] 内。此时 score = R / max(T小时, 0.5)：
+// 剩得越多、离重置越近越优先。未知族的桶不参与——加分不能建立在猜测上。
+func (a *Account) antigravityExpiryUrgency(model string, horizon time.Duration, now time.Time) (score float64, urgent bool) {
+	if a == nil || horizon <= 0 {
+		return 0, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	snap := &a.AntigravityQuota
+	// 与硬门禁同一信任口径：groups 来源元数据不可信时桶数值不作为加分依据。
+	if snap.SchemaVersion != 2 || !antigravityQuotaGroupsMetaTrusted(snap, now) {
+		return 0, false
+	}
+	scope, known := antigravityQuotaScopeForModel(snap, model, false)
+	if !known {
+		return 0, false
+	}
+	remaining := math.Inf(1)
+	var resetAt time.Time
+	for _, g := range snap.Groups {
+		for _, b := range g.Buckets {
+			if !scope(b) {
+				continue
+			}
+			w, ok := NormalizeAntigravityWindow(b.Window)
+			if !ok {
+				continue
+			}
+			if w == "5h" {
+				// 同族 5h 已知为零：周配额再临期也接不了新请求，不加分（门禁关闭时它仍
+				// 可调度，只是不被提前，免得白耗一次上游 429 重试）。
+				if blocked, _, _ := antigravityQuotaBucketGateBlock(b, now); blocked {
+					return 0, false
+				}
+				continue
+			}
+			if w != "weekly" || !b.FractionPresent || b.RemainingFraction == nil {
+				continue
+			}
+			v := *b.RemainingFraction
+			if v < 0.0 || v > 1.0 || math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			if !b.ObservedAt.IsZero() && now.After(b.ObservedAt.Add(time.Duration(b.TTLSeconds)*time.Second)) {
+				continue // 观测过期：剩余比例可能早已被消耗，不能据此冲刺
+			}
+			reset, ok := ValidateResetTime(b.ResetTime, b.ObservedAt, w)
+			if !ok || !reset.After(now) {
+				continue
+			}
+			if v < remaining {
+				remaining, resetAt = v, reset
+			}
+		}
+	}
+	if math.IsInf(remaining, 1) || remaining < antigravityExpiryMinRemaining {
+		return 0, false
+	}
+	left := resetAt.Sub(now)
+	if left > horizon {
+		return 0, false
+	}
+	return quantizeQuotaPressure(remaining / math.Max(left.Hours(), antigravityExpiryMinHours)), true
+}
 
 // SelectionOptions 描述一次选号的调度上下文。
 //
@@ -90,9 +325,10 @@ func antigravityTieBreak(key string, dbID int64) uint64 {
 //
 // 候选按 (调度优先级, 健康档位) 从高到低分层，层内按
 //
-//	score = load + usage*0.50 + penalty*0.35   （load=occupied/limit，usage=已用配额/100）
+//	score = load + quotaPressure*0.50 + penalty*0.35   （load=occupied/limit，quotaPressure=额度压力分∈[0,1]）
 //
-// 升序打分，同分用 (key, DBID) 哈希做确定性打散；从最高层开始逐个尝试取号，命中即返回，
+// 升序打分（临期优先开启时，同层内请求模型所在配额族的周配额临期账号先于其余账号，
+// 见 antigravityExpiryUrgency），同分用 (key, DBID) 哈希做确定性打散；从最高层开始逐个尝试取号，命中即返回，
 // 整层都拿不下（并发被抢占 / 命中 cached cooldown）时继续下一层。它只影响「下一个新会话
 // 优先选谁」，不改变任何冷却、绑定或并发语义。
 //
@@ -116,12 +352,15 @@ func (s *Store) selectAntigravityBalancedAccount(key string, apiKeyID int64, exc
 		tierPriority      int
 		limit             int64
 		score             float64
+		urgent            bool
+		urgency           float64
 		tie               uint64
 	}
 
 	maxConcurrency := s.maxConcurrency.Load()
 	now := time.Now()
 	penaltyWeight, usageWeight := AntigravityThrottleWeights()
+	expiryEnabled, expiryHorizon := AntigravityExpiryPriority()
 
 	accounts := s.accountSnapshotAccounts()
 	candidates := make([]candidate, 0, len(accounts))
@@ -145,15 +384,24 @@ func (s *Store) selectAntigravityBalancedAccount(key string, apiKeyID int64, exc
 			continue
 		}
 		load := float64(occupied) / float64(limit)
-		usage := acc.usagePercentForScheduling() / 100.0
+		// quotaPressure 整体替换原 usage 项（防双罚，Spec §7.1、验收 #19）：
+		// 沿用同一 usageWeight 权重位，绝不与 usage 叠加。
+		pressure := acc.antigravityQuotaPressureForScheduling(opts.Model, now)
 		penalty := acc.AntigravityPenalty(now)
-		score := load + usage*usageWeight + penalty*penaltyWeight
+		score := load + pressure*usageWeight + penalty*penaltyWeight
+		var urgency float64
+		var urgent bool
+		if expiryEnabled {
+			urgency, urgent = acc.antigravityExpiryUrgency(opts.Model, expiryHorizon, now)
+		}
 		candidates = append(candidates, candidate{
 			acc:               acc,
 			schedulerPriority: acc.schedulerPriority(),
 			tierPriority:      tierPriority(tier),
 			limit:             limit,
 			score:             score,
+			urgent:            urgent,
+			urgency:           urgency,
 			tie:               antigravityTieBreak(key, acc.DBID),
 		})
 	}
@@ -172,6 +420,14 @@ func (s *Store) selectAntigravityBalancedAccount(key string, apiKeyID int64, exc
 		}
 		if left.tierPriority != right.tierPriority {
 			return left.tierPriority > right.tierPriority
+		}
+		// 临期优先（开关开启时）：同层内临期账号整体排在非临期之前，临期账号之间按紧急度
+		// 降序。非临期账号保持原打分，远期号池的均衡不受影响。
+		if left.urgent != right.urgent {
+			return left.urgent
+		}
+		if left.urgent && left.urgency != right.urgency {
+			return left.urgency > right.urgency
 		}
 		if left.score != right.score {
 			return left.score < right.score

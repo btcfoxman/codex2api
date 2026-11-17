@@ -1,6 +1,7 @@
 name: Security Scan
 
 on:
+  workflow_call:
   pull_request:
     paths-ignore:
       - 'docs/**'
@@ -8,7 +9,6 @@ on:
       - 'CHANGELOG.md'
   push:
     branches:
-      - main
       - codex/**
     paths-ignore:
       - 'docs/**'

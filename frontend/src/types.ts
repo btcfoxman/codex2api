@@ -1,6 +1,6 @@
 export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
-export type UpstreamChannel = 'codex' | 'grok' | 'antigravity' | 'claude'
+export type UpstreamChannel = 'codex' | 'grok' | 'antigravity' | 'claude' | 'kiro'
 
 export type ChannelMonitorStatus = 'unknown' | 'operational' | 'degraded' | 'failed'
 export type ChannelMonitorBillingStatus = 'unknown' | 'ok' | 'unsupported' | 'failed'
@@ -102,9 +102,47 @@ export interface ChannelTestSettings {
 export interface ChannelTestSettingsResponse {
   antigravity: ChannelTestSettings
   claude: ChannelTestSettings
+  kiro: ChannelTestSettings
   default_test_content: string
   default_test_concurrency: number
-  model_choices?: Partial<Record<'antigravity' | 'claude', string[]>>
+  model_choices?: Partial<Record<'antigravity' | 'claude' | 'kiro', string[]>>
+}
+
+export interface KiroSettings {
+  api_domain: 'amazonaws' | 'kiro'
+  cache_simulation: boolean
+}
+
+/** Kiro 额度快照：基础额度 + 免费试用 + 赠送额度。 */
+export interface KiroUsageSnapshot {
+  subscription_title?: string
+  subscription_type?: string
+  used: number
+  limit: number
+  base_used: number
+  base_limit: number
+  bonus_used: number
+  bonus_limit: number
+  trial_used: number
+  trial_limit: number
+  next_reset_at?: string
+  credits_expire_at?: string
+  overage_status?: string
+  fetched_at: string
+}
+
+export interface KiroImportResponse {
+  imported: number
+  failed: number
+  results: Array<{ index: number; id?: number; email?: string; warnings?: string[]; error?: string }>
+}
+
+export interface KiroDeviceLoginStart {
+  session: string
+  user_code: string
+  verification_uri_complete: string
+  interval: number
+  expires_at: string
 }
 
 export interface AntigravityRedirectChoice {
@@ -117,7 +155,33 @@ export interface AntigravitySettingsResponse {
   model_redirects: Record<string, string>
   redirect_overrides_effort: boolean
   expose_thoughts: boolean
+  /** 配额自动刷新开关（GET 返回后端生效值；PUT 缺失 = 保留现值，null = 重置默认）。 */
+  quota_refresh_enabled?: boolean
+  /** 配额刷新间隔（分钟），允许范围 3–60。 */
+  quota_refresh_interval_minutes?: number
+  /** 配额硬门禁开关：开启后配额耗尽账号直接 429，不进入排队。 */
+  quota_gate_enabled?: boolean
+  /** 临期优先调度开关：周配额临近重置且仍有存量的账号优先承接新会话（仅 round_robin）。 */
+  expiry_priority_enabled?: boolean
+  /** 临期时间窗（小时），允许范围 1–168。 */
+  expiry_priority_horizon_hours?: number
+  /** 渠道配置 CAS 版本号（只读，后端下发）。 */
+  config_revision?: number
   choices: AntigravityRedirectChoice[]
+}
+
+/** POST /accounts/antigravity/quota/clear 的逐项结果（运维止血）。 */
+export interface AntigravityQuotaClearItem {
+  id: number
+  ok: boolean
+  quota_epoch: number
+  error?: string
+}
+
+export interface AntigravityQuotaClearResponse {
+  cleared: number
+  failed: number
+  items: AntigravityQuotaClearItem[]
 }
 
 export interface VisibleChannelsSettings {
@@ -384,6 +448,14 @@ export interface AccountRow {
   grok_api?: boolean
   antigravity_api?: boolean
   claude_api?: boolean
+  kiro_api?: boolean
+  /** Kiro 凭据形态：social / idc / external_idp / api_key。 */
+  kiro_auth_kind?: string
+  /** Kiro 登录来源：Google / Github / BuilderId / Enterprise 等。 */
+  kiro_login_source?: string
+  kiro_usage?: KiroUsageSnapshot
+  /** Kiro 套餐标识（按订阅标题归一）：kiro free / pro / pro+ / max / power / student。 */
+  kiro_plan?: string
   /** Claude 凭据形态(仅 Claude 账号有值)。 */
   claude_auth_kind?: ClaudeAuthKind | string
   claude_base_url?: string
@@ -579,6 +651,10 @@ export interface AccountListSummary {
   api_key: number
   /** Claude 渠道:长效 Setup Token 账号数。 */
   setup_token?: number
+  /** Kiro 渠道:按 social / idc / external_idp / api_key 计数。 */
+  kiro_auth_kinds?: Record<string, number>
+  /** 健康档为 banned 的账号数（与 health_tier=banned 筛选同口径）。 */
+  health_banned?: number
   subscription_unlocked: number
   unauthorized_24h: number
   rate_limited_1h: number
@@ -1131,7 +1207,10 @@ export interface AntigravityModelQuota {
   model?: string
   model_id?: string
   name?: string
-  remaining_fraction?: number
+  /** V2 契约：null 表示无事实；配合 fraction_present 区分"未观测"与"观测到耗尽"。 */
+  remaining_fraction?: number | null
+  /** 上游是否观测到该配额的 remaining_fraction（true 时 0 是可信的耗尽事实）。 */
+  fraction_present?: boolean
   remaining_percent?: number
   reset_time?: string
   display_name?: string
@@ -1147,7 +1226,10 @@ export interface AntigravityModelQuota {
 export interface AntigravityQuotaBucket {
   bucket_id: string
   window: string
-  remaining_fraction: number
+  /** V2 契约：null 表示无事实；配合 fraction_present 区分"未观测"与"观测到耗尽"。 */
+  remaining_fraction: number | null
+  /** 上游是否观测到该配额的 remaining_fraction（true 时 0 是可信的耗尽事实）。 */
+  fraction_present?: boolean
   reset_time?: string
   display_name?: string
   description?: string
@@ -2185,7 +2267,6 @@ export interface SystemSettings {
   codex_force_websocket: boolean
   codex_telemetry_enabled: boolean
   codex_telemetry_timing_debug: boolean
-  codex_unified_client_identity_enabled: boolean
   codex_request_compression: boolean
   codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
@@ -2272,6 +2353,12 @@ export interface SystemSettings {
   response_cache_reconstruct_max_bytes: number
   response_cache_write_policy: ResponseCacheWritePolicy
   readonly response_cache_config_generation: number
+  output_guard_enabled: boolean
+  output_guard_max_tool_argument_bytes: number
+  output_guard_max_tool_argument_deltas: number
+  output_guard_max_channel_bytes: number
+  output_guard_max_request_bytes: number
+  readonly output_guard_config_generation: number
   relay_model_cooldown_mode: ModelCooldownMode
   relay_model_cooldown_seconds: number
   relay_model_cooldown_backoff_enabled: boolean
@@ -3355,6 +3442,8 @@ export interface ModelsResponse {
   grok_models?: string[]
   // Claude 渠道账号声明模型的并集;渠道选 claude 时模型下拉用这份
   claude_models?: string[]
+  // Kiro 渠道账号模型目录的并集;渠道选 kiro 时模型下拉用这份
+  kiro_models?: string[]
   items?: ModelInfo[]
   last_synced_at?: string
   source_url: string
@@ -3362,7 +3451,7 @@ export interface ModelsResponse {
 }
 
 export interface ChannelModelRefreshResult {
-  channel: 'codex' | 'claude' | 'grok' | 'antigravity' | string
+  channel: 'codex' | 'claude' | 'grok' | 'antigravity' | 'kiro' | string
   groups?: number
   refreshed: number
   failed: number
@@ -3749,6 +3838,8 @@ export interface OfficialPricingSyncResult {
 	sources: string[]
 	warnings?: string[]
 	synced_at: string
+	fallbacks?: Record<string, string>
+	notices?: string[]
 }
 
 /**
@@ -3878,8 +3969,10 @@ export interface APIKeyLimits {
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
   upstream_channel?: UpstreamChannel
-  /** 允许该 Key 使用 ChatGPT Live（/v1/live）。默认关闭。 */
+  /** 允许该 Key 使用 ChatGPT Live（/v1/live）。新建自动/Codex 渠道 Key 默认开启。 */
   allow_live?: boolean
+  /** 外部调度模式（issue #831）：请求用 X-Codex2API-Account-ID 指定账号，网关不选号、不换号、不重试。 */
+  external_scheduler?: boolean
   /** 分组 / 账号维度的用量预算（issue #439）。 */
   scope_limits?: APIKeyScopeLimit[]
   /** Fixed weekly request budgets shared by models matching each rule. */
@@ -4058,6 +4151,8 @@ export interface PublicAPIKeyUsageLog {
   billed_image_count?: number
   id: number
   channel?: UpstreamChannel | ''
+  client_ip: string
+  client_user_agent: string
   endpoint: string
   model: string
   effective_model: string
@@ -4067,7 +4162,11 @@ export interface PublicAPIKeyUsageLog {
   first_token_ms: number
   input_tokens: number
   output_tokens: number
+  reasoning_tokens: number
+  reasoning_effort: string
   cached_tokens: number
+  cache_write_5m_tokens?: number
+  cache_write_1h_tokens?: number
   total_tokens: number
   user_billed: number
   input_cost: number
@@ -4393,4 +4492,28 @@ export interface ClaudeGlobalConfig {
   max_output_tokens: number
   max_tool_count: number
   max_tool_schema_bytes: number
+}
+
+
+export interface ScheduledConnectionTestConfig {
+  enabled: boolean
+  model: string
+  content: string
+  weekday_times: string[]
+  weekend_times: string[]
+}
+export interface ScheduledConnectionTestRecord {
+  scheduled_at: string
+  attempted_at?: string
+  account_id: number
+  model?: string
+  status: 'success' | 'failed' | 'skipped' | 'unknown'
+  success: boolean
+  error?: string
+  next_reset_5h_at?: string
+}
+export interface ScheduledConnectionTestResponse {
+  config: ScheduledConnectionTestConfig
+  timezone: string
+  records: ScheduledConnectionTestRecord[]
 }

@@ -301,14 +301,16 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 	grokKeys := dedup(append(h.grokBillingModelIDs(), grokDefaultDisplayModelIDs()...))
 	antigravityKeys := dedup(h.antigravityChannelModels())
 	claudeKeys := dedup(h.claudeChannelModels())
+	kiroKeys := dedup(h.kiroChannelModels())
 
 	// 每个渠道内按新版本在前排序；渠道之间整体拼接,避免版本号交叉穿插。
 	sortModelKeysNewestFirst(keys)
 	sortModelKeysNewestFirst(grokKeys)
 	sortModelKeysNewestFirst(antigravityKeys)
 	sortModelKeysNewestFirst(claudeKeys)
+	sortModelKeysNewestFirst(kiroKeys)
 
-	rows := make([]modelPricingRow, 0, len(keys)+len(grokKeys)+len(antigravityKeys)+len(claudeKeys))
+	rows := make([]modelPricingRow, 0, len(keys)+len(grokKeys)+len(antigravityKeys)+len(claudeKeys)+len(kiroKeys))
 	appendRows := func(modelKeys []string, channel string) {
 		for _, key := range modelKeys {
 			canonicalModel := database.PricingAliasTarget(key)
@@ -327,6 +329,7 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 	appendRows(grokKeys, database.UpstreamChannelGrok)
 	appendRows(antigravityKeys, database.UpstreamChannelAntigravity)
 	appendRows(claudeKeys, database.UpstreamChannelClaude)
+	appendRows(kiroKeys, database.UpstreamChannelKiro)
 
 	syncURL := ""
 	if s, err := h.db.GetSystemSettings(ctx); err == nil && s != nil {
@@ -338,6 +341,7 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 		"sync_url":             syncURL,
 		"default_sync_url":     proxy.DefaultModelPricingSyncURL,
 		"models_dev_url":       proxy.ModelsDevPricingSyncURL,
+		"litellm_url":          proxy.LiteLLMPricingSyncURL,
 		"official_openai_url":  proxy.OfficialOpenAIPricingURL,
 		"official_xai_url":     strings.TrimSuffix(proxy.OfficialXAIPricingURL, ".md"),
 		"official_claude_url":  proxy.OfficialAnthropicPricingURL,

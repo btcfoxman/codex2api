@@ -29,6 +29,7 @@ import type {
   AntigravityAccountState,
   AntigravityStateSyncResponse,
   AntigravityCapabilityProbeResponse,
+  AntigravityQuotaClearResponse,
   BatchUpdateGrokModelsRequest,
   BatchUpdateGrokModelsResponse,
   FetchGrokModelsResponse,
@@ -158,6 +159,10 @@ import type {
   ChannelTestSettings,
   ChannelTestSettingsResponse,
   AntigravitySettingsResponse,
+  KiroSettings,
+  KiroImportResponse,
+  KiroDeviceLoginStart,
+  KiroUsageSnapshot,
 } from './types'
 
 const BASE = '/api/admin'
@@ -191,11 +196,13 @@ type RequestOptions = RequestInit & { timeoutMs?: number }
 
 export class AdminAPIError extends Error {
   readonly status: number
+  readonly details: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, details?: unknown) {
     super(message)
     this.name = 'AdminAPIError'
     this.status = status
+    this.details = details
   }
 }
 
@@ -259,7 +266,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     if (res.status === 401) {
       resetAdminAuthState()
     }
-    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status))
+    let details: unknown
+    try { details = JSON.parse(body) } catch { /* Non-JSON errors retain their message. */ }
+    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status), details)
   }
 
   if (res.status === 204) {
@@ -321,6 +330,24 @@ async function requestAccountPortal<T>(path: string, options: RequestInit = {}):
   return (text ? JSON.parse(text) : undefined) as T
 }
 
+export interface PublicKeyUsageAccount {
+  id: number
+  name: string
+  email: string
+  plan_type: string
+  status: string
+  group_ids: number[]
+  usage_percent_5h: number | null
+  usage_percent_7d: number | null
+  long_window_seconds?: number
+  reset_5h_at?: string
+  reset_7d_at?: string
+  usage_updated_at_5h?: string
+  usage_updated_at_7d?: string
+  reset_credits?: number
+  reset_allowed: boolean
+}
+
 async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   headers.set('Authorization', `Bearer ${apiKey}`)
@@ -333,7 +360,7 @@ async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: Requ
 
   if (!res.ok) {
     const body = await res.text()
-    throw new Error(extractAdminErrorMessage(body, res.status))
+    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status))
   }
 
   return (await res.json()) as T
@@ -565,6 +592,11 @@ export interface ModelTraceBankUpdateResult extends ModelTraceBankStatus {
 }
 
 export const api = {
+  getKeyUsageAccountPermissions: (id: number) => request<{ view_enabled: boolean; reset_enabled: boolean }>(`/key-usage-account-permissions/${id}`),
+  setKeyUsageAccountPermissions: (id: number, data: { view_enabled: boolean; reset_enabled: boolean }) =>
+    request<{ view_enabled: boolean; reset_enabled: boolean }>(`/key-usage-account-permissions/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  getPublicKeyUsageAccounts: (key: string, options: RequestInit = {}) => requestAPIKeyUsage<{ accounts: PublicKeyUsageAccount[]; groups: { id: number; name: string }[]; reset_enabled: boolean }>('/accounts', key, options),
+  resetPublicKeyUsageCredits: (key: string, id: number, requestID: string) => requestAPIKeyUsage<{ message: string; usage_refreshed: boolean }>(`/accounts/${id}/reset-credits`, key, { method: 'POST', headers: { 'Idempotency-Key': requestID } }),
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
   // 公开账号自助门户:生成 OpenAI 授权链接(无鉴权)。
   generateAccountPortalAuthURL: (data: { contact_email: string }) =>
@@ -578,6 +610,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  getPublicAPIKeyConcurrency: (apiKey: string, options: RequestInit = {}) =>
+    requestAPIKeyUsage<{ current: number }>('/concurrency', apiKey, options),
   getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } & PublicAPIKeyUsageLogFilter = {}) => {
     const search = new URLSearchParams()
     search.set('range', range)
@@ -660,7 +694,7 @@ export const api = {
     if (params.order) searchParams.set('order', params.order)
     return request<AccountsPageResponse>(`/accounts?${searchParams.toString()}`, { signal })
   },
-  getAccountAnalysis: (channel: 'codex' | 'grok' | 'antigravity' | 'claude' = 'codex', signal?: AbortSignal) =>
+  getAccountAnalysis: (channel: UpstreamChannel = 'codex', signal?: AbortSignal) =>
     request<AccountAnalysisResponse>(`/accounts/analysis?channel=${channel}`, { signal }),
   getAccountPageStats: (ids: number[], signal?: AbortSignal) => {
     const query = new URLSearchParams({ ids: ids.join(',') })
@@ -868,6 +902,56 @@ export const api = {
       method: 'POST',
       timeoutMs: 60_000,
     }),
+  /** 导入 kiro.rs credentials.json / Kiro IDE kiro-auth-token.json / Kiro Account Manager 导出，自动识别格式。 */
+  importKiroAccounts: (data: { content: string; name?: string; proxy_url?: string; use_proxy_pool?: boolean }) =>
+    request<KiroImportResponse>('/accounts/kiro/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 180_000,
+    }),
+  exportKiroAccounts: (format: 'kam' | 'kiro-rs', ids?: number[]) => {
+    const params = new URLSearchParams({ format })
+    if (ids && ids.length > 0) params.set('ids', ids.join(','))
+    return requestNamedBlob(`/accounts/kiro/export?${params.toString()}`)
+  },
+  startKiroSocialLogin: (data: { name?: string; proxy_url?: string; use_proxy_pool?: boolean }) =>
+    request<{ auth_url: string; session: string; redirect_uri: string }>('/accounts/kiro/social/auth-url', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  finishKiroSocialLogin: (data: { session: string; callback_url: string }) =>
+    request<{ status: string; id: number; email?: string; warnings?: string[] }>('/accounts/kiro/social/exchange', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 60_000,
+    }),
+  startKiroDeviceLogin: (data: { start_url?: string; region?: string; name?: string; proxy_url?: string; use_proxy_pool?: boolean }) =>
+    request<KiroDeviceLoginStart>('/accounts/kiro/device/start', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  pollKiroDeviceLogin: (session: string) =>
+    request<{ status: 'pending' | 'completed'; id?: number; email?: string; warnings?: string[] }>('/accounts/kiro/device/poll', {
+      method: 'POST',
+      body: JSON.stringify({ session }),
+      timeoutMs: 60_000,
+    }),
+  syncKiroAccount: (id: number) =>
+    request<{ usage?: KiroUsageSnapshot; models?: string[] }>(`/accounts/${id}/kiro/sync`, {
+      method: 'POST',
+      timeoutMs: 60_000,
+    }),
+  syncAllKiroAccounts: () =>
+    request<{ refreshed: number; failed: number }>('/accounts/kiro/sync', {
+      method: 'POST',
+      timeoutMs: 180_000,
+    }),
+  getKiroSettings: () => request<KiroSettings>('/settings/kiro'),
+  updateKiroSettings: (patch: Partial<KiroSettings>) =>
+    request<KiroSettings>('/settings/kiro', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
   refreshAllModels: () =>
     request<RefreshAllModelsResponse>('/models/refresh-all', {
       method: 'POST',
@@ -907,6 +991,10 @@ export const api = {
     }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  getScheduledConnectionTests: (id: number) =>
+    request<import('./types').ScheduledConnectionTestResponse>(`/accounts/${id}/scheduled-tests`),
+  updateScheduledConnectionTests: (id: number, data: import('./types').ScheduledConnectionTestConfig) =>
+    request<import('./types').ScheduledConnectionTestConfig>(`/accounts/${id}/scheduled-tests`, { method: 'PUT', body: JSON.stringify(data) }),
   getAccount: (id: number, signal?: AbortSignal) =>
     request<AccountRow>(`/accounts/${id}`, { signal }),
   forceUsageProbe: () =>
@@ -1052,13 +1140,27 @@ export const api = {
       body: JSON.stringify({ channels }),
     }),
   getAntigravitySettings: () => request<AntigravitySettingsResponse>('/settings/antigravity'),
-  updateAntigravitySettings: (patch: { model_redirects?: Record<string, string>; redirect_overrides_effort?: boolean; expose_thoughts?: boolean }) =>
+  updateAntigravitySettings: (patch: {
+    model_redirects?: Record<string, string>
+    redirect_overrides_effort?: boolean
+    expose_thoughts?: boolean
+    quota_refresh_enabled?: boolean
+    quota_refresh_interval_minutes?: number
+    quota_gate_enabled?: boolean
+    expiry_priority_enabled?: boolean
+    expiry_priority_horizon_hours?: number
+  }) =>
     request<AntigravitySettingsResponse>('/settings/antigravity', {
       method: 'PUT',
       body: JSON.stringify(patch),
     }),
+  clearAntigravityQuota: (ids: number[]) =>
+    request<AntigravityQuotaClearResponse>('/accounts/antigravity/quota/clear', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: ids }),
+    }),
   getChannelTestSettings: () => request<ChannelTestSettingsResponse>('/settings/channel-tests'),
-  updateChannelTestSettings: (patch: Partial<Record<'antigravity' | 'claude', Partial<ChannelTestSettings>>>) =>
+  updateChannelTestSettings: (patch: Partial<Record<'antigravity' | 'claude' | 'kiro', Partial<ChannelTestSettings>>>) =>
     request<ChannelTestSettingsResponse>('/settings/channel-tests', {
       method: 'PUT',
       body: JSON.stringify(patch),
@@ -1570,6 +1672,7 @@ export const api = {
       sync_url: string
       default_sync_url: string
       models_dev_url: string
+      litellm_url: string
 		official_openai_url: string
 		official_xai_url: string
 		official_claude_url: string

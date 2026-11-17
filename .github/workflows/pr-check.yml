@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   pull_request:
     paths-ignore:
       - 'docs/**'
@@ -8,7 +9,6 @@ on:
       - 'CHANGELOG.md'
   push:
     branches:
-      - main
       - codex/**
     paths-ignore:
       - 'docs/**'
@@ -61,6 +61,16 @@ jobs:
         working-directory: frontend
         run: npm run test:intelligence
 
+      - name: Test API key account portal in the browser
+        working-directory: frontend
+        run: npm run test:key-usage
+
+      - name: Test version checks and Kiro account controls in the browser
+        working-directory: frontend
+        run: |
+          npm run test:version
+          node --experimental-strip-types --test tests/kiroAccounts.browser.test.mjs
+
       - name: Build frontend
         working-directory: frontend
         env:
@@ -106,6 +116,11 @@ jobs:
       - name: Run Go tests
         run: go test -count=1 -timeout 8m ./...
 
+      - name: Verify modules and backend build
+        run: |
+          go mod verify
+          go build -o /tmp/codex2api-check .
+
   postgres-compatibility:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -129,7 +144,7 @@ jobs:
       - name: Test PostgreSQL compatibility and pending-account transactions
         env:
           CODEX2API_TEST_POSTGRES_DSN: postgres://codex2api_test:test-only@localhost:5432/codex2api_test?sslmode=disable
-        run: go test -race -count=1 ./database -run '^(TestPostgresTraceAndCapabilities|TestIntelligenceCheckPostgres|TestPendingAccountTransaction)$'
+        run: go test -race -count=1 ./database -run '^(TestPostgresTraceAndCapabilities|TestIntelligenceCheckPostgres|TestPendingAccountTransaction|TestKeyUsageAccountPermissionsPostgres)$'
 
   test-race:
     name: test-race (${{ matrix.name }})

@@ -38,6 +38,7 @@ var modelRefreshChannelOrder = []string{
 	database.UpstreamChannelClaude,
 	database.UpstreamChannelGrok,
 	database.UpstreamChannelAntigravity,
+	database.UpstreamChannelKiro,
 }
 
 // channelModelRefreshResult 是单个渠道的刷新结果。
@@ -191,6 +192,7 @@ func (h *Handler) defaultModelRefreshFuncs() map[string]channelModelRefreshFunc 
 		database.UpstreamChannelClaude:      h.refreshClaudeChannelModels,
 		database.UpstreamChannelGrok:        h.refreshGrokChannelModels,
 		database.UpstreamChannelAntigravity: h.refreshAntigravityChannelModels,
+		database.UpstreamChannelKiro:        h.refreshKiroChannelModels,
 	}
 }
 
@@ -413,6 +415,9 @@ func (h *Handler) refreshCodexChannelModels(ctx context.Context, emit modelRefre
 		func(ctx context.Context, group modelRefreshPlanGroup) (int, []string, error) {
 			manifest, err := proxy.FetchCodexModelsManifest(ctx, group.Sample, h.store.ResolveProxyForAccount(group.Sample), "", "", nil)
 			if err != nil {
+				return 0, nil, err
+			}
+			if err := manifest.SaveCapabilities(ctx, h.db); err != nil {
 				return 0, nil, err
 			}
 			proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
